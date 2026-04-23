@@ -5,9 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.routers import auth, chat, health, passages, users
 from app.core.config import get_settings
-from app.db import base  # noqa: F401
-from app.db.base_class import Base
-from app.db.session import engine
 
 settings = get_settings()
 
@@ -28,15 +25,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.on_event("startup")
-    def on_startup() -> None:
-        """启动时初始化数据库表。
-
-        当前项目仍处于初始阶段，直接建表足够；后续可切换为 Alembic 迁移。
-        """
-
-        Base.metadata.create_all(bind=engine)
 
     app.include_router(health.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
