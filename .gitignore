@@ -1,0 +1,30 @@
+# Python 字节码与缓存文件。
+__pycache__/
+*.py[cod]
+*.sqlite3
+
+# 测试与类型检查缓存。
+.pytest_cache/
+.mypy_cache/
+
+# 常见虚拟环境目录。
+.venv/
+env/
+venv/
+
+# 本地环境变量文件。
+.env
+
+# 运行期上传与收集目录。
+media/
+staticfiles/
+
+# IDE 配置目录。
+.idea/
+.vscode/
+
+# 前端依赖与构建产物。
+frontend/node_modules/
+frontend/dist/
+
+data/
