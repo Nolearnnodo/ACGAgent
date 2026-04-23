@@ -28,3 +28,6 @@ frontend/node_modules/
 frontend/dist/
 
 data/
+
+# sqlite数据库文件
+identifier.sqlite
