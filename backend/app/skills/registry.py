@@ -9,7 +9,7 @@ from app.models.skill import SkillDefinition
 from app.skills.atomic.conversation_reply import ConversationReplyAtomicSkill
 from app.skills.atomic.graph_query import GraphQueryAtomicSkill
 from app.skills.atomic.graph_write import GraphWriteAtomicSkill
-from app.skills.atomic.passage_preprocess import PassagePreprocessAtomicSkill
+from app.skills.atomic.nl_to_cypher_read import NaturalLanguageToCypherReadAtomicSkill
 from app.skills.atomic.passage_store_graph import PassageStoreGraphAtomicSkill
 from app.skills.atomic.passage_store_sqlite import PassageStoreSqliteAtomicSkill
 from app.skills.base import BaseSkill
@@ -25,8 +25,8 @@ class SkillRegistry:
             "conversation_reply_atomic": ConversationReplyAtomicSkill(),
             "graph_query_atomic": GraphQueryAtomicSkill(),
             "graph_write_atomic": GraphWriteAtomicSkill(),
+            "nl_to_cypher_read_atomic": NaturalLanguageToCypherReadAtomicSkill(),
             "conversation_reply_workflow": ConversationReplyWorkflowSkill(),
-            "passage_preprocess_atomic": PassagePreprocessAtomicSkill(),
             "passage_store_sqlite_atomic": PassageStoreSqliteAtomicSkill(),
             "passage_store_graph_atomic": PassageStoreGraphAtomicSkill(),
             "passage_ingestion_workflow": PassageIngestionWorkflowSkill(),
@@ -58,7 +58,7 @@ class SkillRegistry:
                 "name": "图查询 Atomic Skill",
                 "code": "graph_query_atomic",
                 "skill_type": "atomic",
-                "description": "用于执行图查询占位逻辑。",
+                "description": "用于执行图查询逻辑。",
                 "script_path": str(Path("backend/app/skills/atomic/graph_query.py")),
                 "allowed_roles": ["user", "admin"],
             },
@@ -66,9 +66,17 @@ class SkillRegistry:
                 "name": "图写入 Atomic Skill",
                 "code": "graph_write_atomic",
                 "skill_type": "atomic",
-                "description": "用于执行图写入占位逻辑，仅管理员可调用。",
+                "description": "用于执行图写入逻辑，仅管理员可调用。",
                 "script_path": str(Path("backend/app/skills/atomic/graph_write.py")),
                 "allowed_roles": ["admin"],
+            },
+            {
+                "name": "自然语言转只读 Cypher Atomic Skill",
+                "code": "nl_to_cypher_read_atomic",
+                "skill_type": "atomic",
+                "description": "把自然语言请求转换为只读 Cypher，并执行图查询。",
+                "script_path": str(Path("backend/app/skills/atomic/nl_to_cypher_read.py")),
+                "allowed_roles": ["user", "admin"],
             },
             {
                 "name": "普通对话 Workflow Skill",
@@ -77,14 +85,6 @@ class SkillRegistry:
                 "description": "封装普通对话回复流程。",
                 "script_path": str(Path("backend/app/skills/workflow/conversation_reply_workflow.py")),
                 "allowed_roles": ["user", "admin"],
-            },
-            {
-                "name": "古籍预处理 Atomic Skill",
-                "code": "passage_preprocess_atomic",
-                "skill_type": "atomic",
-                "description": "对古籍正文做最小清洗。",
-                "script_path": str(Path("backend/app/skills/atomic/passage_preprocess.py")),
-                "allowed_roles": ["admin"],
             },
             {
                 "name": "古籍 SQLite 持久化确认 Atomic Skill",

@@ -211,10 +211,17 @@ pip install -r requirements.txt
 pip install "bcrypt==4.0.1" --force-reinstall
 ```
 
-启动命令：
+数据库结构现在统一由 Alembic 管理。启动后端前，请先执行迁移：
 
 ```bash
-uvicorn app.main:app --app-dir backend --reload
+cd backend
+alembic upgrade head
+```
+
+在后端目录启动命令：
+
+```bash
+uvicorn app.main:app --reload
 ```
 
 启动后默认访问：

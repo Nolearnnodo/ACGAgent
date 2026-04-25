@@ -18,7 +18,13 @@ class GraphWriteAtomicSkill(BaseSkill):
         self.repository = GraphRepository()
 
     def run(self, context: ExecutionContext, arguments: dict) -> dict:
+        cypher = str(arguments.get("cypher", "")).strip()
+        params = arguments.get("params") or {}
+
+        if not cypher:
+            raise ValueError("图写入 Skill 缺少 cypher 参数。")
+
         return self.repository.run_write_query(
-            cypher="// 占位写入，后续由具体 Skill 生成 Cypher",
-            parameters={"user_prompt": arguments.get("user_prompt", "")},
+            cypher=cypher,
+            parameters=params,
         )

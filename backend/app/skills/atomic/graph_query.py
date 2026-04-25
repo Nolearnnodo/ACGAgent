@@ -15,8 +15,13 @@ class GraphQueryAtomicSkill(BaseSkill):
         self.repository = GraphRepository()
 
     def run(self, context: ExecutionContext, arguments: dict) -> dict:
-        user_prompt = arguments.get("user_prompt", "")
+        cypher = str(arguments.get("cypher", "")).strip()
+        params = arguments.get("params") or {}
+
+        if not cypher:
+            raise ValueError("图查询 Skill 缺少 cypher 参数。")
+
         return self.repository.run_read_query(
-            cypher="// 占位查询，后续由具体 Skill 生成 Cypher",
-            parameters={"user_prompt": user_prompt},
+            cypher=cypher,
+            parameters=params,
         )
