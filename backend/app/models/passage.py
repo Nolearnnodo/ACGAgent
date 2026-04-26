@@ -20,6 +20,11 @@ class Passage(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     context: Mapped[str] = mapped_column(Text, nullable=False)
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # source_type_code 与 era 由 Skill-1 抽取后回写：
+    # source_type_code 0=墓志铭/塔铭(一手资料), 1=一般历史文献(列传/方志等)。
+    # source_type 字段表示输入方式 (upload/manual_input)，与上面的语义不同，二者并存。
+    source_type_code: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    era: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     workflow_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)

@@ -195,9 +195,56 @@ flowchart TD
 - `LLM_API_BASE_URL=https://api.deepseek.com`
 - `LLM_API_KEY=你的 DeepSeek 密钥`
 
-## 7. 本地启动
+## 7. Docker 一键启动（推荐）
 
-### 7.1 后端
+仓库根直接：
+
+```bash
+cp .env.example .env       # 填好 LLM_API_KEY（DeepSeek）
+docker compose up -d --build
+```
+
+启动后：
+
+| 入口 | URL |
+|---|---|
+| 前端 SPA | http://localhost:5173 |
+| Swagger API | http://localhost:8000/docs |
+| Neo4j Browser | http://localhost:7474（账号 `neo4j` / 密码 `please_change_me`） |
+
+### 7.1 开发循环（已开 dev mount + 热更新）
+
+- 改任意 `backend/**/*.py` → uvicorn `--reload` 自动重启
+- 改任意 `frontend/src/**/*.{vue,ts,css}` → vite HMR 推到浏览器，无需手刷
+- 改 `requirements.txt` 或 `frontend/package.json` → `docker compose up -d --build <service>`
+
+### 7.2 批量跑抽取（容器内）
+
+```bash
+# 跑所有 test_data
+docker compose exec backend python -m scripts.run_passage_workflow /app/test_data
+
+# 跑单文件
+docker compose exec backend python -m scripts.run_passage_workflow /app/test_data/墓志铭/安定胡永府君墓誌.txt
+
+# 不连真 Neo4j 的 dry-run
+docker compose exec backend python -m scripts.run_passage_workflow /app/test_data --dry-run
+```
+
+输出 YAML 自动同步到宿主机 `./output/`。
+
+### 7.3 常用运维命令
+
+```bash
+docker compose ps                       # 查状态
+docker compose logs -f backend          # 跟后端日志
+docker compose down                     # 停服务，保留卷
+docker compose down -v                  # 连卷一起删（清空 SQLite + Neo4j）
+```
+
+## 8. 本地裸装启动（不走 Docker）
+
+### 8.1 后端
 
 建议先准备 Python 3.11 虚拟环境，然后执行：
 

@@ -1,6 +1,9 @@
-"""Neo4j 客户端封装。"""
+"""Neo4j 客户端封装。
 
-from neo4j import GraphDatabase
+`neo4j` 第三方包仅在真正建立连接时才 import，
+这样在未安装 neo4j 库或 driver 不可用的情况下，
+依赖 GraphRepository 的模块依然可以被加载（用于单元测试 / 离线场景）。
+"""
 
 from app.core.config import get_settings
 
@@ -16,6 +19,8 @@ class Neo4jClient:
         """建立到 Neo4j 的连接。"""
 
         if self._driver is None:
+            from neo4j import GraphDatabase  # 延迟导入
+
             self._driver = GraphDatabase.driver(
                 self.settings.neo4j_uri,
                 auth=(self.settings.neo4j_username, self.settings.neo4j_password),

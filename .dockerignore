@@ -1,0 +1,44 @@
+# 仓库管理
+.git
+.gitignore
+.gitattributes
+
+# IDE / 工具缓存
+.idea
+.vscode
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Python
+__pycache__
+*.py[cod]
+*.egg-info
+.venv
+env
+venv
+
+# Node
+# 注意：dev 模式下 frontend 走 vite dev server + bind mount + named volume 隔离 node_modules，
+# 不需要把宿主机的 node_modules 打进 build context；生产 build 也用不上。
+**/node_modules
+**/dist
+*.log
+
+# 项目数据 / 临时
+data/
+output/
+test_data/
+processed/
+bg_knowledge/
+*.sqlite3
+identifier.sqlite
+
+# 本地敏感信息
+.env
+.env.local
+.env.*.local
+
+# 运行期上传
+media/
+staticfiles/

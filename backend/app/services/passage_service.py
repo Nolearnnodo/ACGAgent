@@ -1,13 +1,35 @@
 """古籍文章服务。"""
 
+import io
 from pathlib import Path
 
-from docx import Document
 from sqlalchemy.orm import Session
 
 from app.models.execution import ExecutionRun, ExecutionStepRun
 from app.models.passage import Passage
 from app.models.user import User
+
+# markitdown 支持的全部上传后缀（与路由层白名单保持一致）。
+MARKITDOWN_SUPPORTED_SUFFIXES = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".docx",
+        ".doc",
+        ".pdf",
+        ".pptx",
+        ".ppt",
+        ".xlsx",
+        ".xls",
+        ".csv",
+        ".html",
+        ".htm",
+        ".json",
+        ".xml",
+        ".epub",
+    }
+)
 
 
 class PassageService:
@@ -76,19 +98,35 @@ class PassageService:
         self.db.refresh(passage)
         return passage
 
-    def extract_text_from_md(self, file_name: str, file_bytes: bytes) -> tuple[str, str]:
-        """从 md 文件提取标题与正文。"""
+    # 纯文本类后缀走 fast path（直接 UTF-8 decode），无需 markitdown 依赖。
+    _PLAIN_TEXT_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
+
+    def extract_text_via_markitdown(self, file_name: str, file_bytes: bytes) -> tuple[str, str]:
+        """统一把任意上传格式转成 .md 文本。
+
+        - 纯文本后缀（.md/.markdown/.txt）走 fast path：直接 UTF-8 decode。
+        - 二进制后缀（.docx/.pdf/.pptx/.xlsx 等）走 markitdown。
+        title 由文件名 stem 给出，context 为转换后的 markdown 文本。
+        """
 
         title = Path(file_name).stem
-        context = file_bytes.decode("utf-8")
-        return title, context
+        suffix = Path(file_name).suffix.lower()
 
-    def extract_text_from_docx(self, file_name: str, file_bytes: bytes) -> tuple[str, str]:
-        """从 docx 文件提取标题与正文。"""
+        if suffix not in MARKITDOWN_SUPPORTED_SUFFIXES:
+            raise ValueError(f"不支持的文件后缀：{suffix}")
 
-        import io
+        if suffix in self._PLAIN_TEXT_SUFFIXES:
+            try:
+                context = file_bytes.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                # 兜底：少量历史文献文件可能是 GBK / GB18030 编码。
+                context = file_bytes.decode("gb18030", errors="replace").strip()
+            return title, context
 
-        title = Path(file_name).stem
-        document = Document(io.BytesIO(file_bytes))
-        context = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
+        # 走 markitdown：仅二进制格式需要它解析。
+        from markitdown import MarkItDown  # 延迟导入，未装时也不影响 fast path
+
+        md = MarkItDown(enable_plugins=False)
+        result = md.convert_stream(io.BytesIO(file_bytes), file_extension=suffix)
+        context = (result.text_content or "").strip()
         return title, context

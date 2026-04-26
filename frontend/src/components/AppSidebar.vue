@@ -8,19 +8,14 @@ const route = useRoute()
 const authStore = useAuthStore()
 
 const navItems = computed(() => {
-  const items = [
+  // 科研阶段：古籍模块对所有登录用户开放（后端权限同步放开）
+  void authStore.user
+  return [
     { label: '对话中心', to: '/chat', active: route.path.startsWith('/chat') },
+    { label: '古籍上传', to: '/passages/upload', active: route.path.startsWith('/passages/upload') },
+    { label: '古籍输入', to: '/passages/manual', active: route.path.startsWith('/passages/manual') },
     { label: '个人设置', to: '/profile', active: route.path.startsWith('/profile') },
   ]
-
-  if (authStore.user?.role === 'admin') {
-    items.push(
-      { label: '古籍上传', to: '/passages/upload', active: route.path.startsWith('/passages/upload') },
-      { label: '古籍输入', to: '/passages/manual', active: route.path.startsWith('/passages/manual') },
-    )
-  }
-
-  return items
 })
 </script>
 

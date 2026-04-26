@@ -12,7 +12,7 @@ class GraphWriteAtomicSkill(BaseSkill):
     """
 
     code = "graph_write_atomic"
-    allowed_roles = ["admin"]
+    allowed_roles = ["user", "admin"]
 
     def __init__(self) -> None:
         self.repository = GraphRepository()

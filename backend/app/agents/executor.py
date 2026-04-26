@@ -107,6 +107,11 @@ class Executor:
             db.commit()
             return result
 
+        # 把 execution_run_id 注入 metadata，让 workflow 可以分阶段写 step_run。
+        context.metadata["execution_run_id"] = execution_run.id
+
+        is_workflow = planner_decision.target_skill_code.endswith("_workflow")
+
         output = skill.run(context, planner_decision.arguments)
         # 统一把当前 step 的结果写入 ExecutionContext，
         # 后续 Workflow 或更复杂的多步执行可以通过 step1_result 等键继续引用。
@@ -118,19 +123,20 @@ class Executor:
             success=True,
             output=output,
         )
-        # 当前版本虽然多数流程只落一条 step，但这里已经按“run + step”结构持久化，
-        # 这样后续扩展为真正多步骤 Workflow 时，无需推翻执行记录模型。
-        db.add(
-            ExecutionStepRun(
-                execution_run_id=execution_run.id,
-                step_no=1,
-                skill_code=planner_decision.target_skill_code,
-                status="success",
-                input_json=json.dumps(planner_decision.arguments, ensure_ascii=False),
-                output_json=json.dumps(output, ensure_ascii=False),
-                error_message="",
+        if not is_workflow:
+            # atomic 直接由 executor 兜底写 step_run；
+            # workflow 自行管理子步骤（step_no 1..N），避免重复记录。
+            db.add(
+                ExecutionStepRun(
+                    execution_run_id=execution_run.id,
+                    step_no=1,
+                    skill_code=planner_decision.target_skill_code,
+                    status="success",
+                    input_json=json.dumps(planner_decision.arguments, ensure_ascii=False),
+                    output_json=json.dumps(output, ensure_ascii=False),
+                    error_message="",
+                )
             )
-        )
         execution_run.status = "success"
         execution_run.finished_at = datetime.now(timezone.utc)
         db.commit()

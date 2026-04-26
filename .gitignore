@@ -31,3 +31,19 @@ data/
 
 # sqlite数据库文件
 identifier.sqlite
+
+#  背景知识文件夹
+bg_knowledge/
+
+# 原始数据文件夹
+processed/
+
+# 初步测试数据文件夹
+test_data/
+
+# 输出文件夹
+output/
+
+# oh-my-claudecode 工具本地状态
+.omc/
+**/.omc/
