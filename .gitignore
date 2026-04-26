@@ -47,3 +47,7 @@ output/
 # oh-my-claudecode 工具本地状态
 .omc/
 **/.omc/
+
+# submit
+submit/
+submit.zip
