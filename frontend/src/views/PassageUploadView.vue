@@ -6,9 +6,9 @@ import {
   fetchPassageRuns,
   listPassages,
   uploadPassages,
-  type PassageDetail,
   type PassageExecutionRun,
   type PassageSummary,
+  type PassageUploadResult,
 } from '../api/passages'
 
 // Stage 顺序与后端 PassageIngestionWorkflowSkill.STAGES 严格对齐
@@ -18,22 +18,24 @@ const STAGES = [
   { skill: 'person_layer_atomic', label: 'Stage 3 · 人物层（扫描 + 重要度评级 + 关系候选）' },
   { skill: 'event_relation_atomic', label: 'Stage 4 · 事件 + 历史关联 + 关系字母码' },
   { skill: 'passage_format_output_atomic', label: 'Stage 5 · 渲染 YAML 输出文件' },
+  { skill: 'person_exact_match_merge_atomic', label: 'Stage 6 · 同名人物精确匹配合并' },
 ] as const
 
 const selectedFiles = ref<File[]>([])
-const uploadedPassages = ref<PassageDetail[]>([])
+const uploadedPassages = ref<PassageUploadResult[]>([])
 const passages = ref<PassageSummary[]>([])
 const activeDocId = ref<number | null>(null)
 const activeRuns = ref<PassageExecutionRun[]>([])
 const submitting = ref(false)
 const errorMessage = ref<string | null>(null)
 let pollingTimer: number | null = null
+let monitorRequestToken = 0
 
 const latestRun = computed<PassageExecutionRun | null>(() =>
   activeRuns.value[0] ?? null,
 )
 
-// 用 stage_no（1..5）作为索引，标记当前每个 stage 的状态
+// 用 stage_no（1..6）作为索引，标记当前每个 stage 的状态
 type StageStatus = 'pending' | 'running' | 'success' | 'failed'
 
 const stageStatuses = computed<StageStatus[]>(() => {
@@ -85,6 +87,13 @@ function handleFileChange(event: Event) {
   selectedFiles.value = Array.from(target.files ?? [])
 }
 
+function uploadResultLabel(passage: PassageUploadResult) {
+  if (passage.upload_status === 'skipped_existing') {
+    return passage.skip_reason ?? '已存在，已跳过'
+  }
+  return '已加入任务队列'
+}
+
 async function handleUpload() {
   if (!selectedFiles.value.length || submitting.value) {
     return
@@ -118,21 +127,33 @@ async function handleUpload() {
 
 async function openMonitor(docId: number) {
   activeDocId.value = docId
-  await refreshRuns(docId)
+  const token = ++monitorRequestToken
+  await refreshRuns(docId, token)
   startPolling(docId)
 }
 
-async function refreshRuns(docId: number) {
-  activeRuns.value = await fetchPassageRuns(docId)
+async function refreshRuns(docId: number, token: number = monitorRequestToken) {
+  const runs = await fetchPassageRuns(docId)
+  if (activeDocId.value !== docId || token !== monitorRequestToken) {
+    return
+  }
+  activeRuns.value = runs
 }
 
 function startPolling(docId: number) {
   stopPolling()
+  const token = monitorRequestToken
   pollingTimer = window.setInterval(async () => {
-    await refreshRuns(docId)
-    // 同时刷新文章列表，显示最新 workflow_status
+    await refreshRuns(docId, token)
+    if (activeDocId.value !== docId || token !== monitorRequestToken) {
+      return
+    }
     try {
-      passages.value = await listPassages()
+      const nextPassages = await listPassages()
+      if (activeDocId.value !== docId || token !== monitorRequestToken) {
+        return
+      }
+      passages.value = nextPassages
     } catch (_e) {
       /* ignore */
     }
@@ -151,8 +172,6 @@ function stopPolling() {
 }
 
 onMounted(async () => {
-  // 切走再切回来时组件会被重建，状态丢失。
-  // 这里主动重新拉一次文章列表，并对仍在跑的篇目自动续上监控。
   try {
     passages.value = await listPassages()
   } catch (_e) {
@@ -209,7 +228,7 @@ onBeforeUnmount(() => {
             @click="openMonitor(passage.doc_id)"
           >
             <strong>{{ passage.title }}</strong>
-            <span>状态：{{ passage.workflow_status }}</span>
+            <span>{{ uploadResultLabel(passage) }}</span>
           </article>
         </div>
         <div v-if="passages.length" class="passage-monitor-list">

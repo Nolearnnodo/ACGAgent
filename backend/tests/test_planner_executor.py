@@ -8,18 +8,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.agents.context import ExecutionContext
 from app.agents.executor import Executor
 from app.agents.models import PlannerDecision, PlannerInput
 from app.agents.planner import Planner
+from app.models.passage import Passage
 from app.services.passage_service import PassageService
-from app.skills.workflow.passage_ingestion_workflow import PassageIngestionWorkflowSkill
+from app.skills.workflow.passage_ingestion_workflow import (
+    PassageIngestionWorkflowSkill,
+    _has_graph_write_warning,
+)
 
 
 class _DummyQuery:
-    def __init__(self, result):
+    def __init__(self, result, all_result=None):
         self.result = result
+        self.all_result = all_result
 
     def filter(self, *args, **kwargs):
         return self
@@ -27,12 +33,17 @@ class _DummyQuery:
     def first(self):
         return self.result
 
+    def all(self):
+        return self.all_result or []
+
 
 class _DummySession:
     """极简 Session 模拟器，避免测试依赖真实数据库。"""
 
-    def __init__(self):
+    def __init__(self, query_result=None, query_all_result=None):
         self.records = []
+        self.query_result = query_result
+        self.query_all_result = query_all_result
 
     def add(self, item):
         if getattr(item, "id", None) is None:
@@ -46,7 +57,7 @@ class _DummySession:
         return None
 
     def query(self, model):
-        return _DummyQuery(None)
+        return _DummyQuery(self.query_result, self.query_all_result)
 
     def get(self, model, key):
         return None
@@ -137,10 +148,23 @@ def test_passage_ingestion_workflow_skeleton(tmp_path):
     assert "output_path" in result
     assert Path(result["output_path"]).exists()
     # 必须出现 5 段 step 产物
-    for stage in ("probe", "passage_meta", "person_layer", "event_relation", "format_output"):
+    for stage in (
+        "probe_atomic",
+        "passage_meta_atomic",
+        "person_layer_atomic",
+        "event_relation_atomic",
+        "passage_format_output_atomic",
+        "person_exact_match_merge_atomic",
+    ):
         assert stage in result["steps"]
     # context.metadata 里 probe / passage_meta / person_layer / event_relation 都要有
-    for key in ("probe", "passage_meta", "person_layer", "event_relation"):
+    for key in (
+        "probe",
+        "passage_meta",
+        "person_layer",
+        "event_relation",
+        "person_exact_match_merge",
+    ):
         assert key in context.metadata
 
 
@@ -199,3 +223,85 @@ def test_passage_service_rejects_unknown_suffix():
         assert "不支持" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("应当拒绝 .exe")
+
+
+def test_passage_service_content_hash_normalizes_minor_whitespace():
+    service = PassageService(db=None)  # type: ignore[arg-type]
+
+    first = service.compute_content_hash("正文内容\r\n第二行   \n")
+    second = service.compute_content_hash("正文内容\n第二行")
+    changed = service.compute_content_hash("正文内容\n第三行")
+
+    assert first == second
+    assert first != changed
+
+
+def test_passage_service_create_passage_sets_content_hash():
+    db = _DummySession()
+    service = PassageService(db=db)  # type: ignore[arg-type]
+    user = SimpleNamespace(id=42)
+
+    passage = service.create_passage(
+        user=user,  # type: ignore[arg-type]
+        title="古籍一",
+        context="正文内容",
+        source_type="upload",
+        file_name="古籍一.txt",
+    )
+
+    assert passage.content_hash == service.compute_content_hash("正文内容")
+    assert db.records[-1] is passage
+
+
+def test_passage_service_finds_existing_by_content_hash():
+    existing = Passage(
+        title="古籍一",
+        context="正文内容",
+        source_type="upload",
+        file_name="古籍一.txt",
+        content_hash="abc123",
+        created_by=1,
+        workflow_status="success",
+    )
+    service = PassageService(db=_DummySession(query_result=existing))  # type: ignore[arg-type]
+
+    assert service.find_by_content_hash("abc123") is existing
+
+
+def test_passage_service_duplicate_lookup_backfills_legacy_hash():
+    legacy = Passage(
+        title="古籍一",
+        context="正文内容\n第二行",
+        source_type="upload",
+        file_name="古籍一.txt",
+        content_hash=None,
+        created_by=1,
+        workflow_status="success",
+    )
+    service = PassageService(
+        db=_DummySession(query_result=None, query_all_result=[legacy])  # type: ignore[arg-type]
+    )
+    content_hash = service.compute_content_hash("正文内容\n第二行")
+
+    result = service.find_duplicate_passage("正文内容\r\n第二行   ", content_hash)
+
+    assert result is legacy
+    assert legacy.content_hash == content_hash
+
+
+def test_graph_write_warning_detection_ignores_dictionary_misses():
+    warnings = [
+        {"type": "unmatched_era", "detail": "era missing"},
+        {"type": "unmatched_historic_event", "detail": "event missing"},
+    ]
+
+    assert _has_graph_write_warning(warnings) is False
+
+
+def test_graph_write_warning_detection_flags_neo4j_write_failures():
+    warnings = [
+        {"type": "unmatched_historic_event", "detail": "event missing"},
+        {"type": "neo4j_write_failed", "detail": "upsert_person failed"},
+    ]
+
+    assert _has_graph_write_warning(warnings) is True

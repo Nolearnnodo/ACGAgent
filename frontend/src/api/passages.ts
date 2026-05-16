@@ -15,6 +15,11 @@ export interface PassageDetail extends PassageSummary {
   created_at: string
 }
 
+export interface PassageUploadResult extends PassageDetail {
+  upload_status: 'queued' | 'skipped_existing'
+  skip_reason: string | null
+}
+
 export interface PassageStepRun {
   id: number
   step_no: number
@@ -41,7 +46,7 @@ export async function uploadPassages(files: File[]) {
     formData.append('files', file)
   }
 
-  const { data } = await apiClient.post<PassageDetail[]>('/passages/upload', formData, {
+  const { data } = await apiClient.post<PassageUploadResult[]>('/passages/upload', formData, {
     headers: {
       'Content-Type': 'multipart/form-data',
     },

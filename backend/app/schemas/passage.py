@@ -28,6 +28,13 @@ class PassageResponse(BaseModel):
     updated_at: datetime
 
 
+class PassageUploadResponse(PassageResponse):
+    """上传单篇文件后的处理结果。"""
+
+    upload_status: str = "queued"
+    skip_reason: str | None = None
+
+
 class PassageSummaryResponse(BaseModel):
     """古籍文章列表摘要。"""
 

@@ -21,6 +21,7 @@ const activeDocId = ref<number | null>(null)
 const activeRuns = ref<PassageExecutionRun[]>([])
 const submitting = ref(false)
 let pollingTimer: number | null = null
+let monitorRequestToken = 0
 
 async function handleSubmit() {
   if (!formState.title.trim() || !formState.context.trim()) {
@@ -44,18 +45,27 @@ async function handleSubmit() {
 
 async function openMonitor(docId: number) {
   activeDocId.value = docId
-  await refreshRuns(docId)
+  const token = ++monitorRequestToken
+  await refreshRuns(docId, token)
   startPolling(docId)
 }
 
-async function refreshRuns(docId: number) {
-  activeRuns.value = await fetchPassageRuns(docId)
+async function refreshRuns(docId: number, token: number = monitorRequestToken) {
+  const runs = await fetchPassageRuns(docId)
+  if (activeDocId.value !== docId || token !== monitorRequestToken) {
+    return
+  }
+  activeRuns.value = runs
 }
 
 function startPolling(docId: number) {
   stopPolling()
+  const token = monitorRequestToken
   pollingTimer = window.setInterval(async () => {
-    await refreshRuns(docId)
+    await refreshRuns(docId, token)
+    if (activeDocId.value !== docId || token !== monitorRequestToken) {
+      return
+    }
     const latestRun = activeRuns.value[0]
     if (latestRun && ['success', 'failed'].includes(latestRun.status)) {
       stopPolling()

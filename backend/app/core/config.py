@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
+        extra="ignore",
     )
 
     app_name: str = Field(default="ACGAgent Graph Maintenance System", alias="APP_NAME")
@@ -42,7 +43,7 @@ class Settings(BaseSettings):
     llm_model_name: str = Field(default="mock-planner", alias="LLM_MODEL_NAME")
     llm_api_base_url: str = Field(default="", alias="LLM_API_BASE_URL")
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
-    llm_timeout_seconds: int = Field(default=30, alias="LLM_TIMEOUT_SECONDS")
+    llm_timeout_seconds: int = Field(default=120, alias="LLM_TIMEOUT_SECONDS")
 
     @property
     def cors_origins(self) -> list[str]:

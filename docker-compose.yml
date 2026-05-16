@@ -77,6 +77,8 @@ services:
       # 输出 / 测试数据 / 背景知识 双向挂载
       - ./output:/app/output
       - ./test_data:/app/test_data:ro
+      - ./data:/app/data:ro
+      - ../开发阶段微数据集.xlsx:/app/micro_dataset.xlsx:ro
       - ./bg_knowledge:/app/bg_knowledge:ro
     restart: unless-stopped
 

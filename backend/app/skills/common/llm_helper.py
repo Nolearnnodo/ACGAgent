@@ -88,8 +88,8 @@ def call_llm_structured(
         except ValidationError as exc:
             errs = exc.errors()[:2]
             last_diag = f"字段校验失败：{errs}"
-        except Exception as exc:  # 包括 LLM provider 自己的异常
-            last_diag = f"未知错误：{exc}"
+        except Exception as exc:  # Provider/network errors are surfaced to workflow warnings.
+            last_diag = f"LLM 调用失败：{type(exc).__name__}: {exc}"
 
     raise LLMStructuredError(
         f"{skill_code} LLM 重试 {max_retries + 1} 次仍失败：{last_diag}"

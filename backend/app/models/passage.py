@@ -26,6 +26,7 @@ class Passage(Base):
     source_type_code: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     era: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     workflow_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

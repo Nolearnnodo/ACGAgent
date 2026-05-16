@@ -23,6 +23,7 @@ from app.schemas.passage import (
     PassageManualCreateRequest,
     PassageResponse,
     PassageSummaryResponse,
+    PassageUploadResponse,
 )
 from app.services.passage_service import MARKITDOWN_SUPPORTED_SUFFIXES, PassageService
 
@@ -109,11 +110,17 @@ def create_manual_passage(
     """手工录入古籍文章；立即返回 pending，workflow 后台跑。"""
 
     service = PassageService(db)
+    content_hash = service.compute_content_hash(payload.context)
+    existing = service.find_duplicate_passage(payload.context, content_hash)
+    if existing is not None:
+        return PassageResponse.model_validate(existing)
+
     passage = service.create_passage(
         user=current_user,
         title=payload.title,
         context=payload.context,
         source_type="manual_input",
+        content_hash=content_hash,
     )
     background_tasks.add_task(
         _run_workflow_background, current_user.id, passage.doc_id, "passage_manual_input"
@@ -121,17 +128,17 @@ def create_manual_passage(
     return PassageResponse.model_validate(passage)
 
 
-@router.post("/upload", response_model=list[PassageResponse])
+@router.post("/upload", response_model=list[PassageUploadResponse])
 async def upload_passages(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> list[PassageResponse]:
+) -> list[PassageUploadResponse]:
     """上传一个或多个古籍文件；立即返回 pending 列表，workflow 后台跑。"""
 
     service = PassageService(db)
-    passages: list[PassageResponse] = []
+    passages: list[PassageUploadResponse] = []
 
     for file in files:
         suffix = Path(file.filename or "").suffix.lower()
@@ -152,17 +159,31 @@ async def upload_passages(
                 detail=f"文件解析失败：{file.filename}",
             ) from exc
 
+        content_hash = service.compute_content_hash(context)
+        existing = service.find_duplicate_passage(context, content_hash)
+        if existing is not None:
+            passages.append(
+                PassageUploadResponse.model_validate(existing).model_copy(
+                    update={
+                        "upload_status": "skipped_existing",
+                        "skip_reason": f"已存在文章 doc_id={existing.doc_id}，状态={existing.workflow_status}，已跳过入队。",
+                    }
+                )
+            )
+            continue
+
         passage = service.create_passage(
             user=current_user,
             title=title,
             context=context,
             source_type="upload",
             file_name=file.filename,
+            content_hash=content_hash,
         )
         background_tasks.add_task(
             _run_workflow_background, current_user.id, passage.doc_id, "passage_upload"
         )
-        passages.append(PassageResponse.model_validate(passage))
+        passages.append(PassageUploadResponse.model_validate(passage))
 
     return passages
 

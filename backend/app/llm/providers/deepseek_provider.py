@@ -1,6 +1,7 @@
-"""DeepSeek Provider。
+"""DeepSeek Provider.
 
-当前按 OpenAI 兼容接口调用 DeepSeek，并在结构化输出失败时回退到受控默认结果。
+The planner still has a safe mock fallback, but normal chat/structured calls
+raise provider errors so extraction warnings preserve the real failure cause.
 """
 
 import json
@@ -101,9 +102,6 @@ class DeepSeekProvider(BaseLLMProvider):
             return self.mock_provider.generate_structured_intent(prompt, metadata)
 
     def chat_completion(self, messages: list[dict[str, str]], metadata: dict[str, Any]) -> str:
-        """普通聊天接口。"""
+        """Call DeepSeek and let callers record the real provider error."""
 
-        try:
-            return self._post_chat_completion(messages)
-        except Exception:
-            return self.mock_provider.chat_completion(messages, metadata)
+        return self._post_chat_completion(messages)

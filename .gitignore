@@ -22,6 +22,7 @@ staticfiles/
 # IDE 配置目录。
 .idea/
 .vscode/
+.serena/
 
 # 前端依赖与构建产物。
 frontend/node_modules/
@@ -51,3 +52,7 @@ output/
 # submit
 submit/
 submit.zip
+
+# local tooling artifacts
+.playwright-mcp/
+docs/

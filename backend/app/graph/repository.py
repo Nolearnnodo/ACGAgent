@@ -288,3 +288,175 @@ class GraphRepository:
                 "note": note,
             },
         )
+
+    # ---------- 业务封装：功能 B ----------
+
+    def merge_same_name_persons_for_passage(self, doc_id: int) -> dict[str, Any]:
+        """功能 B：把指定篇目中的人物按姓名精确合并到既有人物节点。
+
+        这个版本不做 LLM 裁定，也不接 CBDB；只有当新篇目人物与更早篇目人物
+        的 name 完全相等时，才把新人物节点合并到最早的同名人物节点上。
+        """
+
+        pair_result = self.run_read_query(
+            cypher="""
+            MATCH (new_person:Person_Nodes)-[:在文章中]->(:Passage_Info {doc_id: $doc_id})
+            WHERE new_person.name IS NOT NULL AND trim(new_person.name) <> ''
+            MATCH (candidate:Person_Nodes {name: new_person.name})-[:在文章中]->(old_passage:Passage_Info)
+            WHERE candidate.person_id <> new_person.person_id
+              AND old_passage.doc_id < $doc_id
+            WITH new_person, collect(DISTINCT candidate.person_id) AS candidate_ids
+            WITH new_person,
+                 candidate_ids,
+                 reduce(
+                    min_id = candidate_ids[0],
+                    id IN candidate_ids |
+                    CASE WHEN id < min_id THEN id ELSE min_id END
+                 ) AS canonical_id
+            RETURN new_person.person_id AS duplicate_person_id,
+                   new_person.name AS name,
+                   canonical_id AS canonical_person_id,
+                   size(candidate_ids) AS candidate_count
+            ORDER BY name, duplicate_person_id
+            """,
+            parameters={"doc_id": doc_id},
+        )
+
+        merges: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for record in pair_result.get("records", []):
+            duplicate_person_id = int(record["duplicate_person_id"])
+            canonical_person_id = int(record["canonical_person_id"])
+            if duplicate_person_id == canonical_person_id:
+                continue
+
+            try:
+                result = self.merge_person_nodes(
+                    canonical_person_id=canonical_person_id,
+                    duplicate_person_id=duplicate_person_id,
+                )
+            except Exception as exc:  # pragma: no cover - depends on Neo4j runtime
+                failures.append(
+                    {
+                        "name": record.get("name"),
+                        "canonical_person_id": canonical_person_id,
+                        "duplicate_person_id": duplicate_person_id,
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            merges.append(
+                {
+                    "name": record.get("name"),
+                    "canonical_person_id": canonical_person_id,
+                    "duplicate_person_id": duplicate_person_id,
+                    "candidate_count": int(record.get("candidate_count") or 0),
+                    "result": result,
+                }
+            )
+
+        return {
+            "status": "partial" if failures else "success",
+            "doc_id": doc_id,
+            "matched_person_count": len(pair_result.get("records", [])),
+            "merged_person_count": len(merges),
+            "failed_merge_count": len(failures),
+            "merges": merges,
+            "failures": failures,
+        }
+
+    def merge_person_nodes(
+        self,
+        canonical_person_id: int,
+        duplicate_person_id: int,
+    ) -> dict[str, Any]:
+        """把 duplicate 人物节点的已知关系转移到 canonical 人物节点后删除 duplicate。"""
+
+        parameters = {
+            "canonical_person_id": canonical_person_id,
+            "duplicate_person_id": duplicate_person_id,
+        }
+        steps = [
+            """
+            MATCH (keep:Person_Nodes {person_id: $canonical_person_id})
+            MATCH (drop:Person_Nodes {person_id: $duplicate_person_id})
+            SET keep.zi = coalesce(keep.zi, drop.zi),
+                keep.titles = reduce(
+                    acc = [],
+                    title IN coalesce(keep.titles, []) + coalesce(drop.titles, []) |
+                    CASE WHEN title IS NULL OR title IN acc THEN acc ELSE acc + title END
+                ),
+                keep.merged_person_ids = reduce(
+                    acc = [],
+                    pid IN coalesce(keep.merged_person_ids, []) +
+                           coalesce(drop.merged_person_ids, []) +
+                           [drop.person_id] |
+                    CASE WHEN pid IS NULL OR pid IN acc THEN acc ELSE acc + pid END
+                )
+            RETURN keep
+            """,
+            """
+            MATCH (keep:Person_Nodes {person_id: $canonical_person_id})
+            MATCH (drop:Person_Nodes {person_id: $duplicate_person_id})-[r:在文章中]->(passage:Passage_Info)
+            MERGE (keep)-[new_rel:在文章中]->(passage)
+            SET new_rel.level =
+                CASE
+                    WHEN new_rel.level IS NULL THEN r.level
+                    WHEN r.level IS NULL THEN new_rel.level
+                    WHEN r.level < new_rel.level THEN r.level
+                    ELSE new_rel.level
+                END
+            RETURN count(new_rel) AS transferred
+            """,
+            """
+            MATCH (keep:Person_Nodes {person_id: $canonical_person_id})
+            MATCH (drop:Person_Nodes {person_id: $duplicate_person_id})-[:生平]->(event:Life_Events)
+            MERGE (keep)-[:生平]->(event)
+            RETURN count(event) AS transferred
+            """,
+            """
+            MATCH (keep:Person_Nodes {person_id: $canonical_person_id})
+            MATCH (drop:Person_Nodes {person_id: $duplicate_person_id})-[r:历史事件]->(event:Historical_Events)
+            MERGE (keep)-[new_rel:历史事件]->(event)
+            SET new_rel.label = coalesce(new_rel.label, r.label)
+            RETURN count(new_rel) AS transferred
+            """,
+            """
+            MATCH (keep:Person_Nodes {person_id: $canonical_person_id})
+            MATCH (drop:Person_Nodes {person_id: $duplicate_person_id})-[r:person_relation]->(target:Person_Nodes)
+            WHERE target.person_id <> $canonical_person_id
+              AND target.person_id <> $duplicate_person_id
+            MERGE (keep)-[new_rel:person_relation]->(target)
+            SET new_rel.codes = coalesce(new_rel.codes, r.codes),
+                new_rel.note = coalesce(new_rel.note, r.note)
+            RETURN count(new_rel) AS transferred
+            """,
+            """
+            MATCH (keep:Person_Nodes {person_id: $canonical_person_id})
+            MATCH (source:Person_Nodes)-[r:person_relation]->(drop:Person_Nodes {person_id: $duplicate_person_id})
+            WHERE source.person_id <> $canonical_person_id
+              AND source.person_id <> $duplicate_person_id
+            MERGE (source)-[new_rel:person_relation]->(keep)
+            SET new_rel.codes = coalesce(new_rel.codes, r.codes),
+                new_rel.note = coalesce(new_rel.note, r.note)
+            RETURN count(new_rel) AS transferred
+            """,
+            """
+            MATCH (drop:Person_Nodes {person_id: $duplicate_person_id})
+            DETACH DELETE drop
+            RETURN $duplicate_person_id AS deleted_person_id
+            """,
+        ]
+
+        step_results = [
+            self.run_write_query(cypher=cypher, parameters=parameters)
+            for cypher in steps
+        ]
+        return {
+            "status": "success",
+            "canonical_person_id": canonical_person_id,
+            "duplicate_person_id": duplicate_person_id,
+            "step_count": len(step_results),
+            "steps": step_results,
+        }

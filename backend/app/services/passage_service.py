@@ -1,5 +1,6 @@
 """古籍文章服务。"""
 
+import hashlib
 import io
 from pathlib import Path
 
@@ -38,14 +39,62 @@ class PassageService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def create_passage(self, user: User, title: str, context: str, source_type: str, file_name: str | None = None) -> Passage:
+    @staticmethod
+    def normalize_context_for_hash(context: str) -> str:
+        """Normalize harmless formatting differences before duplicate checks."""
+
+        text = context.replace("\r\n", "\n").replace("\r", "\n")
+        return "\n".join(line.rstrip() for line in text.split("\n")).strip()
+
+    @classmethod
+    def compute_content_hash(cls, context: str) -> str:
+        """Return the stable duplicate key for a passage body."""
+
+        normalized = cls.normalize_context_for_hash(context)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def find_by_content_hash(self, content_hash: str) -> Passage | None:
+        """Find an already stored passage with the same normalized body."""
+
+        return self.db.query(Passage).filter(Passage.content_hash == content_hash).first()
+
+    def find_duplicate_passage(self, context: str, content_hash: str | None = None) -> Passage | None:
+        """Find a duplicate passage, including legacy rows created before hashing."""
+
+        resolved_content_hash = content_hash or self.compute_content_hash(context)
+        existing = self.find_by_content_hash(resolved_content_hash)
+        if existing is not None:
+            return existing
+
+        normalized_context = self.normalize_context_for_hash(context)
+        legacy_candidates = self.db.query(Passage).filter(Passage.content_hash.is_(None)).all()
+        for candidate in legacy_candidates:
+            if self.normalize_context_for_hash(candidate.context) == normalized_context:
+                candidate.content_hash = resolved_content_hash
+                self.db.add(candidate)
+                self.db.commit()
+                self.db.refresh(candidate)
+                return candidate
+        return None
+
+    def create_passage(
+        self,
+        user: User,
+        title: str,
+        context: str,
+        source_type: str,
+        file_name: str | None = None,
+        content_hash: str | None = None,
+    ) -> Passage:
         """创建 Passage 数据。"""
 
+        resolved_content_hash = content_hash or self.compute_content_hash(context)
         passage = Passage(
             title=title,
             context=context,
             source_type=source_type,
             file_name=file_name,
+            content_hash=resolved_content_hash,
             created_by=user.id,
             workflow_status="pending",
         )
