@@ -18,9 +18,15 @@ from app.skills.atomic.passage_meta import PassageMetaAtomicSkill
 from app.skills.atomic.person_exact_match_merge import PersonExactMatchMergeAtomicSkill
 from app.skills.atomic.person_layer import PersonLayerAtomicSkill
 from app.skills.atomic.probe import ProbeAtomicSkill
+from app.skills.atomic.graph_statistics_query import GraphStatisticsQueryAtomicSkill
+from app.skills.atomic.person_info_query import PersonInfoQueryAtomicSkill
+from app.skills.atomic.person_relation_query import PersonRelationQueryAtomicSkill
+from app.skills.atomic.query_answer_compose import QueryAnswerComposeAtomicSkill
+from app.skills.atomic.query_intent_classifier import QueryIntentClassifierAtomicSkill
 from app.skills.base import BaseSkill
 from app.skills.workflow.conversation_reply_workflow import ConversationReplyWorkflowSkill
 from app.skills.workflow.passage_ingestion_workflow import PassageIngestionWorkflowSkill
+from app.skills.workflow.query_workflow import QueryWorkflowSkill
 
 
 class SkillRegistry:
@@ -40,6 +46,12 @@ class SkillRegistry:
             "passage_format_output_atomic": PassageFormatOutputAtomicSkill(),
             "person_exact_match_merge_atomic": PersonExactMatchMergeAtomicSkill(),
             "passage_ingestion_workflow": PassageIngestionWorkflowSkill(),
+            "query_intent_classifier_atomic": QueryIntentClassifierAtomicSkill(),
+            "query_answer_compose_atomic": QueryAnswerComposeAtomicSkill(),
+            "person_info_query_atomic": PersonInfoQueryAtomicSkill(),
+            "person_relation_query_atomic": PersonRelationQueryAtomicSkill(),
+            "graph_statistics_query_atomic": GraphStatisticsQueryAtomicSkill(),
+            "query_workflow": QueryWorkflowSkill(),
         }
 
     def get(self, skill_code: str) -> BaseSkill:
@@ -145,6 +157,54 @@ class SkillRegistry:
                 "skill_type": "workflow",
                 "description": "Run Function A extraction and Function B exact-name merge.",
                 "script_path": str(Path("backend/app/skills/workflow/passage_ingestion_workflow.py")),
+                "allowed_roles": ["user", "admin"],
+            },
+            {
+                "name": "Query intent classifier atomic",
+                "code": "query_intent_classifier_atomic",
+                "skill_type": "atomic",
+                "description": "Classify query intent and extract parameters.",
+                "script_path": str(Path("backend/app/skills/atomic/query_intent_classifier.py")),
+                "allowed_roles": ["user", "admin"],
+            },
+            {
+                "name": "Query answer compose atomic",
+                "code": "query_answer_compose_atomic",
+                "skill_type": "atomic",
+                "description": "Compose human-readable answer from query results.",
+                "script_path": str(Path("backend/app/skills/atomic/query_answer_compose.py")),
+                "allowed_roles": ["user", "admin"],
+            },
+            {
+                "name": "Person info query atomic",
+                "code": "person_info_query_atomic",
+                "skill_type": "atomic",
+                "description": "Query person information from graph database.",
+                "script_path": str(Path("backend/app/skills/atomic/person_info_query.py")),
+                "allowed_roles": ["user", "admin"],
+            },
+            {
+                "name": "Person relation query atomic",
+                "code": "person_relation_query_atomic",
+                "skill_type": "atomic",
+                "description": "Query relations between two persons.",
+                "script_path": str(Path("backend/app/skills/atomic/person_relation_query.py")),
+                "allowed_roles": ["user", "admin"],
+            },
+            {
+                "name": "Graph statistics query atomic",
+                "code": "graph_statistics_query_atomic",
+                "skill_type": "atomic",
+                "description": "Generate and execute read-only statistics Cypher.",
+                "script_path": str(Path("backend/app/skills/atomic/graph_statistics_query.py")),
+                "allowed_roles": ["user", "admin"],
+            },
+            {
+                "name": "Query workflow",
+                "code": "query_workflow",
+                "skill_type": "workflow",
+                "description": "Three-step query workflow: classify, query, compose.",
+                "script_path": str(Path("backend/app/skills/workflow/query_workflow.py")),
                 "allowed_roles": ["user", "admin"],
             },
         ]

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { marked } from 'marked'
 
 import AppLayout from '../layouts/AppLayout.vue'
 import {
@@ -12,6 +13,15 @@ import {
   type ConversationDetail,
   type ConversationItem,
 } from '../api/chat'
+
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+})
+
+function renderMarkdown(content: string): string {
+  return marked.parse(content) as string
+}
 
 const conversations = ref<ConversationItem[]>([])
 const activeConversation = ref<ConversationDetail | null>(null)
@@ -80,10 +90,21 @@ async function handleSendMessage() {
     return
   }
 
+  const content = messageInput.value.trim()
+  messageInput.value = ''
   sending.value = true
+
+  const tempUserMsg: typeof activeConversation.value.messages[0] = {
+    id: Date.now(),
+    role: 'user',
+    content,
+    sequence: (activeConversation.value.messages.length + 1),
+    created_at: new Date().toISOString(),
+  }
+  activeConversation.value.messages.push(tempUserMsg)
+
   try {
-    activeConversation.value = await sendMessage(activeConversation.value.id, messageInput.value.trim())
-    messageInput.value = ''
+    activeConversation.value = await sendMessage(activeConversation.value.id, content)
     conversations.value = await listConversations()
   } finally {
     sending.value = false
@@ -147,7 +168,14 @@ onMounted(async () => {
             :class="message.role === 'assistant' ? 'chat-page__message--assistant' : 'chat-page__message--user'"
           >
             <span class="chat-page__message-role">{{ message.role }}</span>
-            <p>{{ message.content }}</p>
+            <div v-if="message.role === 'assistant'" class="chat-page__message-content" v-html="renderMarkdown(message.content)" />
+            <p v-else>{{ message.content }}</p>
+          </div>
+          <div v-if="sending" class="chat-page__message chat-page__message--assistant chat-page__message--loading">
+            <span class="chat-page__message-role">assistant</span>
+            <div class="chat-page__loading-dots">
+              <span></span><span></span><span></span>
+            </div>
           </div>
         </div>
 
@@ -300,6 +328,103 @@ onMounted(async () => {
   line-height: 1.6;
 }
 
+.chat-page__message-content {
+  margin: 8px 0 0;
+  line-height: 1.7;
+}
+
+.chat-page__message-content :deep(p) {
+  margin: 0.5em 0;
+}
+
+.chat-page__message-content :deep(p:first-child) {
+  margin-top: 0;
+}
+
+.chat-page__message-content :deep(h1),
+.chat-page__message-content :deep(h2),
+.chat-page__message-content :deep(h3),
+.chat-page__message-content :deep(h4) {
+  margin: 0.8em 0 0.4em;
+  color: #31456f;
+}
+
+.chat-page__message-content :deep(h1) { font-size: 1.4em; }
+.chat-page__message-content :deep(h2) { font-size: 1.2em; }
+.chat-page__message-content :deep(h3) { font-size: 1.05em; }
+
+.chat-page__message-content :deep(ul),
+.chat-page__message-content :deep(ol) {
+  margin: 0.5em 0;
+  padding-left: 1.5em;
+}
+
+.chat-page__message-content :deep(li) {
+  margin: 0.25em 0;
+}
+
+.chat-page__message-content :deep(code) {
+  background: #e8edf6;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.9em;
+  font-family: 'Fira Code', 'Consolas', monospace;
+}
+
+.chat-page__message-content :deep(pre) {
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 10px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  margin: 0.6em 0;
+}
+
+.chat-page__message-content :deep(pre code) {
+  background: none;
+  padding: 0;
+  color: inherit;
+  font-size: 0.85em;
+}
+
+.chat-page__message-content :deep(blockquote) {
+  border-left: 3px solid #8fb3ff;
+  margin: 0.6em 0;
+  padding: 4px 12px;
+  color: #506080;
+  background: #f0f5ff;
+  border-radius: 0 8px 8px 0;
+}
+
+.chat-page__message-content :deep(table) {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  width: 100%;
+}
+
+.chat-page__message-content :deep(th),
+.chat-page__message-content :deep(td) {
+  border: 1px solid #dce6f5;
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.chat-page__message-content :deep(th) {
+  background: #f0f5ff;
+  font-weight: 600;
+}
+
+.chat-page__message-content :deep(a) {
+  color: #2f6fed;
+  text-decoration: none;
+}
+
+.chat-page__message-content :deep(hr) {
+  border: none;
+  border-top: 1px solid #e4ebf7;
+  margin: 1em 0;
+}
+
 .chat-page__message-role {
   font-size: 12px;
   text-transform: uppercase;
@@ -313,6 +438,29 @@ onMounted(async () => {
 
 .chat-page__message--assistant {
   background: #f5f7fb;
+}
+
+.chat-page__loading-dots {
+  display: flex;
+  gap: 6px;
+  padding: 8px 0;
+}
+
+.chat-page__loading-dots span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #7085b0;
+  animation: dot-bounce 1.4s infinite ease-in-out both;
+}
+
+.chat-page__loading-dots span:nth-child(1) { animation-delay: 0s; }
+.chat-page__loading-dots span:nth-child(2) { animation-delay: 0.2s; }
+.chat-page__loading-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes dot-bounce {
+  0%, 80%, 100% { transform: scale(0.4); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
 }
 
 .chat-page__composer {

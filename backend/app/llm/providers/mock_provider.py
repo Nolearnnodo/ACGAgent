@@ -15,10 +15,13 @@ class MockLLMProvider(BaseLLMProvider):
         lower_prompt = prompt.lower()
         role = metadata.get("user_role", "user")
 
-        if any(keyword in lower_prompt for keyword in ["写", "新增", "删除", "修改图", "写入图"]):
+        if any(keyword in lower_prompt for keyword in ["谁", "是谁", "什么人", "查询", "查找", "关系", "多少", "统计", "几个", "几次"]):
+            target_skill = "query_workflow"
+            reason = "识别到查询类意图，路由到 query_workflow。"
+        elif any(keyword in lower_prompt for keyword in ["写", "新增", "删除", "修改图", "写入图"]):
             target_skill = "graph_write_atomic"
             reason = "识别到可能涉及写操作，优先路由到写类 Skill。"
-        elif any(keyword in lower_prompt for keyword in ["查询", "查找", "图谱", "关系", "节点"]):
+        elif any(keyword in lower_prompt for keyword in ["图谱", "节点"]):
             target_skill = "graph_query_atomic"
             reason = "识别到查询意图，路由到图查询 Skill。"
         else:

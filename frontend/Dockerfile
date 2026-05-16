@@ -12,5 +12,4 @@ RUN npm install
 
 EXPOSE 5173
 
-# vite 默认 localhost，必须 0.0.0.0 才能从主机映射访问
-CMD ["npx", "vite", "--host", "0.0.0.0", "--port", "5173"]
+CMD ["sh", "-c", "npm install && npx vite --host 0.0.0.0 --port 5173"]

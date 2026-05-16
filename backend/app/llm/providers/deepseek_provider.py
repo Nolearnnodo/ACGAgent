@@ -57,6 +57,7 @@ class DeepSeekProvider(BaseLLMProvider):
             "conversation_reply_workflow",
             "graph_query_atomic",
             "graph_write_atomic",
+            "query_workflow",
         ]
         system_prompt = (
             "你是一个受控 Planner，只能从给定 Skill 中选择一个执行目标，"
@@ -66,6 +67,8 @@ class DeepSeekProvider(BaseLLMProvider):
             "decision_type 只能是 skill、workflow、reject。"
             f"可选 target_skill_code 仅允许：{', '.join(allowed_skill_codes)}。"
             "如果用户请求涉及图写入且用户不是 admin，则返回 reject。"
+            "如果用户请求是查询类（如'XXX是谁'、'XXX和YYY有什么关系'、'图中有多少XXX'），"
+            "请路由到 query_workflow。"
         )
         user_prompt = {
             "user_prompt": prompt,
