@@ -1,5 +1,8 @@
 """对话服务。"""
 
+import logging
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session, selectinload
 
 from app.agents.context import ExecutionContext
@@ -7,10 +10,13 @@ from app.agents.executor import Executor
 from app.agents.models import PlannerInput
 from app.agents.planner import Planner
 from app.core.config import get_settings
+from app.llm.providers.factory import get_llm_provider
 from app.models.conversation import Conversation, ConversationMemory, Message
 from app.models.execution import PlannerDecisionRecord
 from app.models.user import User
 from app.skills.registry import SkillRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationService:
@@ -53,11 +59,14 @@ class ConversationService:
         return conversation
 
     def get_conversation_detail(self, user: User, conversation_id: int) -> Conversation:
-        """读取会话详情。"""
+        """读取会话详情（同时预加载 messages 与 memory）。"""
 
         conversation = (
             self.db.query(Conversation)
-            .options(selectinload(Conversation.messages))
+            .options(
+                selectinload(Conversation.messages),
+                selectinload(Conversation.memory),
+            )
             .filter(Conversation.id == conversation_id, Conversation.user_id == user.id)
             .first()
         )
@@ -105,10 +114,66 @@ class ConversationService:
         self.db.commit()
         self.db.refresh(user_message)
 
-        recent_messages = [
+        # ── 滑动窗口摘要压缩 ──────────────────────────────────────────────────
+        memory: ConversationMemory | None = conversation.memory
+        window_size: int = memory.window_size if memory else self.settings.conversation_memory_window
+
+        # conversation.messages 此时尚不包含刚提交的 user_message（ORM 对象层）
+        all_messages = conversation.messages
+        current_summary: str = memory.summary if memory else ""
+
+        if len(all_messages) > window_size:
+            # 被滑出窗口的消息（最旧的那些）
+            evicted_messages = all_messages[: len(all_messages) - window_size]
+
+            # 构造压缩提示：旧摘要 + 被滑出的消息 → 新摘要
+            compress_prompt_parts: list[str] = []
+            if current_summary:
+                compress_prompt_parts.append(f"已有摘要：{current_summary}")
+            compress_prompt_parts.append("新增对话（需纳入摘要）：")
+            for msg in evicted_messages:
+                role_label = "用户" if msg.role == "user" else "助手"
+                compress_prompt_parts.append(f"[{role_label}] {msg.content}")
+
+            compress_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个对话摘要助手。请将下方对话历史压缩为 1-2 句简洁的中文关键信息，"
+                        "保留对后续对话最有价值的内容，去除冗余细节。只输出摘要本身，不要加任何前缀。"
+                    ),
+                },
+                {"role": "user", "content": "\n".join(compress_prompt_parts)},
+            ]
+
+            try:
+                llm = get_llm_provider()
+                new_summary = llm.chat_completion(
+                    messages=compress_messages,
+                    metadata={"purpose": "conversation_summary", "conversation_id": conversation.id},
+                ).strip()
+
+                if memory is not None:
+                    memory.summary = new_summary
+                    memory.last_message_id = evicted_messages[-1].id
+                    memory.updated_at = datetime.now(timezone.utc)
+                    self.db.add(memory)
+                    self.db.commit()
+                    current_summary = new_summary
+                    logger.info("会话 %d 摘要已更新，压缩 %d 条消息。", conversation.id, len(evicted_messages))
+            except Exception:
+                logger.exception("会话 %d 摘要压缩失败，保留旧摘要继续执行。", conversation.id)
+                # 失败时 current_summary 保持旧值，不中断主流程
+
+        # ── 构造 recent_messages（含摘要前缀）────────────────────────────────
+        recent_messages: list[dict[str, str]] = []
+        if current_summary:
+            recent_messages.append({"role": "system", "content": f"对话历史摘要：{current_summary}"})
+
+        recent_messages.extend(
             {"role": message.role, "content": message.content}
-            for message in conversation.messages[-self.settings.conversation_memory_window :]
-        ]
+            for message in all_messages[-window_size:]
+        )
         recent_messages.append({"role": "user", "content": content})
 
         planner_decision = self.planner.plan(
@@ -136,7 +201,12 @@ class ConversationService:
         context = ExecutionContext(
             user={"id": user.id, "role": user.role, "email": user.email},
             conversation={"id": conversation.id, "title": conversation.title},
-            metadata={"memory_window": self.settings.conversation_memory_window},
+            metadata={
+                "memory_window": self.settings.conversation_memory_window,
+                "trigger_type": "chat",
+                "conversation_id": conversation.id,
+                "message_id": user_message.id,
+            },
         )
         result = self.executor.execute(
             db=self.db,

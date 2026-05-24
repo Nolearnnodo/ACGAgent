@@ -46,6 +46,7 @@ class QueryAnswerComposeAtomicSkill(BaseSkill):
             user_prompt=compose_prompt,
             schema=_ReplyResult,
             skill_code=self.code,
+            additional_metadata=context.metadata,
         )
 
         note = _SOURCE_NOTES.get(source)

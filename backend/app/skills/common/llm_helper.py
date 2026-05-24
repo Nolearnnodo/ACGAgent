@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from app.llm.providers.factory import get_llm_provider
+from app.observability.llm_tracer import traced_chat_completion
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -22,6 +23,14 @@ class LLMStructuredError(RuntimeError):
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+
+
+def _truncate_prompt(text: str, max_chars: int = 6000) -> str:
+    """对传入 LLM 的 user_prompt 做长度保护，超过 max_chars 时截断并附标记。"""
+    if len(text) <= max_chars:
+        return text
+    original_len = len(text)
+    return text[:max_chars] + f"[...截断，原始 {original_len} 字符]"
 
 
 def _parse_json(content: str) -> Any:
@@ -63,10 +72,13 @@ def call_llm_structured(
     last_diag: str | None = None
     metadata = {"skill_code": skill_code, **(additional_metadata or {})}
 
+    # 传入 LLM 前对 user_prompt 做长度保护，避免大量工具结果撑爆 token 限制
+    safe_user_prompt = _truncate_prompt(user_prompt)
+
     for attempt in range(max_retries + 1):
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": safe_user_prompt},
         ]
         if attempt > 0 and last_diag:
             messages.append(
@@ -80,7 +92,17 @@ def call_llm_structured(
             )
 
         try:
-            content = provider.chat_completion(messages, metadata=metadata)
+            trace_context = {
+                **metadata,
+                "skill_code": skill_code,
+                "call_purpose": metadata.get("purpose") or "structured_output",
+            }
+            content = traced_chat_completion(
+                provider=provider,
+                messages=messages,
+                metadata=metadata,
+                trace_context=trace_context,
+            )
             payload = _parse_json(content)
             return schema(**payload)
         except json.JSONDecodeError as exc:

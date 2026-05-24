@@ -14,8 +14,13 @@ from app.agents.context import ExecutionContext
 from app.agents.executor import Executor
 from app.agents.models import PlannerDecision, PlannerInput
 from app.agents.planner import Planner
+from app.graph.repository import GraphRepository
 from app.models.passage import Passage
 from app.services.passage_service import PassageService
+from app.skills.atomic.person_identity_resolution import (
+    IdentityResolutionDecision,
+    PersonIdentityResolutionAtomicSkill,
+)
 from app.skills.workflow.passage_ingestion_workflow import (
     PassageIngestionWorkflowSkill,
     _has_graph_write_warning,
@@ -154,7 +159,7 @@ def test_passage_ingestion_workflow_skeleton(tmp_path):
         "person_layer_atomic",
         "event_relation_atomic",
         "passage_format_output_atomic",
-        "person_exact_match_merge_atomic",
+        "person_identity_resolution_atomic",
     ):
         assert stage in result["steps"]
     # context.metadata 里 probe / passage_meta / person_layer / event_relation 都要有
@@ -163,9 +168,254 @@ def test_passage_ingestion_workflow_skeleton(tmp_path):
         "passage_meta",
         "person_layer",
         "event_relation",
-        "person_exact_match_merge",
+        "person_identity_resolution",
     ):
         assert key in context.metadata
+
+
+def test_person_identity_resolution_merges_only_after_llm_same(monkeypatch):
+    result, repo, context = _run_identity_resolution(
+        monkeypatch,
+        [
+            IdentityResolutionDecision(
+                decision="same",
+                confidence=0.95,
+                positive_evidence=["同名且旁证一致"],
+                negative_evidence=[],
+                missing_evidence=[],
+                next_hop_focus=[],
+                reason="证据充分",
+            )
+        ],
+    )
+
+    assert result["merged_person_count"] == 1
+    assert repo.merges == [(8001001, 9001001)]
+    assert context.metadata["person_identity_resolution"]["status"] == "success"
+
+
+class _IdentityResolutionRepo:
+    def __init__(self, review_raises: bool = False):
+        self.merges: list[tuple[int, int]] = []
+        self.reviews: list[dict] = []
+        self.evidence_calls: list[tuple[int, int, tuple[str, ...]]] = []
+        self.review_raises = review_raises
+
+    def find_same_name_person_candidates_for_passage(self, doc_id):
+        return {
+            "records": [
+                {
+                    "name": "李某",
+                    "new_person_id": 9001001,
+                    "candidate_person_id": 8001001,
+                    "new_passage_doc_id": doc_id,
+                    "candidate_passage_doc_id": 8001,
+                    "candidate_count_for_new_person": 1,
+                }
+            ]
+        }
+
+    def get_person_evidence_bundle(self, person_id, max_hops=2, focus=None):
+        self.evidence_calls.append((person_id, max_hops, tuple(focus or [])))
+        return {
+            "person": {"person_id": person_id, "name": "李某"},
+            "passages": [{"doc_id": 9001 if person_id == 9001001 else 8001}],
+        }
+
+    def merge_person_nodes(self, canonical_person_id, duplicate_person_id):
+        self.merges.append((canonical_person_id, duplicate_person_id))
+        return {"status": "success"}
+
+    def mark_possible_same_person(self, **kwargs):
+        if self.review_raises:
+            raise RuntimeError("review edge write failed")
+        self.reviews.append(kwargs)
+        return {"status": "success"}
+
+
+def _run_identity_resolution(monkeypatch, decisions, repo=None):
+    repo = repo or _IdentityResolutionRepo()
+    decision_iter = iter(decisions)
+    monkeypatch.setattr("app.skills.atomic.person_identity_resolution.GraphRepository", lambda: repo)
+    monkeypatch.setattr(
+        "app.skills.atomic.person_identity_resolution._call_identity_llm",
+        lambda **kwargs: next(decision_iter),
+    )
+    context = _build_passage_context("测试墓志", "测试正文", doc_id=9001)
+    result = PersonIdentityResolutionAtomicSkill().run(context, {})
+    return result, repo, context
+
+
+def test_person_identity_resolution_keeps_different_people_separate(monkeypatch):
+    result, repo, _context = _run_identity_resolution(
+        monkeypatch,
+        [
+            IdentityResolutionDecision(
+                decision="different",
+                confidence=0.91,
+                negative_evidence=["任官时间冲突"],
+                reason="证据冲突",
+            )
+        ],
+    )
+
+    assert result["merged_person_count"] == 0
+    assert result["review_link_count"] == 0
+    assert result["cases"][0]["action"] == "kept_separate"
+    assert repo.merges == []
+    assert repo.reviews == []
+
+
+def test_person_identity_resolution_enters_manual_review_after_five_hops(monkeypatch):
+    result, repo, _context = _run_identity_resolution(
+        monkeypatch,
+        [
+            IdentityResolutionDecision(
+                decision="insufficient",
+                confidence=0.2,
+                missing_evidence=["亲属链不足"],
+                next_hop_focus=["relations"],
+                reason="继续查关系",
+            )
+            for _ in range(4)
+        ],
+    )
+
+    assert result["merged_person_count"] == 0
+    assert result["review_link_count"] == 1
+    assert result["cases"][0]["action"] == "manual_review"
+    assert result["cases"][0]["hops_used"] == 5
+    assert repo.merges == []
+    assert len(repo.reviews) == 1
+    assert [call[1] for call in repo.evidence_calls[::2]] == [2, 3, 4, 5]
+
+
+def test_person_identity_resolution_low_confidence_same_goes_to_manual_review(monkeypatch):
+    result, repo, _context = _run_identity_resolution(
+        monkeypatch,
+        [
+            IdentityResolutionDecision(
+                decision="same",
+                confidence=0.5,
+                positive_evidence=["同名"],
+                next_hop_focus=["events"],
+                reason="置信度不足",
+            )
+            for _ in range(4)
+        ],
+    )
+
+    assert result["merged_person_count"] == 0
+    assert result["review_link_count"] == 1
+    assert result["cases"][0]["action"] == "manual_review"
+    assert repo.merges == []
+    assert len(repo.reviews) == 1
+
+
+def test_person_identity_resolution_marks_failure_when_review_link_fails(monkeypatch):
+    result, repo, context = _run_identity_resolution(
+        monkeypatch,
+        [
+            IdentityResolutionDecision(
+                decision="insufficient",
+                confidence=0.2,
+                missing_evidence=["旁证不足"],
+                next_hop_focus=["relations"],
+                reason="继续查关系",
+            )
+            for _ in range(4)
+        ],
+        repo=_IdentityResolutionRepo(review_raises=True),
+    )
+
+    assert result["status"] == "partial"
+    assert result["failed_resolution_count"] == 1
+    assert result["review_link_count"] == 0
+    assert result["cases"][0]["action"] == "failed"
+    assert "review_link_failed" in result["cases"][0]["error"]
+    assert repo.merges == []
+    assert repo.reviews == []
+    assert any(
+        warning.get("type") == "function_b_review_link_failed"
+        for warning in context.metadata["warnings"]
+    )
+
+
+def test_merge_person_nodes_runs_inside_single_write_transaction():
+    class _Summary:
+        query_type = "w"
+        database = "neo4j"
+
+        class counters:
+            contains_updates = True
+            nodes_created = 0
+            nodes_deleted = 0
+            relationships_created = 0
+            relationships_deleted = 0
+            properties_set = 0
+            labels_added = 0
+            labels_removed = 0
+
+    class _Result:
+        def __iter__(self):
+            return iter([])
+
+        def consume(self):
+            return _Summary()
+
+    class _Tx:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cypher, parameters):
+            self.calls.append((cypher, parameters))
+            return _Result()
+
+    class _Session:
+        def __init__(self):
+            self.tx = _Tx()
+            self.execute_write_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute_write(self, fn):
+            self.execute_write_calls += 1
+            return fn(self.tx)
+
+    class _Driver:
+        def __init__(self):
+            self.session_obj = _Session()
+
+        def session(self, database):
+            assert database == "neo4j"
+            return self.session_obj
+
+    class _Client:
+        def __init__(self):
+            self.settings = SimpleNamespace(neo4j_database="neo4j")
+            self.driver = _Driver()
+
+        def get_driver(self):
+            return self.driver
+
+    client = _Client()
+    result = GraphRepository(client=client).merge_person_nodes(
+        canonical_person_id=8001001,
+        duplicate_person_id=9001001,
+    )
+
+    assert result["status"] == "success"
+    assert result["step_count"] == 7
+    assert client.driver.session_obj.execute_write_calls == 1
+    assert len(client.driver.session_obj.tx.calls) == 7
+    assert all(
+        params == {"canonical_person_id": 8001001, "duplicate_person_id": 9001001}
+        for _cypher, params in client.driver.session_obj.tx.calls
+    )
 
 
 def test_passage_ingestion_workflow_on_real_test_data(tmp_path):

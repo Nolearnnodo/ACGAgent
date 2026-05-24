@@ -16,6 +16,12 @@ from app.models.dictionary import (  # noqa: E402,F401
     SourceTypeDictionary,
 )
 from app.models.execution import ExecutionRun, ExecutionStepRun, PlannerDecisionRecord  # noqa: E402,F401
+from app.models.observability import (  # noqa: E402,F401
+    ExecutionTraceSummary,
+    LLMCallLog,
+    ModelPricingRule,
+    ToolCallLog,
+)
 from app.models.passage import Passage  # noqa: E402,F401
 from app.models.skill import SkillDefinition, SkillRelation  # noqa: E402,F401
 from app.models.user import User  # noqa: E402,F401

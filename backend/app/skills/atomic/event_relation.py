@@ -190,6 +190,7 @@ class EventRelationAtomicSkill(BaseSkill):
                 ),
                 schema=EventRelationOutput,
                 skill_code=self.code,
+                additional_metadata=context.metadata,
             )
             person_events = [pe.model_dump() for pe in result.person_events]
             person_relations = [pr.model_dump() for pr in result.person_relations]

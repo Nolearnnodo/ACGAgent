@@ -1,8 +1,10 @@
-"""Function B: exact-name person merge.
+"""Deprecated Function B: exact-name person merge.
 
-This atomic skill is intentionally conservative: it does not call LLMs, CBDB, or
-expert-review workflows. It only asks Neo4j to merge people from the current
-passage into earlier people whose ``name`` property is exactly equal.
+Deprecated on 2026-05-24. The current Function B workflow must use
+``person_identity_resolution_atomic`` instead, because exact-name merging can
+incorrectly collapse distinct historical people. This file is kept only as a
+historical compatibility module and is intentionally no longer registered in
+``SkillRegistry`` metadata or executable skill instances.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from app.skills.base import BaseSkill
 
 
 class PersonExactMatchMergeAtomicSkill(BaseSkill):
-    """Merge current-passage people into earlier same-name people."""
+    """Deprecated exact-name merge implementation."""
 
     code = "person_exact_match_merge_atomic"
     allowed_roles = ["user", "admin"]

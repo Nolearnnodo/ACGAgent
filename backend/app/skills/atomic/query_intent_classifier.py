@@ -63,6 +63,7 @@ class QueryIntentClassifierAtomicSkill(BaseSkill):
                 user_prompt=full_prompt,
                 schema=_IntentResult,
                 skill_code=self.code,
+                additional_metadata=context.metadata,
             )
         except LLMStructuredError:
             return {

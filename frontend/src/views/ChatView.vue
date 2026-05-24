@@ -2,6 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { marked } from 'marked'
 
+import axios from 'axios'
+
 import AppLayout from '../layouts/AppLayout.vue'
 import {
   createConversation,
@@ -106,6 +108,31 @@ async function handleSendMessage() {
   try {
     activeConversation.value = await sendMessage(activeConversation.value.id, content)
     conversations.value = await listConversations()
+  } catch (err: unknown) {
+    let errorText = '服务暂时不可用，请稍后重试'
+
+    if (axios.isAxiosError(err)) {
+      if (err.code === 'ECONNABORTED' || err.message?.includes('timeout')) {
+        errorText = '请求超时，请稍后重试'
+      } else if (err.response) {
+        const detail = err.response.data?.detail
+        if (detail) {
+          errorText = typeof detail === 'string' ? detail : JSON.stringify(detail)
+        }
+      } else if (err.request) {
+        errorText = '网络连接失败，请稍后重试'
+      }
+    }
+
+    if (activeConversation.value) {
+      activeConversation.value.messages.push({
+        id: Date.now(),
+        role: 'error' as 'assistant',
+        content: errorText,
+        sequence: activeConversation.value.messages.length + 1,
+        created_at: new Date().toISOString(),
+      })
+    }
   } finally {
     sending.value = false
   }
@@ -165,9 +192,13 @@ onMounted(async () => {
             v-for="message in activeConversation?.messages ?? []"
             :key="message.id"
             class="chat-page__message"
-            :class="message.role === 'assistant' ? 'chat-page__message--assistant' : 'chat-page__message--user'"
+            :class="{
+              'chat-page__message--assistant': message.role === 'assistant',
+              'chat-page__message--user': message.role === 'user',
+              'chat-page__message--error': message.role === 'error',
+            }"
           >
-            <span class="chat-page__message-role">{{ message.role }}</span>
+            <span class="chat-page__message-role">{{ message.role === 'error' ? '错误' : message.role }}</span>
             <div v-if="message.role === 'assistant'" class="chat-page__message-content" v-html="renderMarkdown(message.content)" />
             <p v-else>{{ message.content }}</p>
           </div>
@@ -438,6 +469,19 @@ onMounted(async () => {
 
 .chat-page__message--assistant {
   background: #f5f7fb;
+}
+
+.chat-page__message--error {
+  background: #fff0f0;
+  color: #c0392b;
+}
+
+.chat-page__message--error .chat-page__message-role {
+  color: #c0392b;
+}
+
+.chat-page__message--error p {
+  color: #c0392b;
 }
 
 .chat-page__loading-dots {

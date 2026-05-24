@@ -17,13 +17,21 @@ from app.agents.models import PlannerDecision, StepExecutionResult
 from app.core.deps import get_current_user
 from app.db.session import SessionLocal, get_db
 from app.models.passage import Passage
+from app.models.observability import ExecutionTraceSummary, LLMCallLog
 from app.models.user import User
+from sqlalchemy import func
+
 from app.schemas.passage import (
     PassageExecutionRunResponse,
+    PassageLLMCallUsageResponse,
     PassageManualCreateRequest,
     PassageResponse,
     PassageSummaryResponse,
+    PassageTokenUsageResponse,
+    PassageTraceSummaryResponse,
     PassageUploadResponse,
+    PassageUsageOverviewItem,
+    PassageUsageOverviewResponse,
 )
 from app.services.passage_service import MARKITDOWN_SUPPORTED_SUFFIXES, PassageService
 
@@ -197,6 +205,71 @@ def list_passages(
     return [PassageSummaryResponse.model_validate(item) for item in service.list_passages()]
 
 
+@router.get("/token-usage-overview", response_model=PassageUsageOverviewResponse)
+def get_all_passages_token_usage_overview(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PassageUsageOverviewResponse:
+    """返回所有古籍的资源追踪汇总数据。"""
+
+    rows = (
+        db.query(
+            Passage.doc_id,
+            Passage.title,
+            Passage.workflow_status,
+            func.count(LLMCallLog.id).label("llm_call_count"),
+            func.coalesce(func.sum(LLMCallLog.total_tokens), 0).label("total_tokens"),
+            func.coalesce(func.sum(LLMCallLog.prompt_cache_hit_tokens), 0).label(
+                "prompt_cache_hit_tokens"
+            ),
+            func.coalesce(func.sum(LLMCallLog.prompt_cache_miss_tokens), 0).label(
+                "prompt_cache_miss_tokens"
+            ),
+            func.coalesce(func.sum(LLMCallLog.estimated_total_cost), 0).label(
+                "estimated_total_cost"
+            ),
+        )
+        .outerjoin(LLMCallLog, LLMCallLog.passage_id == Passage.doc_id)
+        .group_by(Passage.doc_id)
+        .order_by(Passage.doc_id.desc())
+        .all()
+    )
+
+    items: list[PassageUsageOverviewItem] = []
+    total_llm_calls = 0
+    total_tokens = 0
+    total_cost = 0.0
+
+    for row in rows:
+        hit = int(row.prompt_cache_hit_tokens)
+        miss = int(row.prompt_cache_miss_tokens)
+        ratio = hit / (hit + miss) if (hit + miss) > 0 else 0.0
+        item = PassageUsageOverviewItem(
+            doc_id=row.doc_id,
+            title=row.title,
+            workflow_status=row.workflow_status,
+            llm_call_count=int(row.llm_call_count),
+            total_tokens=int(row.total_tokens),
+            prompt_cache_hit_tokens=hit,
+            prompt_cache_miss_tokens=miss,
+            cache_hit_ratio=ratio,
+            estimated_total_cost=float(row.estimated_total_cost),
+            currency="CNY",
+        )
+        items.append(item)
+        total_llm_calls += item.llm_call_count
+        total_tokens += item.total_tokens
+        total_cost += item.estimated_total_cost
+
+    return PassageUsageOverviewResponse(
+        items=items,
+        total_llm_calls=total_llm_calls,
+        total_tokens=total_tokens,
+        total_cost=total_cost,
+        currency="CNY",
+    )
+
+
 @router.get("/{doc_id}", response_model=PassageResponse)
 def get_passage(
     doc_id: int,
@@ -236,3 +309,43 @@ def list_passage_runs(
             )
         )
     return results
+
+
+@router.get("/{doc_id}/token-usage", response_model=PassageTokenUsageResponse)
+def get_passage_token_usage(
+    doc_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PassageTokenUsageResponse:
+    service = PassageService(db)
+    try:
+        service.get_passage(doc_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    latest_run = (
+        db.query(ExecutionTraceSummary)
+        .join(LLMCallLog, LLMCallLog.execution_run_id == ExecutionTraceSummary.execution_run_id)
+        .filter(LLMCallLog.passage_id == doc_id)
+        .order_by(ExecutionTraceSummary.updated_at.desc())
+        .first()
+    )
+    execution_run_id = latest_run.execution_run_id if latest_run is not None else None
+    calls_query = db.query(LLMCallLog).filter(LLMCallLog.passage_id == doc_id)
+    if execution_run_id is not None:
+        calls_query = calls_query.filter(LLMCallLog.execution_run_id == execution_run_id)
+    calls = calls_query.order_by(LLMCallLog.id.asc()).all()
+
+    return PassageTokenUsageResponse(
+        doc_id=doc_id,
+        execution_run_id=execution_run_id,
+        summary=(
+            PassageTraceSummaryResponse.model_validate(latest_run, from_attributes=True)
+            if latest_run is not None
+            else None
+        ),
+        llm_calls=[
+            PassageLLMCallUsageResponse.model_validate(call, from_attributes=True)
+            for call in calls
+        ],
+    )

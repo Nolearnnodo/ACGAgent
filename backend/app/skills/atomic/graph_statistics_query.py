@@ -72,6 +72,7 @@ class GraphStatisticsQueryAtomicSkill(BaseSkill):
             user_prompt=user_prompt,
             schema=CypherGenResult,
             skill_code=self.code,
+            additional_metadata=context.metadata,
         )
 
         try:

@@ -87,6 +87,7 @@ class PassageMetaAtomicSkill(BaseSkill):
                 user_prompt=f"【标题】{title}\n\n【正文片段】\n{head}",
                 schema=PassageMetaOutput,
                 skill_code=self.code,
+                additional_metadata=context.metadata,
             )
             output = result.model_dump()
         except LLMStructuredError as exc:

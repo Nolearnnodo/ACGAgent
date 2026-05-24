@@ -54,6 +54,7 @@ class ProbeAtomicSkill(BaseSkill):
                 user_prompt=f"【文件名】{title}\n\n【文献片段】\n{text}",
                 schema=ProbeOutput,
                 skill_code=self.code,
+                additional_metadata=context.metadata,
             )
             output = result.model_dump()
         except LLMStructuredError as exc:

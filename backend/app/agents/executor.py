@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -10,6 +11,32 @@ from app.agents.models import PlannerDecision, StepExecutionResult
 from app.models.execution import ExecutionRun, ExecutionStepRun
 from app.models.skill import SkillDefinition
 from app.skills.loader import load_skill_registry
+
+
+def _truncate_output(output: Any, max_chars: int = 8000) -> str:
+    """将 skill 执行结果序列化并截断，用于写入数据库，避免存储膨胀。
+
+    策略：
+    - 对于 dict/list，先尝试对其中的列表型字段做预处理，保留前 30 条并附统计信息；
+    - 再序列化为 JSON 字符串；
+    - 若超过 max_chars，直接截断并附 `[...截断，原始 N 字符]` 标记。
+    """
+    if isinstance(output, dict):
+        compacted: dict[str, Any] = {}
+        for key, val in output.items():
+            if isinstance(val, list) and len(val) > 30:
+                compacted[key] = val[:30] + [f"[共 {len(val)} 条，已截取前 30 条]"]
+            else:
+                compacted[key] = val
+        serialized = json.dumps(compacted, ensure_ascii=False)
+    else:
+        serialized = json.dumps(output, ensure_ascii=False)
+
+    if len(serialized) > max_chars:
+        original_len = len(serialized)
+        serialized = serialized[:max_chars] + f"[...截断，原始 {original_len} 字符]"
+
+    return serialized
 
 
 class Executor:
@@ -61,7 +88,7 @@ class Executor:
                     skill_code=planner_decision.target_skill_code,
                     status="failed",
                     input_json=json.dumps(planner_decision.arguments, ensure_ascii=False),
-                    output_json=json.dumps(result.output, ensure_ascii=False),
+                    output_json=_truncate_output(result.output),
                     error_message=result.error_message,
                 )
             )
@@ -100,7 +127,7 @@ class Executor:
                     skill_code=planner_decision.target_skill_code,
                     status="failed",
                     input_json=json.dumps(planner_decision.arguments, ensure_ascii=False),
-                    output_json=json.dumps(result.output, ensure_ascii=False),
+                    output_json=_truncate_output(result.output),
                     error_message=result.error_message,
                 )
             )
@@ -133,7 +160,9 @@ class Executor:
                     skill_code=planner_decision.target_skill_code,
                     status="success",
                     input_json=json.dumps(planner_decision.arguments, ensure_ascii=False),
-                    output_json=json.dumps(output, ensure_ascii=False),
+                    # 截断后写入数据库，避免大量节点数据撑爆存储；
+                    # 传给 context 的 output 保持原始，不受影响。
+                    output_json=_truncate_output(output),
                     error_message="",
                 )
             )

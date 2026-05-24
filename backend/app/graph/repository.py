@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.graph.client import Neo4jClient
@@ -291,11 +292,229 @@ class GraphRepository:
 
     # ---------- 业务封装：功能 B ----------
 
-    def merge_same_name_persons_for_passage(self, doc_id: int) -> dict[str, Any]:
-        """功能 B：把指定篇目中的人物按姓名精确合并到既有人物节点。
+    def find_same_name_person_candidates_for_passage(self, doc_id: int) -> dict[str, Any]:
+        """Recall same-name candidates for Function B without merging them."""
 
-        这个版本不做 LLM 裁定，也不接 CBDB；只有当新篇目人物与更早篇目人物
-        的 name 完全相等时，才把新人物节点合并到最早的同名人物节点上。
+        return self.run_read_query(
+            cypher="""
+            MATCH (new_person:Person_Nodes)-[new_rel:在文章中]->(new_passage:Passage_Info {doc_id: $doc_id})
+            WHERE new_person.name IS NOT NULL AND trim(new_person.name) <> ''
+            MATCH (candidate:Person_Nodes {name: new_person.name})-[candidate_rel:在文章中]->(candidate_passage:Passage_Info)
+            WHERE candidate.person_id <> new_person.person_id
+              AND candidate_passage.doc_id < $doc_id
+            WITH new_person,
+                 new_rel,
+                 new_passage,
+                 candidate,
+                 collect(DISTINCT {
+                    doc_id: candidate_passage.doc_id,
+                    title: candidate_passage.title,
+                    source_type: candidate_passage.source_type,
+                    level: candidate_rel.level
+                 }) AS candidate_passages,
+                 min(candidate_passage.doc_id) AS first_candidate_doc_id,
+                 max(candidate_passage.doc_id) AS latest_candidate_doc_id
+            ORDER BY latest_candidate_doc_id DESC, candidate.person_id ASC
+            WITH new_person,
+                 new_rel,
+                 new_passage,
+                 collect({
+                    candidate_person_id: candidate.person_id,
+                    candidate_passage_doc_id: first_candidate_doc_id,
+                    latest_candidate_passage_doc_id: latest_candidate_doc_id,
+                    candidate_passages: candidate_passages
+                 }) AS candidate_rows
+            UNWIND candidate_rows AS row
+            RETURN new_person.person_id AS new_person_id,
+                   new_person.name AS name,
+                   new_passage.doc_id AS new_passage_doc_id,
+                   new_passage.title AS new_passage_title,
+                   new_passage.source_type AS new_passage_source_type,
+                   new_rel.level AS new_level,
+                   row.candidate_person_id AS candidate_person_id,
+                   row.candidate_passage_doc_id AS candidate_passage_doc_id,
+                   row.latest_candidate_passage_doc_id AS latest_candidate_passage_doc_id,
+                   row.candidate_passages AS candidate_passages,
+                   size(candidate_rows) AS candidate_count_for_new_person
+            ORDER BY name, new_person_id, latest_candidate_passage_doc_id DESC, candidate_person_id
+            """,
+            parameters={"doc_id": doc_id},
+        )
+
+    def get_person_evidence_bundle(
+        self,
+        person_id: int,
+        max_hops: int = 2,
+        focus: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Build a whitelisted evidence bundle for identity adjudication."""
+
+        hops = max(1, min(int(max_hops), 5))
+        focus_set = {str(item) for item in (focus or []) if item}
+
+        basic = self.run_read_query(
+            cypher="""
+            MATCH (p:Person_Nodes {person_id: $person_id})
+            OPTIONAL MATCH (p)-[r:在文章中]->(pa:Passage_Info)
+            RETURN p {
+                .person_id,
+                .name,
+                .zi,
+                .titles,
+                .merged_person_ids
+            } AS person,
+            collect(DISTINCT {
+                doc_id: pa.doc_id,
+                title: pa.title,
+                source_type: pa.source_type,
+                era: pa.era,
+                level: r.level,
+                path: 'Person_Nodes-在文章中-Passage_Info'
+            }) AS passages
+            """,
+            parameters={"person_id": person_id},
+        )
+        records = basic.get("records", [])
+        base_record = records[0] if records else {}
+        bundle: dict[str, Any] = {
+            "person": base_record.get("person") or {"person_id": person_id},
+            "passages": [
+                item
+                for item in (base_record.get("passages") or [])
+                if item and item.get("doc_id") is not None
+            ],
+            "life_events": [],
+            "relations": [],
+            "historical_events": [],
+            "relation_paths": [],
+        }
+
+        wants_events = not focus_set or bool(focus_set & {"events", "official_titles", "locations"})
+        wants_relations = not focus_set or "relations" in focus_set
+
+        if wants_events:
+            events = self.run_read_query(
+                cypher="""
+                MATCH (p:Person_Nodes {person_id: $person_id})-[:生平]->(le:Life_Events)
+                OPTIONAL MATCH (le)-[:发生于]->(t:Time)
+                OPTIONAL MATCH (le)-[:发生于]->(l:Location)
+                OPTIONAL MATCH (le)-[:担任]->(o:Official_title)
+                RETURN le {
+                    .event_id,
+                    .event_type
+                } AS life_event,
+                t {
+                    .era,
+                    .year,
+                    .month,
+                    .day
+                } AS time,
+                l {
+                    .dao,
+                    .fu,
+                    .zhou,
+                    .jun,
+                    .xian,
+                    .other
+                } AS location,
+                o {.official_title} AS official_title,
+                'Person_Nodes-生平-Life_Events-(发生于/担任)' AS path
+                LIMIT 80
+                """,
+                parameters={"person_id": person_id},
+            )
+            bundle["life_events"] = events.get("records", [])
+
+            historical_events = self.run_read_query(
+                cypher="""
+                MATCH (p:Person_Nodes {person_id: $person_id})-[r:历史事件]->(h:Historical_Events)
+                RETURN h {.event_name} AS historical_event,
+                       r.label AS label,
+                       'Person_Nodes-历史事件-Historical_Events' AS path
+                LIMIT 50
+                """,
+                parameters={"person_id": person_id},
+            )
+            bundle["historical_events"] = historical_events.get("records", [])
+
+        if wants_relations:
+            relations = self.run_read_query(
+                cypher="""
+                MATCH (p:Person_Nodes {person_id: $person_id})-[r:person_relation]->(other:Person_Nodes)
+                RETURN 'outgoing' AS direction,
+                       other {.person_id, .name, .zi, .titles} AS other_person,
+                       r.codes AS codes,
+                       r.note AS note,
+                       'Person_Nodes-person_relation-Person_Nodes' AS path
+                UNION
+                MATCH (other:Person_Nodes)-[r:person_relation]->(p:Person_Nodes {person_id: $person_id})
+                RETURN 'incoming' AS direction,
+                       other {.person_id, .name, .zi, .titles} AS other_person,
+                       r.codes AS codes,
+                       r.note AS note,
+                       'Person_Nodes-person_relation-Person_Nodes' AS path
+                LIMIT 80
+                """,
+                parameters={"person_id": person_id},
+            )
+            bundle["relations"] = relations.get("records", [])
+
+            if hops > 2:
+                relation_paths = self.run_read_query(
+                    cypher=f"""
+                    MATCH path=(p:Person_Nodes {{person_id: $person_id}})-[:person_relation*1..{hops}]-(other:Person_Nodes)
+                    WHERE other.person_id <> $person_id
+                    RETURN [node IN nodes(path) | node {{.person_id, .name, .zi, .titles}}] AS persons,
+                           [rel IN relationships(path) | {{codes: rel.codes, note: rel.note}}] AS relations,
+                           'Person_Nodes-person_relation*1..{hops}-Person_Nodes' AS path
+                    LIMIT 30
+                    """,
+                    parameters={"person_id": person_id},
+                )
+                bundle["relation_paths"] = relation_paths.get("records", [])
+
+        bundle["max_hops"] = hops
+        bundle["focus"] = sorted(focus_set)
+        return bundle
+
+    def mark_possible_same_person(
+        self,
+        source_person_id: int,
+        target_person_id: int,
+        confidence: float,
+        reason: str,
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a review edge when evidence is insufficient for a safe merge."""
+
+        return self.run_write_query(
+            cypher="""
+            MATCH (source:Person_Nodes {person_id: $source_person_id})
+            MATCH (target:Person_Nodes {person_id: $target_person_id})
+            MERGE (source)-[r:可能同人]->(target)
+            SET r.status = '待人工判断',
+                r.confidence = $confidence,
+                r.reason = $reason,
+                r.evidence_json = $evidence_json
+            RETURN source.person_id AS source_person_id,
+                   target.person_id AS target_person_id,
+                   r.status AS status,
+                   r.confidence AS confidence
+            """,
+            parameters={
+                "source_person_id": source_person_id,
+                "target_person_id": target_person_id,
+                "confidence": confidence,
+                "reason": reason,
+                "evidence_json": json.dumps(evidence or {}, ensure_ascii=False),
+            },
+        )
+
+    def merge_same_name_persons_for_passage(self, doc_id: int) -> dict[str, Any]:
+        """已弃用：把指定篇目中的人物按姓名精确合并到既有人物节点。
+
+        当前功能 B 入口是 person_identity_resolution_atomic。该方法仅为旧
+        person_exact_match_merge_atomic 兼容保留，不应被新 workflow 调用。
         """
 
         pair_result = self.run_read_query(
@@ -449,10 +668,33 @@ class GraphRepository:
             """,
         ]
 
-        step_results = [
-            self.run_write_query(cypher=cypher, parameters=parameters)
-            for cypher in steps
-        ]
+        def _merge_tx(tx) -> list[dict[str, Any]]:
+            tx_step_results: list[dict[str, Any]] = []
+            for cypher in steps:
+                actual_cypher, query_parameters = self._extract_query(cypher, parameters)
+                result = tx.run(actual_cypher, query_parameters)
+                records = [record.data() for record in result]
+                summary = result.consume()
+                tx_step_results.append(
+                    {
+                        "status": "success",
+                        "operation": "write",
+                        "cypher": actual_cypher,
+                        "parameters": query_parameters,
+                        "record_count": len(records),
+                        "records": records,
+                        "summary": self._build_summary(summary),
+                    }
+                )
+            return tx_step_results
+
+        driver = self.client.get_driver()
+        with driver.session(database=self.client.settings.neo4j_database) as session:
+            if hasattr(session, "execute_write"):
+                step_results = session.execute_write(_merge_tx)
+            else:  # pragma: no cover - compatibility for older neo4j drivers
+                step_results = session.write_transaction(_merge_tx)
+
         return {
             "status": "success",
             "canonical_person_id": canonical_person_id,

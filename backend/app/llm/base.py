@@ -1,19 +1,31 @@
-"""外部 LLM 统一抽象。
-
-首版目标不是做复杂推理，而是为 Planner 提供受控的结构化意图识别接口。
-"""
+"""Unified external LLM provider abstraction."""
 
 from abc import ABC, abstractmethod
 from typing import Any
 
+from app.observability.schemas import LLMCallResult, LLMUsage
+
 
 class BaseLLMProvider(ABC):
-    """所有 LLM Provider 的统一接口。"""
+    """Common interface for all LLM providers."""
 
     @abstractmethod
     def generate_structured_intent(self, prompt: str, metadata: dict[str, Any]) -> dict[str, Any]:
-        """生成结构化意图识别结果。"""
+        """Generate a structured planner decision."""
 
     @abstractmethod
     def chat_completion(self, messages: list[dict[str, str]], metadata: dict[str, Any]) -> str:
-        """通用聊天接口，后续可供更丰富场景复用。"""
+        """Generic chat completion interface."""
+
+    def chat_completion_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        metadata: dict[str, Any],
+    ) -> LLMCallResult:
+        content = self.chat_completion(messages, metadata)
+        return LLMCallResult(
+            content=content,
+            usage=LLMUsage(),
+            provider="unknown",
+            model="unknown",
+        )

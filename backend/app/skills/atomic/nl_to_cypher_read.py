@@ -5,6 +5,7 @@ import json
 from app.agents.context import ExecutionContext
 from app.graph.repository import GraphRepository
 from app.llm.providers.factory import get_llm_provider
+from app.observability.llm_tracer import traced_chat_completion
 from app.skills.base import BaseSkill
 
 
@@ -48,7 +49,13 @@ class NaturalLanguageToCypherReadAtomicSkill(BaseSkill):
             {"role": "user", "content": user_prompt},
         ]
 
-        llm_content = self.provider.chat_completion(messages, metadata={"skill_code": self.code})
+        metadata = {"skill_code": self.code, **context.metadata}
+        llm_content = traced_chat_completion(
+            provider=self.provider,
+            messages=messages,
+            metadata=metadata,
+            trace_context={**metadata, "call_purpose": "nl_to_cypher"},
+        )
         parsed = json.loads(llm_content)
         cypher = self._ensure_read_only(str(parsed.get("cypher", "")))
         params = parsed.get("params") or {}

@@ -131,6 +131,7 @@ class PersonLayerAtomicSkill(BaseSkill):
                 user_prompt=f"【标题】{title}\n\n【全文】\n{text}",
                 schema=PersonLayerOutput,
                 skill_code=self.code,
+                additional_metadata=context.metadata,
             )
             persons_raw = [p.model_dump() for p in result.persons]
             pairs_raw = [r.model_dump() for r in result.pair_relations]

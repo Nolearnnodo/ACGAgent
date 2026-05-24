@@ -2,6 +2,7 @@
 
 from app.agents.context import ExecutionContext
 from app.llm.providers.factory import get_llm_provider
+from app.observability.llm_tracer import traced_chat_completion
 from app.skills.base import BaseSkill
 
 
@@ -37,13 +38,17 @@ class ConversationReplyAtomicSkill(BaseSkill):
                 messages.append({"role": role, "content": str(content)})
 
         messages.append({"role": "user", "content": user_prompt})
-        reply = self.provider.chat_completion(
-            messages,
-            metadata={
-                "skill_code": self.code,
-                "user": context.user,
-                "conversation": context.conversation,
-            },
+        metadata = {
+            "skill_code": self.code,
+            "user": context.user,
+            "conversation": context.conversation,
+            **context.metadata,
+        }
+        reply = traced_chat_completion(
+            provider=self.provider,
+            messages=messages,
+            metadata=metadata,
+            trace_context={**metadata, "call_purpose": "conversation_reply"},
         )
 
         return {

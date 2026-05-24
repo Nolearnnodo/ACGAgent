@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
@@ -51,7 +51,7 @@ npm run build    # vue-tsc --noEmit 类型检查 + vite 构建
 
 执行链路：
 
-```
+```text
 ChatRouter → ConversationService → Planner.plan() → PlannerDecision
                                                   ↓
                               Executor.execute() → SkillRegistry.get()
@@ -62,6 +62,7 @@ ChatRouter → ConversationService → Planner.plan() → PlannerDecision
 ```
 
 `ExecutionContext`（`backend/app/agents/context.py`）作为唯一上下文：
+
 - `metadata` 在路由侧注入（如 `passage_ingestion` 把 passage dict 放进来）
 - `step_results` 由 Executor / Workflow 写入（约定 key：`step1_result`、`step2_result`…）
 - `resolve_value` 支持 `$step1_result.xxx` 形式的简单引用，未来可扩展成模板
@@ -105,6 +106,19 @@ ChatRouter → ConversationService → Planner.plan() → PlannerDecision
 3. **schema 约束**：`bg_knowledge/数据库存储格式（…）.pdf` 是图节点/关系的唯一权威；`bg_knowledge/年号数据库.pdf` 与 `bg_knowledge/历史事件数据库.pdf` 是 `Time.era` 与 `Historical_Events.event_name` 的对齐表，建议作为常量字典或独立 Skill 加载
 4. **人物分级**：依 `bg_knowledge/人物分级指南.pdf`：每篇仅一个 `level=1` 核心人物；`level=2` 重要人物需有强关联（血/地/业缘）+ 具体描述；`level=3` 一般人物只统计数量，不抽取信息
 5. **添加新 Skill 时**，必须同时改三处：`registry.py` 的 `_instances`、同文件 `definitions` 列表、以及 DeepSeek Provider 的 `allowed_skill_codes`（如果它需要被 Planner 选中）
+
+## Todo 维护流程
+
+当一个设计或实施计划被确认后，需要按以下方式写入项目任务跟踪：
+
+- **统一使用中文**：`AGENTS.md`、`todo/`、`docs/superpowers/specs/`、`docs/superpowers/plans/` 中新增或修改的说明性内容默认使用中文，除代码、命令、路径、API 字段名、英文专有名词外不要写英文段落。
+- **避免编码破坏**：修改已有中文文档时不要用会把已读乱码重新写回文件的方式处理；如发现终端显示乱码，应先确认文件编码或直接用正确中文内容重写相关段落。
+- 设计文档放在 `docs/superpowers/specs/`，文件名使用日期前缀，例如 `YYYY-MM-DD-feature-name-design.md`。
+- 实施计划放在 `docs/superpowers/plans/`，文件名使用日期前缀，例如 `YYYY-MM-DD-feature-name.md`。
+- 任务清单放在现有 `todo/` 目录中，每个主题一个独立文件，例如 `todo/remote-llm-cache-tracing.md`。
+- 每次新增 `todo/` 主题文件时，必须同步更新 `todo/00-overview.md`，并在 overview 中链接到对应主题文件。
+- 不要创建根目录 `TODO.md` 或 `docs/superpowers/TODO.md` 来做项目任务跟踪。
+- todo 条目要简洁、可执行，使用与现有 `todo/` 文件一致的复选框格式：`- [ ]`、`- [~]`、`- [x]`。
 
 ## 已知坑位
 

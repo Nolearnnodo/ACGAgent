@@ -48,6 +48,9 @@ def _stub_graph_repository(monkeypatch):
             "upsert_person_historical_event",
             "upsert_person_relation",
             "merge_same_name_persons_for_passage",
+            "find_same_name_person_candidates_for_passage",
+            "get_person_evidence_bundle",
+            "mark_possible_same_person",
             "merge_person_nodes",
             "run_read_query",
             "run_write_query",
@@ -62,6 +65,13 @@ def _stub_graph_repository(monkeypatch):
             "merges": [],
             "failures": [],
         }
+        stub.find_same_name_person_candidates_for_passage.return_value = {
+            "status": "success",
+            "records": [],
+            "record_count": 0,
+        }
+        stub.get_person_evidence_bundle.return_value = {"person": {}, "passages": []}
+        stub.mark_possible_same_person.return_value = success
         return stub
 
     monkeypatch.setattr(repo_module, "GraphRepository", make_stub)
@@ -73,6 +83,7 @@ def _stub_graph_repository(monkeypatch):
         "app.skills.atomic.person_layer",
         "app.skills.atomic.event_relation",
         "app.skills.atomic.person_exact_match_merge",
+        "app.skills.atomic.person_identity_resolution",
     ):
         monkeypatch.setattr(f"{skill_module}.GraphRepository", make_stub)
 

@@ -15,7 +15,7 @@ from app.skills.atomic.graph_query import GraphQueryAtomicSkill
 from app.skills.atomic.graph_write import GraphWriteAtomicSkill
 from app.skills.atomic.nl_to_cypher_read import NaturalLanguageToCypherReadAtomicSkill
 from app.skills.atomic.passage_meta import PassageMetaAtomicSkill
-from app.skills.atomic.person_exact_match_merge import PersonExactMatchMergeAtomicSkill
+from app.skills.atomic.person_identity_resolution import PersonIdentityResolutionAtomicSkill
 from app.skills.atomic.person_layer import PersonLayerAtomicSkill
 from app.skills.atomic.probe import ProbeAtomicSkill
 from app.skills.atomic.graph_statistics_query import GraphStatisticsQueryAtomicSkill
@@ -44,7 +44,7 @@ class SkillRegistry:
             "person_layer_atomic": PersonLayerAtomicSkill(),
             "event_relation_atomic": EventRelationAtomicSkill(),
             "passage_format_output_atomic": PassageFormatOutputAtomicSkill(),
-            "person_exact_match_merge_atomic": PersonExactMatchMergeAtomicSkill(),
+            "person_identity_resolution_atomic": PersonIdentityResolutionAtomicSkill(),
             "passage_ingestion_workflow": PassageIngestionWorkflowSkill(),
             "query_intent_classifier_atomic": QueryIntentClassifierAtomicSkill(),
             "query_answer_compose_atomic": QueryAnswerComposeAtomicSkill(),
@@ -144,18 +144,18 @@ class SkillRegistry:
                 "allowed_roles": ["user", "admin"],
             },
             {
-                "name": "Function B exact-name person merge",
-                "code": "person_exact_match_merge_atomic",
+                "name": "Function B person identity resolution",
+                "code": "person_identity_resolution_atomic",
                 "skill_type": "atomic",
-                "description": "Merge current-passage people into earlier same-name people without LLM adjudication.",
-                "script_path": str(Path("backend/app/skills/atomic/person_exact_match_merge.py")),
+                "description": "Recall same-name candidates, build whitelisted evidence, adjudicate with fixed JSON, and merge only high-confidence same-person cases.",
+                "script_path": str(Path("backend/app/skills/atomic/person_identity_resolution.py")),
                 "allowed_roles": ["user", "admin"],
             },
             {
                 "name": "Passage ingestion workflow",
                 "code": "passage_ingestion_workflow",
                 "skill_type": "workflow",
-                "description": "Run Function A extraction and Function B exact-name merge.",
+                "description": "Run Function A extraction and Function B identity resolution.",
                 "script_path": str(Path("backend/app/skills/workflow/passage_ingestion_workflow.py")),
                 "allowed_roles": ["user", "admin"],
             },
@@ -240,6 +240,22 @@ class SkillRegistry:
                     status="enabled",
                 )
             )
+
+        deprecated_codes = {
+            "person_exact_match_merge_atomic": (
+                "Deprecated: use person_identity_resolution_atomic for Function B identity resolution."
+            ),
+        }
+        for code, description in deprecated_codes.items():
+            existing = (
+                db.query(SkillDefinition)
+                .filter(SkillDefinition.code == code)
+                .first()
+            )
+            if existing:
+                existing.status = "deprecated"
+                existing.description = description
+                db.add(existing)
 
         db.commit()
 
