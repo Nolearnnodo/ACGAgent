@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import time
+from typing import Any
+
 from app.agents.context import ExecutionContext
+from app.db.session import SessionLocal
 from app.graph.repository import GraphRepository
+from app.observability.trace_repository import record_tool_call
 from app.skills.base import BaseSkill
 
 _LOOKUP_CYPHER = (
@@ -51,8 +56,57 @@ RETURN other.name AS target_name, r.codes AS codes, r.note AS note, "incoming" A
 """
 
 
-def _lookup_person(repo: GraphRepository, name: str) -> dict:
-    result = repo.run_read_query(_LOOKUP_CYPHER, {"name": name})
+def _run_traced_read_query(
+    repo: GraphRepository,
+    trace_context: dict[str, Any],
+    cypher: str,
+    parameters: dict[str, Any],
+) -> dict:
+    started_at = time.time()
+    input_data = {"cypher": cypher, "parameters": parameters}
+    should_trace = bool(trace_context.get("execution_run_id"))
+    try:
+        result = repo.run_read_query(cypher, parameters)
+    except Exception as exc:
+        if should_trace:
+            latency_ms = int((time.time() - started_at) * 1000)
+            with SessionLocal() as db:
+                record_tool_call(
+                    db=db,
+                    trace_context=trace_context,
+                    tool_name="neo4j_read_query",
+                    input_data=input_data,
+                    output_data={},
+                    latency_ms=latency_ms,
+                    status="failed",
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+        raise
+
+    if not should_trace:
+        return result
+
+    latency_ms = int((time.time() - started_at) * 1000)
+    with SessionLocal() as db:
+        record_tool_call(
+            db=db,
+            trace_context=trace_context,
+            tool_name="neo4j_read_query",
+            input_data=input_data,
+            output_data=result,
+            latency_ms=latency_ms,
+            status=str(result.get("status") or "success"),
+            error_message=str(result.get("error") or ""),
+        )
+    return result
+
+
+def _lookup_person(
+    repo: GraphRepository,
+    trace_context: dict[str, Any],
+    name: str,
+) -> dict:
+    result = _run_traced_read_query(repo, trace_context, _LOOKUP_CYPHER, {"name": name})
     records = result.get("records", [])
     if not records:
         return {"found": False, "source": "llm", "data": None}
@@ -71,8 +125,13 @@ class PersonRelationQueryAtomicSkill(BaseSkill):
     def run(self, context: ExecutionContext, arguments: dict) -> dict:
         person_a = arguments.get("person_a", "").strip()
         person_b = arguments.get("person_b", "").strip()
+        trace_context = {**context.metadata, "skill_code": self.code}
 
-        info_a = _lookup_person(self.repository, person_a) if person_a else {"found": False, "source": "llm", "data": None}
+        info_a = (
+            _lookup_person(self.repository, trace_context, person_a)
+            if person_a
+            else {"found": False, "source": "llm", "data": None}
+        )
 
         # 单人模式：只有 person_a，查询其所有关系
         if not person_b:
@@ -85,8 +144,11 @@ class PersonRelationQueryAtomicSkill(BaseSkill):
                     "source": "llm",
                 }
             pid_a = info_a["data"]["person_id"]
-            all_relations = self.repository.run_read_query(
-                _ALL_RELATIONS_CYPHER, {"pid_a": pid_a}
+            all_relations = _run_traced_read_query(
+                self.repository,
+                trace_context,
+                _ALL_RELATIONS_CYPHER,
+                {"pid_a": pid_a},
             )["records"]
             return {
                 "person_a_info": info_a,
@@ -97,7 +159,7 @@ class PersonRelationQueryAtomicSkill(BaseSkill):
             }
 
         # 双人模式：查询两人之间的关系
-        info_b = _lookup_person(self.repository, person_b)
+        info_b = _lookup_person(self.repository, trace_context, person_b)
 
         direct_relations: list[dict] = []
         shared_time: list[dict] = []
@@ -111,28 +173,46 @@ class PersonRelationQueryAtomicSkill(BaseSkill):
             pid_b = info_b["data"]["person_id"]
             params = {"pid_a": pid_a, "pid_b": pid_b}
 
-            direct_relations = self.repository.run_read_query(
-                _DIRECT_RELATION_CYPHER, params
+            direct_relations = _run_traced_read_query(
+                self.repository,
+                trace_context,
+                _DIRECT_RELATION_CYPHER,
+                params,
             )["records"]
 
-            shared_time = self.repository.run_read_query(
-                _SHARED_TIME_CYPHER, params
+            shared_time = _run_traced_read_query(
+                self.repository,
+                trace_context,
+                _SHARED_TIME_CYPHER,
+                params,
             )["records"]
 
-            shared_location = self.repository.run_read_query(
-                _SHARED_LOCATION_CYPHER, params
+            shared_location = _run_traced_read_query(
+                self.repository,
+                trace_context,
+                _SHARED_LOCATION_CYPHER,
+                params,
             )["records"]
 
-            shared_official_title = self.repository.run_read_query(
-                _SHARED_TITLE_CYPHER, params
+            shared_official_title = _run_traced_read_query(
+                self.repository,
+                trace_context,
+                _SHARED_TITLE_CYPHER,
+                params,
             )["records"]
 
-            shared_historical_events = self.repository.run_read_query(
-                _SHARED_HIST_CYPHER, params
+            shared_historical_events = _run_traced_read_query(
+                self.repository,
+                trace_context,
+                _SHARED_HIST_CYPHER,
+                params,
             )["records"]
 
-            shared_passages = self.repository.run_read_query(
-                _SHARED_PASSAGE_CYPHER, params
+            shared_passages = _run_traced_read_query(
+                self.repository,
+                trace_context,
+                _SHARED_PASSAGE_CYPHER,
+                params,
             )["records"]
 
         return {

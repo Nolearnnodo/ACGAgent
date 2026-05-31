@@ -1,5 +1,6 @@
 """对话服务。"""
 
+import json as _json
 import logging
 from datetime import datetime, timezone
 
@@ -12,8 +13,17 @@ from app.agents.planner import Planner
 from app.core.config import get_settings
 from app.llm.providers.factory import get_llm_provider
 from app.models.conversation import Conversation, ConversationMemory, Message
-from app.models.execution import PlannerDecisionRecord
+from app.models.execution import ExecutionRun, ExecutionStepRun, PlannerDecisionRecord
+from app.models.observability import ExecutionTraceSummary, LLMCallLog, ToolCallLog
 from app.models.user import User
+from app.schemas.conversation import (
+    ExecutionStepResponse,
+    LLMCallSummaryResponse,
+    MessageTraceResponse,
+    PlannerDecisionResponse,
+    ToolCallSummaryResponse,
+    TraceSummaryResponse,
+)
 from app.skills.registry import SkillRegistry
 
 logger = logging.getLogger(__name__)
@@ -227,3 +237,157 @@ class ConversationService:
         self.db.refresh(assistant_message)
         self.db.refresh(conversation)
         return conversation, user_message, assistant_message
+
+    def get_message_trace(self, user: User, conversation_id: int, message_id: int) -> MessageTraceResponse:
+        """获取某条 assistant 消息对应的推理过程追踪数据。"""
+
+        message = (
+            self.db.query(Message)
+            .filter(Message.id == message_id, Message.conversation_id == conversation_id)
+            .first()
+        )
+        if message is None:
+            raise ValueError("消息不存在。")
+
+        conversation = (
+            self.db.query(Conversation)
+            .filter(Conversation.id == conversation_id, Conversation.user_id == user.id)
+            .first()
+        )
+        if conversation is None:
+            raise ValueError("会话不存在。")
+
+        if message.role == "assistant":
+            user_msg = (
+                self.db.query(Message)
+                .filter(
+                    Message.conversation_id == conversation_id,
+                    Message.sequence == message.sequence - 1,
+                    Message.role == "user",
+                )
+                .first()
+            )
+            trigger_msg_id = user_msg.id if user_msg else None
+        else:
+            trigger_msg_id = message.id
+
+        if trigger_msg_id is None:
+            return MessageTraceResponse()
+
+        planner_record = (
+            self.db.query(PlannerDecisionRecord)
+            .filter(
+                PlannerDecisionRecord.conversation_id == conversation_id,
+                PlannerDecisionRecord.message_id == trigger_msg_id,
+            )
+            .order_by(PlannerDecisionRecord.id.desc())
+            .first()
+        )
+
+        execution_run = (
+            self.db.query(ExecutionRun)
+            .filter(
+                ExecutionRun.conversation_id == conversation_id,
+                ExecutionRun.trigger_message_id == trigger_msg_id,
+            )
+            .order_by(ExecutionRun.id.desc())
+            .first()
+        )
+
+        steps: list[ExecutionStepResponse] = []
+        llm_calls: list[LLMCallSummaryResponse] = []
+        tool_calls_resp: list[ToolCallSummaryResponse] = []
+        summary_resp: TraceSummaryResponse | None = None
+
+        if execution_run is not None:
+            step_rows = (
+                self.db.query(ExecutionStepRun)
+                .filter(ExecutionStepRun.execution_run_id == execution_run.id)
+                .order_by(ExecutionStepRun.step_no)
+                .all()
+            )
+            for s in step_rows:
+                try:
+                    out = _json.loads(s.output_json) if s.output_json else None
+                except _json.JSONDecodeError:
+                    out = None
+                steps.append(ExecutionStepResponse(
+                    step_no=s.step_no,
+                    skill_code=s.skill_code,
+                    status=s.status,
+                    output_preview=out,
+                ))
+
+            llm_rows = (
+                self.db.query(LLMCallLog)
+                .filter(LLMCallLog.execution_run_id == execution_run.id)
+                .order_by(LLMCallLog.created_at)
+                .all()
+            )
+            for lc in llm_rows:
+                llm_calls.append(LLMCallSummaryResponse(
+                    skill_code=lc.skill_code,
+                    call_purpose=lc.call_purpose,
+                    provider=lc.provider,
+                    model=lc.model,
+                    total_tokens=lc.total_tokens,
+                    latency_ms=lc.latency_ms,
+                    status=lc.status,
+                    response_text=lc.response_text[:2000] if lc.response_text else "",
+                ))
+
+            tool_rows = (
+                self.db.query(ToolCallLog)
+                .filter(ToolCallLog.execution_run_id == execution_run.id)
+                .order_by(ToolCallLog.created_at)
+                .all()
+            )
+            for tc in tool_rows:
+                try:
+                    inp = _json.loads(tc.input_json) if tc.input_json else None
+                except _json.JSONDecodeError:
+                    inp = None
+                try:
+                    outp = _json.loads(tc.output_json) if tc.output_json else None
+                except _json.JSONDecodeError:
+                    outp = None
+                tool_calls_resp.append(ToolCallSummaryResponse(
+                    skill_code=tc.skill_code,
+                    tool_name=tc.tool_name,
+                    input_preview=inp,
+                    output_preview=outp,
+                    latency_ms=tc.latency_ms,
+                    status=tc.status,
+                    error_message=tc.error_message or "",
+                ))
+
+            summary = (
+                self.db.query(ExecutionTraceSummary)
+                .filter(ExecutionTraceSummary.execution_run_id == execution_run.id)
+                .first()
+            )
+            if summary is not None:
+                summary_resp = TraceSummaryResponse(
+                    llm_call_count=summary.llm_call_count,
+                    tool_call_count=summary.tool_call_count,
+                    total_tokens=summary.total_tokens,
+                    estimated_total_cost=summary.estimated_total_cost,
+                    currency=summary.currency,
+                    total_latency_ms=summary.total_latency_ms,
+                )
+
+        return MessageTraceResponse(
+            planner=PlannerDecisionResponse(
+                intent=planner_record.intent,
+                decision_type=planner_record.decision_type,
+                target_skill_code=planner_record.target_skill_code,
+                reason=planner_record.reason,
+            ) if planner_record else None,
+            execution_status=execution_run.status if execution_run else None,
+            execution_started_at=execution_run.started_at if execution_run else None,
+            execution_finished_at=execution_run.finished_at if execution_run else None,
+            steps=steps,
+            llm_calls=llm_calls,
+            tool_calls=tool_calls_resp,
+            summary=summary_resp,
+        )

@@ -12,6 +12,7 @@ from app.schemas.conversation import (
     ConversationResponse,
     ConversationUpdateRequest,
     MessageCreateRequest,
+    MessageTraceResponse,
 )
 from app.schemas.common import MessageResponse
 from app.services.conversation_service import ConversationService
@@ -112,3 +113,22 @@ def send_message(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     return ConversationDetailResponse.model_validate(conversation)
+
+
+@router.get(
+    "/conversations/{conversation_id}/messages/{message_id}/trace",
+    response_model=MessageTraceResponse,
+)
+def get_message_trace(
+    conversation_id: int,
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MessageTraceResponse:
+    """获取消息的推理过程追踪数据。"""
+
+    service = ConversationService(db)
+    try:
+        return service.get_message_trace(current_user, conversation_id, message_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc

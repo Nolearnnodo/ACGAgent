@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import time
+from typing import Any
+
 from pydantic import BaseModel
 
 from app.agents.context import ExecutionContext
+from app.db.session import SessionLocal
 from app.graph.repository import GraphRepository
+from app.observability.trace_repository import record_tool_call
 from app.skills.base import BaseSkill
 from app.skills.common.llm_helper import call_llm_structured
 
@@ -45,6 +50,51 @@ class CypherGenResult(BaseModel):
     explanation: str
 
 
+def _run_traced_read_query(
+    repo: GraphRepository,
+    trace_context: dict[str, Any],
+    cypher: str,
+    parameters: dict[str, Any],
+) -> dict:
+    started_at = time.time()
+    input_data = {"cypher": cypher, "parameters": parameters}
+    should_trace = bool(trace_context.get("execution_run_id"))
+    try:
+        result = repo.run_read_query(cypher, parameters)
+    except Exception as exc:
+        if should_trace:
+            latency_ms = int((time.time() - started_at) * 1000)
+            with SessionLocal() as db:
+                record_tool_call(
+                    db=db,
+                    trace_context=trace_context,
+                    tool_name="neo4j_read_query",
+                    input_data=input_data,
+                    output_data={},
+                    latency_ms=latency_ms,
+                    status="failed",
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+        raise
+
+    if not should_trace:
+        return result
+
+    latency_ms = int((time.time() - started_at) * 1000)
+    with SessionLocal() as db:
+        record_tool_call(
+            db=db,
+            trace_context=trace_context,
+            tool_name="neo4j_read_query",
+            input_data=input_data,
+            output_data=result,
+            latency_ms=latency_ms,
+            status=str(result.get("status") or "success"),
+            error_message=str(result.get("error") or ""),
+        )
+    return result
+
+
 class GraphStatisticsQueryAtomicSkill(BaseSkill):
     code = "graph_statistics_query_atomic"
     allowed_roles = ["user", "admin"]
@@ -84,7 +134,13 @@ class GraphStatisticsQueryAtomicSkill(BaseSkill):
                 "explanation": result.explanation,
             }
 
-        query_result = self.repository.run_read_query(cypher, result.params)
+        trace_context = {**context.metadata, "skill_code": self.code}
+        query_result = _run_traced_read_query(
+            self.repository,
+            trace_context,
+            cypher,
+            result.params,
+        )
         return {
             "cypher": cypher,
             "explanation": result.explanation,

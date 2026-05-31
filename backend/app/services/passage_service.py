@@ -1,5 +1,6 @@
 """古籍文章服务。"""
 
+from dataclasses import dataclass
 import hashlib
 import io
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app.models.execution import ExecutionRun, ExecutionStepRun
+from app.models.observability import ExecutionTraceSummary, LLMCallLog
 from app.models.passage import Passage
 from app.models.user import User
 
@@ -31,6 +33,22 @@ MARKITDOWN_SUPPORTED_SUFFIXES = frozenset(
         ".epub",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PassageUsageOverviewRow:
+    """最新一次 passage run 的资源用量摘要。"""
+
+    doc_id: int
+    title: str
+    workflow_status: str
+    llm_call_count: int
+    total_tokens: int
+    prompt_cache_hit_tokens: int
+    prompt_cache_miss_tokens: int
+    cache_hit_ratio: float
+    estimated_total_cost: float
+    currency: str
 
 
 class PassageService:
@@ -85,6 +103,7 @@ class PassageService:
         source_type: str,
         file_name: str | None = None,
         content_hash: str | None = None,
+        commit: bool = True,
     ) -> Passage:
         """创建 Passage 数据。"""
 
@@ -99,8 +118,11 @@ class PassageService:
             workflow_status="pending",
         )
         self.db.add(passage)
-        self.db.commit()
-        self.db.refresh(passage)
+        if commit:
+            self.db.commit()
+            self.db.refresh(passage)
+        else:
+            self.db.flush()
         return passage
 
     def list_passages(self) -> list[Passage]:
@@ -137,6 +159,86 @@ class PassageService:
             result.append((run, steps))
 
         return result
+
+    def get_latest_passage_trace(
+        self,
+        doc_id: int,
+    ) -> tuple[int | None, ExecutionTraceSummary | None, list[LLMCallLog]]:
+        """返回指定文章最新一次执行的 trace 汇总与 LLM 调用。
+
+        最新执行以 execution_runs 为准，而不是以 llm_call_logs 为准。这样当
+        rerun 刚开始或没有产生 LLM 调用时，前端不会继续展示上一轮的 token 数据。
+        """
+
+        latest_run = (
+            self.db.query(ExecutionRun)
+            .filter(ExecutionRun.passage_id == doc_id)
+            .order_by(ExecutionRun.started_at.desc(), ExecutionRun.id.desc())
+            .first()
+        )
+        if latest_run is None:
+            return None, None, []
+
+        summary = (
+            self.db.query(ExecutionTraceSummary)
+            .filter(ExecutionTraceSummary.execution_run_id == latest_run.id)
+            .first()
+        )
+        calls = (
+            self.db.query(LLMCallLog)
+            .filter(LLMCallLog.execution_run_id == latest_run.id)
+            .filter(LLMCallLog.passage_id == doc_id)
+            .order_by(LLMCallLog.id.asc())
+            .all()
+        )
+        return latest_run.id, summary, calls
+
+    def get_passage_usage_overview_rows(self) -> list[PassageUsageOverviewRow]:
+        """按文章返回最新一次执行的资源用量。
+
+        只读取每篇文章最新 execution_run 关联的 summary；如果最新 run 尚无
+        summary，则该文章显示 0 用量，避免把旧 run 的成本误算进当前状态。
+        """
+
+        passages = self.db.query(Passage).order_by(Passage.doc_id.desc()).all()
+        rows: list[PassageUsageOverviewRow] = []
+
+        for passage in passages:
+            latest_run = (
+                self.db.query(ExecutionRun)
+                .filter(ExecutionRun.passage_id == passage.doc_id)
+                .order_by(ExecutionRun.started_at.desc(), ExecutionRun.id.desc())
+                .first()
+            )
+            summary = None
+            if latest_run is not None:
+                summary = (
+                    self.db.query(ExecutionTraceSummary)
+                    .filter(ExecutionTraceSummary.execution_run_id == latest_run.id)
+                    .first()
+                )
+
+            hit = int(summary.prompt_cache_hit_tokens) if summary is not None else 0
+            miss = int(summary.prompt_cache_miss_tokens) if summary is not None else 0
+            ratio = hit / (hit + miss) if (hit + miss) > 0 else 0.0
+            rows.append(
+                PassageUsageOverviewRow(
+                    doc_id=passage.doc_id,
+                    title=passage.title,
+                    workflow_status=passage.workflow_status,
+                    llm_call_count=int(summary.llm_call_count) if summary is not None else 0,
+                    total_tokens=int(summary.total_tokens) if summary is not None else 0,
+                    prompt_cache_hit_tokens=hit,
+                    prompt_cache_miss_tokens=miss,
+                    cache_hit_ratio=ratio,
+                    estimated_total_cost=(
+                        float(summary.estimated_total_cost) if summary is not None else 0.0
+                    ),
+                    currency=summary.currency if summary is not None else "CNY",
+                )
+            )
+
+        return rows
 
     def update_workflow_status(self, passage: Passage, status: str) -> Passage:
         """更新文章的最新 workflow 状态。"""

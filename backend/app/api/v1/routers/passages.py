@@ -17,9 +17,7 @@ from app.agents.models import PlannerDecision, StepExecutionResult
 from app.core.deps import get_current_user
 from app.db.session import SessionLocal, get_db
 from app.models.passage import Passage
-from app.models.observability import ExecutionTraceSummary, LLMCallLog
 from app.models.user import User
-from sqlalchemy import func
 
 from app.schemas.passage import (
     PassageExecutionRunResponse,
@@ -36,6 +34,18 @@ from app.schemas.passage import (
 from app.services.passage_service import MARKITDOWN_SUPPORTED_SUFFIXES, PassageService
 
 router = APIRouter(prefix="/passages", tags=["古籍文章"])
+
+
+def _build_skipped_upload_response(
+    passage: Passage,
+    skip_reason: str,
+) -> PassageUploadResponse:
+    return PassageUploadResponse.model_validate(passage).model_copy(
+        update={
+            "upload_status": "skipped_existing",
+            "skip_reason": skip_reason,
+        }
+    )
 
 
 def _trigger_workflow(
@@ -95,8 +105,17 @@ def _run_workflow_background(user_id: int, passage_id: int, trigger_type: str) -
         db.commit()
         db.refresh(passage)
 
-        result = _trigger_workflow(db, user, passage, trigger_type=trigger_type)
-        new_status = _resolve_passage_status(result)
+        try:
+            result = _trigger_workflow(db, user, passage, trigger_type=trigger_type)
+            new_status = _resolve_passage_status(result)
+        except Exception:
+            db.rollback()
+            failed = db.get(Passage, passage_id)
+            if failed is not None:
+                failed.workflow_status = "failed"
+                db.add(failed)
+                db.commit()
+            raise
 
         # workflow 跑完后再开一次 fresh query，避免 session 内对象被 detach
         fresh = db.get(Passage, passage_id)
@@ -146,7 +165,7 @@ async def upload_passages(
     """上传一个或多个古籍文件；立即返回 pending 列表，workflow 后台跑。"""
 
     service = PassageService(db)
-    passages: list[PassageUploadResponse] = []
+    prepared_uploads: list[dict[str, str | None]] = []
 
     for file in files:
         suffix = Path(file.filename or "").suffix.lower()
@@ -167,33 +186,67 @@ async def upload_passages(
                 detail=f"文件解析失败：{file.filename}",
             ) from exc
 
-        content_hash = service.compute_content_hash(context)
-        existing = service.find_duplicate_passage(context, content_hash)
-        if existing is not None:
-            passages.append(
-                PassageUploadResponse.model_validate(existing).model_copy(
-                    update={
-                        "upload_status": "skipped_existing",
-                        "skip_reason": f"已存在文章 doc_id={existing.doc_id}，状态={existing.workflow_status}，已跳过入队。",
-                    }
+        prepared_uploads.append(
+            {
+                "file_name": file.filename,
+                "title": title,
+                "context": context,
+                "content_hash": service.compute_content_hash(context),
+            }
+        )
+
+    responses: list[PassageUploadResponse | None] = [None] * len(prepared_uploads)
+    created_passage_ids: list[int] = []
+    created_by_hash: dict[str, Passage] = {}
+
+    try:
+        for index, prepared in enumerate(prepared_uploads):
+            context = str(prepared["context"] or "")
+            content_hash = str(prepared["content_hash"] or "")
+
+            duplicate_in_batch = created_by_hash.get(content_hash)
+            if duplicate_in_batch is not None:
+                responses[index] = _build_skipped_upload_response(
+                    duplicate_in_batch,
+                    f"本次上传中已创建文章 doc_id={duplicate_in_batch.doc_id}，已跳过重复入队。",
                 )
+                continue
+
+            existing = service.find_duplicate_passage(context, content_hash)
+            if existing is not None:
+                responses[index] = _build_skipped_upload_response(
+                    existing,
+                    f"已存在文章 doc_id={existing.doc_id}，状态={existing.workflow_status}，已跳过入队。",
+                )
+                continue
+
+            passage = service.create_passage(
+                user=current_user,
+                title=str(prepared["title"] or ""),
+                context=context,
+                source_type="upload",
+                file_name=prepared["file_name"],
+                content_hash=content_hash,
+                commit=False,
             )
-            continue
+            created_passage_ids.append(passage.doc_id)
+            created_by_hash[content_hash] = passage
+            responses[index] = PassageUploadResponse.model_validate(passage)
 
-        passage = service.create_passage(
-            user=current_user,
-            title=title,
-            context=context,
-            source_type="upload",
-            file_name=file.filename,
-            content_hash=content_hash,
-        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="批量上传写入失败，已回滚本次新增文章。",
+        ) from exc
+
+    for passage_id in created_passage_ids:
         background_tasks.add_task(
-            _run_workflow_background, current_user.id, passage.doc_id, "passage_upload"
+            _run_workflow_background, current_user.id, passage_id, "passage_upload"
         )
-        passages.append(PassageUploadResponse.model_validate(passage))
 
-    return passages
+    return [response for response in responses if response is not None]
 
 
 @router.get("", response_model=list[PassageSummaryResponse])
@@ -212,28 +265,8 @@ def get_all_passages_token_usage_overview(
 ) -> PassageUsageOverviewResponse:
     """返回所有古籍的资源追踪汇总数据。"""
 
-    rows = (
-        db.query(
-            Passage.doc_id,
-            Passage.title,
-            Passage.workflow_status,
-            func.count(LLMCallLog.id).label("llm_call_count"),
-            func.coalesce(func.sum(LLMCallLog.total_tokens), 0).label("total_tokens"),
-            func.coalesce(func.sum(LLMCallLog.prompt_cache_hit_tokens), 0).label(
-                "prompt_cache_hit_tokens"
-            ),
-            func.coalesce(func.sum(LLMCallLog.prompt_cache_miss_tokens), 0).label(
-                "prompt_cache_miss_tokens"
-            ),
-            func.coalesce(func.sum(LLMCallLog.estimated_total_cost), 0).label(
-                "estimated_total_cost"
-            ),
-        )
-        .outerjoin(LLMCallLog, LLMCallLog.passage_id == Passage.doc_id)
-        .group_by(Passage.doc_id)
-        .order_by(Passage.doc_id.desc())
-        .all()
-    )
+    service = PassageService(db)
+    rows = service.get_passage_usage_overview_rows()
 
     items: list[PassageUsageOverviewItem] = []
     total_llm_calls = 0
@@ -241,20 +274,17 @@ def get_all_passages_token_usage_overview(
     total_cost = 0.0
 
     for row in rows:
-        hit = int(row.prompt_cache_hit_tokens)
-        miss = int(row.prompt_cache_miss_tokens)
-        ratio = hit / (hit + miss) if (hit + miss) > 0 else 0.0
         item = PassageUsageOverviewItem(
             doc_id=row.doc_id,
             title=row.title,
             workflow_status=row.workflow_status,
             llm_call_count=int(row.llm_call_count),
             total_tokens=int(row.total_tokens),
-            prompt_cache_hit_tokens=hit,
-            prompt_cache_miss_tokens=miss,
-            cache_hit_ratio=ratio,
+            prompt_cache_hit_tokens=row.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens=row.prompt_cache_miss_tokens,
+            cache_hit_ratio=row.cache_hit_ratio,
             estimated_total_cost=float(row.estimated_total_cost),
-            currency="CNY",
+            currency=row.currency,
         )
         items.append(item)
         total_llm_calls += item.llm_call_count
@@ -323,25 +353,14 @@ def get_passage_token_usage(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
-    latest_run = (
-        db.query(ExecutionTraceSummary)
-        .join(LLMCallLog, LLMCallLog.execution_run_id == ExecutionTraceSummary.execution_run_id)
-        .filter(LLMCallLog.passage_id == doc_id)
-        .order_by(ExecutionTraceSummary.updated_at.desc())
-        .first()
-    )
-    execution_run_id = latest_run.execution_run_id if latest_run is not None else None
-    calls_query = db.query(LLMCallLog).filter(LLMCallLog.passage_id == doc_id)
-    if execution_run_id is not None:
-        calls_query = calls_query.filter(LLMCallLog.execution_run_id == execution_run_id)
-    calls = calls_query.order_by(LLMCallLog.id.asc()).all()
+    execution_run_id, summary, calls = service.get_latest_passage_trace(doc_id)
 
     return PassageTokenUsageResponse(
         doc_id=doc_id,
         execution_run_id=execution_run_id,
         summary=(
-            PassageTraceSummaryResponse.model_validate(latest_run, from_attributes=True)
-            if latest_run is not None
+            PassageTraceSummaryResponse.model_validate(summary, from_attributes=True)
+            if summary is not None
             else None
         ),
         llm_calls=[

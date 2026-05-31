@@ -6,11 +6,11 @@ Function B maintenance step: same-name person identity adjudication.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any
 
 from app.agents.context import ExecutionContext
+from app.agents.step_output import serialize_step_output
 from app.db.session import SessionLocal
 from app.models.execution import ExecutionStepRun
 from app.skills.atomic.event_relation import EventRelationAtomicSkill
@@ -94,7 +94,7 @@ class PassageIngestionWorkflowSkill(BaseSkill):
                     input_json="{}",
                 )
             step.status = status
-            step.output_json = json.dumps(output or {}, ensure_ascii=False)[:8000]
+            step.output_json = serialize_step_output(output)
             step.error_message = (error or "")[:500]
             db.add(step)
             db.commit()

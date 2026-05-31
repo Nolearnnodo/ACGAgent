@@ -1,8 +1,58 @@
 from __future__ import annotations
 
+import time
+from typing import Any
+
 from app.agents.context import ExecutionContext
+from app.db.session import SessionLocal
 from app.graph.repository import GraphRepository
+from app.observability.trace_repository import record_tool_call
 from app.skills.base import BaseSkill
+
+
+def _run_traced_read_query(
+    repo: GraphRepository,
+    trace_context: dict[str, Any],
+    cypher: str,
+    parameters: dict[str, Any],
+) -> dict:
+    started_at = time.time()
+    input_data = {"cypher": cypher, "parameters": parameters}
+    should_trace = bool(trace_context.get("execution_run_id"))
+    try:
+        result = repo.run_read_query(cypher=cypher, parameters=parameters)
+    except Exception as exc:
+        if should_trace:
+            latency_ms = int((time.time() - started_at) * 1000)
+            with SessionLocal() as db:
+                record_tool_call(
+                    db=db,
+                    trace_context=trace_context,
+                    tool_name="neo4j_read_query",
+                    input_data=input_data,
+                    output_data={},
+                    latency_ms=latency_ms,
+                    status="failed",
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+        raise
+
+    if not should_trace:
+        return result
+
+    latency_ms = int((time.time() - started_at) * 1000)
+    with SessionLocal() as db:
+        record_tool_call(
+            db=db,
+            trace_context=trace_context,
+            tool_name="neo4j_read_query",
+            input_data=input_data,
+            output_data=result,
+            latency_ms=latency_ms,
+            status=str(result.get("status") or "success"),
+            error_message=str(result.get("error") or ""),
+        )
+    return result
 
 
 class PersonInfoQueryAtomicSkill(BaseSkill):
@@ -17,7 +67,10 @@ class PersonInfoQueryAtomicSkill(BaseSkill):
         if not name:
             raise ValueError("person_info_query requires person_name.")
 
-        match_result = self.repository.run_read_query(
+        trace_context = {**context.metadata, "skill_code": self.code}
+        match_result = _run_traced_read_query(
+            self.repository,
+            trace_context,
             cypher="MATCH (p:Person_Nodes {name: $name}) RETURN p",
             parameters={"name": name},
         )
@@ -34,10 +87,14 @@ class PersonInfoQueryAtomicSkill(BaseSkill):
                 "name": p.get("name"),
                 "zi": p.get("zi"),
                 "titles": p.get("titles"),
-                "life_events": _fetch_life_events(self.repository, pid),
-                "relations": _fetch_relations(self.repository, pid),
-                "historical_events": _fetch_historical_events(self.repository, pid),
-                "passages": _fetch_passages(self.repository, pid),
+                "life_events": _fetch_life_events(self.repository, trace_context, pid),
+                "relations": _fetch_relations(self.repository, trace_context, pid),
+                "historical_events": _fetch_historical_events(
+                    self.repository,
+                    trace_context,
+                    pid,
+                ),
+                "passages": _fetch_passages(self.repository, trace_context, pid),
             }
             persons.append(person_data)
 
@@ -50,8 +107,14 @@ class PersonInfoQueryAtomicSkill(BaseSkill):
         }
 
 
-def _fetch_life_events(repo: GraphRepository, pid) -> list[dict]:
-    result = repo.run_read_query(
+def _fetch_life_events(
+    repo: GraphRepository,
+    trace_context: dict[str, Any],
+    pid,
+) -> list[dict]:
+    result = _run_traced_read_query(
+        repo,
+        trace_context,
         cypher=(
             "MATCH (p:Person_Nodes {person_id: $pid})-[:生平]->(le:Life_Events) "
             "OPTIONAL MATCH (le)-[:发生于]->(t:Time) "
@@ -77,8 +140,14 @@ def _fetch_life_events(repo: GraphRepository, pid) -> list[dict]:
     return events
 
 
-def _fetch_relations(repo: GraphRepository, pid) -> list[dict]:
-    result = repo.run_read_query(
+def _fetch_relations(
+    repo: GraphRepository,
+    trace_context: dict[str, Any],
+    pid,
+) -> list[dict]:
+    result = _run_traced_read_query(
+        repo,
+        trace_context,
         cypher=(
             "MATCH (p:Person_Nodes {person_id: $pid})-[r:person_relation]->(other:Person_Nodes) "
             "RETURN other.name AS target_name, r.codes AS codes, r.note AS note "
@@ -94,8 +163,14 @@ def _fetch_relations(repo: GraphRepository, pid) -> list[dict]:
     ]
 
 
-def _fetch_historical_events(repo: GraphRepository, pid) -> list[dict]:
-    result = repo.run_read_query(
+def _fetch_historical_events(
+    repo: GraphRepository,
+    trace_context: dict[str, Any],
+    pid,
+) -> list[dict]:
+    result = _run_traced_read_query(
+        repo,
+        trace_context,
         cypher=(
             "MATCH (p:Person_Nodes {person_id: $pid})-[r:历史事件]->(h:Historical_Events) "
             "RETURN h.event_name AS event_name, r.label AS label"
@@ -108,8 +183,14 @@ def _fetch_historical_events(repo: GraphRepository, pid) -> list[dict]:
     ]
 
 
-def _fetch_passages(repo: GraphRepository, pid) -> list[dict]:
-    result = repo.run_read_query(
+def _fetch_passages(
+    repo: GraphRepository,
+    trace_context: dict[str, Any],
+    pid,
+) -> list[dict]:
+    result = _run_traced_read_query(
+        repo,
+        trace_context,
         cypher=(
             "MATCH (p:Person_Nodes {person_id: $pid})-[r:在文章中]->(pa:Passage_Info) "
             "RETURN pa.doc_id AS doc_id, pa.title AS title, r.level AS level"

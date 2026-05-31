@@ -115,6 +115,46 @@ def test_executor_runs_conversation_reply_workflow():
     assert context.step_results["step1_result"] == result.output
 
 
+def test_executor_marks_run_failed_when_skill_raises():
+    class _FailingSkill:
+        allowed_roles = ["user"]
+
+        def run(self, context, arguments):
+            raise RuntimeError("boom")
+
+    executor = Executor()
+    executor.registry = SimpleNamespace(get=lambda _code: _FailingSkill())
+    db = _DummySession()
+    context = ExecutionContext(
+        user={"id": 1, "role": "user", "email": "demo@example.com"},
+        conversation={"id": 1, "title": "测试会话"},
+    )
+    decision = PlannerDecision(
+        intent="failure_case",
+        decision_type="skill",
+        target_skill_code="failing_atomic",
+        reason="测试失败状态落库",
+        arguments={"user_prompt": "触发失败"},
+    )
+
+    result = executor.execute(
+        db=db,
+        context=context,
+        planner_decision=decision,
+        planner_record_id=1,
+        trigger_message_id=1,
+    )
+
+    run = next(item for item in db.records if item.__class__.__name__ == "ExecutionRun")
+    step = next(item for item in db.records if item.__class__.__name__ == "ExecutionStepRun")
+    assert result.success is False
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    assert step.status == "failed"
+    assert step.skill_code == "failing_atomic"
+    assert "RuntimeError: boom" in step.error_message
+
+
 # ---------------- 功能 A workflow ----------------
 
 

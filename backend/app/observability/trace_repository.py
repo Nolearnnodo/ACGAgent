@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
+from app.agents.step_output import serialize_json_preview
 from app.models.observability import (
     ExecutionTraceSummary,
     LLMCallLog,
@@ -25,13 +25,7 @@ def _utcnow() -> datetime:
 
 
 def _json_dumps(payload: Any) -> str:
-    try:
-        text = json.dumps(payload, ensure_ascii=False, default=str)
-    except TypeError:
-        text = json.dumps(str(payload), ensure_ascii=False)
-    if len(text) > _MAX_JSON_CHARS:
-        text = text[:_MAX_JSON_CHARS] + f"[...truncated, original {len(text)} chars]"
-    return text
+    return serialize_json_preview(payload, max_chars=_MAX_JSON_CHARS, default=str)
 
 
 def _clip_text(text: str) -> str:
@@ -120,6 +114,38 @@ def record_llm_call(
         currency=cost.currency,
         latency_ms=result.latency_ms,
         retry_count=result.retry_count,
+        status=status,
+        error_message=_clip_text(error_message or ""),
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    if log.execution_run_id is not None:
+        refresh_execution_summary(db, log.execution_run_id)
+    return log
+
+
+def record_tool_call(
+    db: Session,
+    trace_context: dict[str, Any],
+    tool_name: str,
+    input_data: dict[str, Any],
+    output_data: dict[str, Any],
+    latency_ms: int,
+    status: str,
+    error_message: str = "",
+) -> ToolCallLog:
+    log = ToolCallLog(
+        execution_run_id=_int_or_none(trace_context.get("execution_run_id")),
+        execution_step_run_id=_int_or_none(trace_context.get("execution_step_run_id")),
+        conversation_id=_int_or_none(trace_context.get("conversation_id")),
+        message_id=_int_or_none(trace_context.get("message_id")),
+        passage_id=_int_or_none(trace_context.get("passage_id")),
+        skill_code=str(trace_context.get("skill_code") or ""),
+        tool_name=tool_name,
+        input_json=_json_dumps(input_data),
+        output_json=_json_dumps(output_data),
+        latency_ms=latency_ms,
         status=status,
         error_message=_clip_text(error_message or ""),
     )

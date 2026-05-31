@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { marked } from 'marked'
 
 import axios from 'axios'
@@ -9,11 +9,13 @@ import {
   createConversation,
   deleteConversation,
   fetchConversationDetail,
+  fetchMessageTrace,
   listConversations,
   renameConversation,
   sendMessage,
   type ConversationDetail,
   type ConversationItem,
+  type MessageTrace,
 } from '../api/chat'
 
 marked.setOptions({
@@ -31,7 +33,66 @@ const messageInput = ref('')
 const sending = ref(false)
 const renamingTitle = ref('')
 
+const traceCache = reactive<Record<number, MessageTrace>>({})
+const traceExpanded = reactive<Record<number, boolean>>({})
+const traceLoading = reactive<Record<number, boolean>>({})
+const traceDetailExpanded = reactive<Record<string, boolean>>({})
+
 const canOperateConversation = computed(() => Boolean(activeConversation.value))
+
+const SKILL_LABELS: Record<string, string> = {
+  query_workflow: '查询工作流',
+  conversation_reply_workflow: '对话回复',
+  passage_ingestion_workflow: '古籍入库',
+  query_intent_classifier_atomic: '意图分类',
+  person_info_query_atomic: '人物信息查询',
+  person_relation_query_atomic: '人物关系查询',
+  graph_statistics_query_atomic: '图谱统计查询',
+  query_answer_compose_atomic: '答案组装',
+  graph_query_atomic: '图谱查询',
+  graph_write_atomic: '图谱写入',
+  conversation_reply_atomic: '对话回复',
+  nl_to_cypher_read_atomic: 'NL→Cypher',
+}
+
+function skillLabel(code: string): string {
+  return SKILL_LABELS[code] || code
+}
+
+function decisionTypeLabel(type: string): string {
+  const map: Record<string, string> = { workflow: '工作流', atomic: '原子技能', reject: '拒绝' }
+  return map[type] || type
+}
+
+function statusIcon(status: string): string {
+  if (status === 'success') return '✅'
+  if (status === 'failed') return '❌'
+  return '⏳'
+}
+
+async function toggleTrace(messageId: number) {
+  if (traceExpanded[messageId]) {
+    traceExpanded[messageId] = false
+    return
+  }
+  traceExpanded[messageId] = true
+
+  if (traceCache[messageId]) return
+  if (!activeConversation.value) return
+
+  traceLoading[messageId] = true
+  try {
+    traceCache[messageId] = await fetchMessageTrace(activeConversation.value.id, messageId)
+  } catch {
+    traceExpanded[messageId] = false
+  } finally {
+    traceLoading[messageId] = false
+  }
+}
+
+function toggleDetail(key: string) {
+  traceDetailExpanded[key] = !traceDetailExpanded[key]
+}
 
 async function loadConversations() {
   conversations.value = await listConversations()
@@ -191,17 +252,166 @@ onMounted(async () => {
           <div
             v-for="message in activeConversation?.messages ?? []"
             :key="message.id"
-            class="chat-page__message"
-            :class="{
-              'chat-page__message--assistant': message.role === 'assistant',
-              'chat-page__message--user': message.role === 'user',
-              'chat-page__message--error': message.role === 'error',
-            }"
+            class="chat-page__message-group"
           >
-            <span class="chat-page__message-role">{{ message.role === 'error' ? '错误' : message.role }}</span>
-            <div v-if="message.role === 'assistant'" class="chat-page__message-content" v-html="renderMarkdown(message.content)" />
-            <p v-else>{{ message.content }}</p>
+            <div
+              class="chat-page__message"
+              :class="{
+                'chat-page__message--assistant': message.role === 'assistant',
+                'chat-page__message--user': message.role === 'user',
+                'chat-page__message--error': message.role === 'error',
+              }"
+            >
+              <span class="chat-page__message-role">{{ message.role === 'error' ? '错误' : message.role }}</span>
+              <div v-if="message.role === 'assistant'" class="chat-page__message-content" v-html="renderMarkdown(message.content)" />
+              <p v-else>{{ message.content }}</p>
+            </div>
+
+            <!-- 推理过程追踪面板 -->
+            <div v-if="message.role === 'assistant'" class="trace-panel">
+              <button class="trace-panel__toggle" type="button" @click="toggleTrace(message.id)">
+                <span class="trace-panel__toggle-icon" :class="{ 'trace-panel__toggle-icon--open': traceExpanded[message.id] }">&#9654;</span>
+                查看推理过程
+              </button>
+
+              <div v-if="traceLoading[message.id]" class="trace-panel__loading">加载中...</div>
+
+              <div v-if="traceExpanded[message.id] && traceCache[message.id]" class="trace-panel__body">
+
+                <!-- 意图识别 -->
+                <div v-if="traceCache[message.id].planner" class="trace-section">
+                  <button class="trace-section__header" type="button" @click="toggleDetail(`planner-${message.id}`)">
+                    <span class="trace-section__icon" :class="{ 'trace-section__icon--open': traceDetailExpanded[`planner-${message.id}`] }">&#9654;</span>
+                    <span class="trace-section__badge trace-section__badge--blue">意图识别</span>
+                    <span class="trace-section__summary">
+                      {{ traceCache[message.id].planner!.intent }}
+                      &rarr; {{ skillLabel(traceCache[message.id].planner!.target_skill_code) }}
+                    </span>
+                  </button>
+                  <div v-if="traceDetailExpanded[`planner-${message.id}`]" class="trace-section__detail">
+                    <div class="trace-kv"><span class="trace-kv__key">意图</span><span class="trace-kv__val">{{ traceCache[message.id].planner!.intent }}</span></div>
+                    <div class="trace-kv"><span class="trace-kv__key">决策类型</span><span class="trace-kv__val">{{ decisionTypeLabel(traceCache[message.id].planner!.decision_type) }}</span></div>
+                    <div class="trace-kv"><span class="trace-kv__key">目标技能</span><span class="trace-kv__val">{{ skillLabel(traceCache[message.id].planner!.target_skill_code) }}</span></div>
+                    <div class="trace-kv"><span class="trace-kv__key">推理理由</span><span class="trace-kv__val">{{ traceCache[message.id].planner!.reason }}</span></div>
+                  </div>
+                </div>
+
+                <!-- 执行步骤 -->
+                <div v-if="traceCache[message.id].steps.length" class="trace-section">
+                  <button class="trace-section__header" type="button" @click="toggleDetail(`steps-${message.id}`)">
+                    <span class="trace-section__icon" :class="{ 'trace-section__icon--open': traceDetailExpanded[`steps-${message.id}`] }">&#9654;</span>
+                    <span class="trace-section__badge trace-section__badge--green">执行步骤</span>
+                    <span class="trace-section__summary">
+                      {{ traceCache[message.id].steps.length }} 步 {{ statusIcon(traceCache[message.id].execution_status || '') }}
+                    </span>
+                  </button>
+                  <div v-if="traceDetailExpanded[`steps-${message.id}`]" class="trace-section__detail">
+                    <div v-for="step in traceCache[message.id].steps" :key="step.step_no" class="trace-step">
+                      <div class="trace-step__header">
+                        <span class="trace-step__no">Step {{ step.step_no }}</span>
+                        <span class="trace-step__skill">{{ skillLabel(step.skill_code) }}</span>
+                        <span class="trace-step__status">{{ statusIcon(step.status) }}</span>
+                      </div>
+                      <div v-if="step.output_preview" class="trace-step__output">
+                        <button class="trace-detail-toggle" type="button" @click="toggleDetail(`step-out-${message.id}-${step.step_no}`)">
+                          {{ traceDetailExpanded[`step-out-${message.id}-${step.step_no}`] ? '收起输出' : '查看输出' }}
+                        </button>
+                        <pre v-if="traceDetailExpanded[`step-out-${message.id}-${step.step_no}`]" class="trace-code">{{ JSON.stringify(step.output_preview, null, 2) }}</pre>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 图谱查询证据链 -->
+                <div v-if="traceCache[message.id].tool_calls.length" class="trace-section">
+                  <button class="trace-section__header" type="button" @click="toggleDetail(`tools-${message.id}`)">
+                    <span class="trace-section__icon" :class="{ 'trace-section__icon--open': traceDetailExpanded[`tools-${message.id}`] }">&#9654;</span>
+                    <span class="trace-section__badge trace-section__badge--teal">证据链</span>
+                    <span class="trace-section__summary">
+                      {{ traceCache[message.id].tool_calls.length }} 次图谱查询
+                    </span>
+                  </button>
+                  <div v-if="traceDetailExpanded[`tools-${message.id}`]" class="trace-section__detail">
+                    <div v-for="(tc, idx) in traceCache[message.id].tool_calls" :key="idx" class="trace-tool-call">
+                      <div class="trace-tool-call__header">
+                        <span class="trace-tool-call__idx">#{{ idx + 1 }}</span>
+                        <span class="trace-tool-call__name">{{ tc.tool_name }}</span>
+                        <span class="trace-tool-call__meta">{{ tc.latency_ms }}ms</span>
+                        <span class="trace-tool-call__status">{{ statusIcon(tc.status) }}</span>
+                      </div>
+                      <!-- Cypher 输入 -->
+                      <div v-if="tc.input_preview" class="trace-tool-call__sub">
+                        <button class="trace-detail-toggle" type="button" @click="toggleDetail(`tool-in-${message.id}-${idx}`)">
+                          {{ traceDetailExpanded[`tool-in-${message.id}-${idx}`] ? '收起 Cypher' : '查看 Cypher' }}
+                        </button>
+                        <pre v-if="traceDetailExpanded[`tool-in-${message.id}-${idx}`]" class="trace-code trace-code--cypher">{{ (tc.input_preview as Record<string, unknown>).cypher || JSON.stringify(tc.input_preview, null, 2) }}</pre>
+                      </div>
+                      <!-- 查询结果 -->
+                      <div v-if="tc.output_preview" class="trace-tool-call__sub">
+                        <button class="trace-detail-toggle" type="button" @click="toggleDetail(`tool-out-${message.id}-${idx}`)">
+                          {{ traceDetailExpanded[`tool-out-${message.id}-${idx}`] ? '收起结果' : '查看结果' }}
+                        </button>
+                        <pre v-if="traceDetailExpanded[`tool-out-${message.id}-${idx}`]" class="trace-code">{{ JSON.stringify(tc.output_preview, null, 2) }}</pre>
+                      </div>
+                      <div v-if="tc.error_message" class="trace-tool-call__error">{{ tc.error_message }}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- LLM 调用链 -->
+                <div v-if="traceCache[message.id].llm_calls.length" class="trace-section">
+                  <button class="trace-section__header" type="button" @click="toggleDetail(`llm-${message.id}`)">
+                    <span class="trace-section__icon" :class="{ 'trace-section__icon--open': traceDetailExpanded[`llm-${message.id}`] }">&#9654;</span>
+                    <span class="trace-section__badge trace-section__badge--purple">LLM 调用</span>
+                    <span class="trace-section__summary">
+                      {{ traceCache[message.id].llm_calls.length }} 次调用
+                    </span>
+                  </button>
+                  <div v-if="traceDetailExpanded[`llm-${message.id}`]" class="trace-section__detail">
+                    <div v-for="(call, idx) in traceCache[message.id].llm_calls" :key="idx" class="trace-llm-call">
+                      <div class="trace-llm-call__header">
+                        <span class="trace-llm-call__idx">#{{ idx + 1 }}</span>
+                        <span class="trace-llm-call__skill">{{ skillLabel(call.skill_code) }}</span>
+                        <span class="trace-llm-call__meta">{{ call.model }} | {{ call.total_tokens }} tokens | {{ call.latency_ms }}ms</span>
+                        <span class="trace-llm-call__status">{{ statusIcon(call.status) }}</span>
+                      </div>
+                      <div v-if="call.call_purpose" class="trace-llm-call__purpose">用途: {{ call.call_purpose }}</div>
+                      <button class="trace-detail-toggle" type="button" @click="toggleDetail(`llm-resp-${message.id}-${idx}`)">
+                        {{ traceDetailExpanded[`llm-resp-${message.id}-${idx}`] ? '收起响应' : '查看响应' }}
+                      </button>
+                      <pre v-if="traceDetailExpanded[`llm-resp-${message.id}-${idx}`]" class="trace-code">{{ call.response_text }}</pre>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 执行摘要 -->
+                <div v-if="traceCache[message.id].summary" class="trace-section trace-summary-bar">
+                  <div class="trace-summary-bar__items">
+                    <span class="trace-summary-bar__item">LLM {{ traceCache[message.id].summary!.llm_call_count }} 次</span>
+                    <span v-if="traceCache[message.id].summary!.tool_call_count" class="trace-summary-bar__sep">|</span>
+                    <span v-if="traceCache[message.id].summary!.tool_call_count" class="trace-summary-bar__item">查询 {{ traceCache[message.id].summary!.tool_call_count }} 次</span>
+                    <span class="trace-summary-bar__sep">|</span>
+                    <span class="trace-summary-bar__item">{{ traceCache[message.id].summary!.total_tokens }} tokens</span>
+                    <span class="trace-summary-bar__sep">|</span>
+                    <span class="trace-summary-bar__item">{{ traceCache[message.id].summary!.total_latency_ms }}ms</span>
+                    <span v-if="traceCache[message.id].summary!.estimated_total_cost > 0" class="trace-summary-bar__sep">|</span>
+                    <span v-if="traceCache[message.id].summary!.estimated_total_cost > 0" class="trace-summary-bar__item">
+                      {{ traceCache[message.id].summary!.estimated_total_cost.toFixed(4) }} {{ traceCache[message.id].summary!.currency }}
+                    </span>
+                  </div>
+                </div>
+
+                <!-- 无追踪数据 -->
+                <div
+                  v-if="!traceCache[message.id].planner && !traceCache[message.id].steps.length && !traceCache[message.id].llm_calls.length && !traceCache[message.id].tool_calls.length"
+                  class="trace-panel__empty"
+                >
+                  暂无推理过程数据
+                </div>
+              </div>
+            </div>
           </div>
+
           <div v-if="sending" class="chat-page__message chat-page__message--assistant chat-page__message--loading">
             <span class="chat-page__message-role">assistant</span>
             <div class="chat-page__loading-dots">
@@ -346,11 +556,14 @@ onMounted(async () => {
   padding: 8px 4px 20px;
 }
 
+.chat-page__message-group {
+  margin-bottom: 16px;
+}
+
 .chat-page__message {
   max-width: 78%;
   border-radius: 16px;
   padding: 14px 16px;
-  margin-bottom: 16px;
 }
 
 .chat-page__message p {
@@ -521,5 +734,344 @@ onMounted(async () => {
   padding: 14px;
   box-sizing: border-box;
   font-family: inherit;
+}
+
+/* ── 推理过程追踪面板 ── */
+
+.trace-panel {
+  max-width: 78%;
+  margin-top: 4px;
+}
+
+.trace-panel__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: none;
+  color: #7085b0;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 8px;
+  transition: background 0.15s;
+}
+
+.trace-panel__toggle:hover {
+  background: #f0f4fa;
+  color: #4a6091;
+}
+
+.trace-panel__toggle-icon {
+  display: inline-block;
+  font-size: 10px;
+  transition: transform 0.2s;
+}
+
+.trace-panel__toggle-icon--open {
+  transform: rotate(90deg);
+}
+
+.trace-panel__loading {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #7085b0;
+}
+
+.trace-panel__body {
+  margin-top: 6px;
+  border: 1px solid #e4ebf7;
+  border-radius: 12px;
+  background: #fafcff;
+  padding: 10px;
+}
+
+.trace-panel__empty {
+  padding: 8px 0;
+  font-size: 13px;
+  color: #9aa8c4;
+  text-align: center;
+}
+
+/* ── 追踪分区 ── */
+
+.trace-section {
+  margin-bottom: 6px;
+}
+
+.trace-section:last-child {
+  margin-bottom: 0;
+}
+
+.trace-section__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 6px 4px;
+  border-radius: 8px;
+  text-align: left;
+  font-size: 13px;
+  color: #42557f;
+  transition: background 0.15s;
+}
+
+.trace-section__header:hover {
+  background: #eef3fb;
+}
+
+.trace-section__icon {
+  display: inline-block;
+  font-size: 9px;
+  color: #7085b0;
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+
+.trace-section__icon--open {
+  transform: rotate(90deg);
+}
+
+.trace-section__badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.trace-section__badge--blue { background: #e3edff; color: #2f6fed; }
+.trace-section__badge--green { background: #e3f8e8; color: #1e8a3c; }
+.trace-section__badge--purple { background: #efe3ff; color: #7c3aed; }
+.trace-section__badge--teal { background: #e0f5f0; color: #0f766e; }
+
+.trace-section__summary {
+  color: #6b7fa3;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-section__detail {
+  margin: 4px 0 4px 20px;
+  padding: 8px 10px;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid #eef2fa;
+}
+
+/* ── 键值对 ── */
+
+.trace-kv {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.trace-kv__key {
+  color: #7085b0;
+  flex-shrink: 0;
+  min-width: 70px;
+}
+
+.trace-kv__val {
+  color: #31456f;
+  word-break: break-all;
+}
+
+/* ── 展开/收起按钮 ── */
+
+.trace-detail-toggle {
+  border: none;
+  background: none;
+  color: #7085b0;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.trace-detail-toggle:hover {
+  background: #eef3fb;
+  color: #4a6091;
+}
+
+/* ── 代码块 ── */
+
+.trace-code {
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  overflow-x: auto;
+  max-height: 300px;
+  overflow-y: auto;
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.trace-code--cypher {
+  background: #1a2332;
+  color: #93c5fd;
+}
+
+/* ── 执行步骤 ── */
+
+.trace-step {
+  padding: 6px 0;
+  border-bottom: 1px solid #f0f4fa;
+}
+
+.trace-step:last-child {
+  border-bottom: none;
+}
+
+.trace-step__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.trace-step__no {
+  font-weight: 600;
+  color: #506080;
+}
+
+.trace-step__skill {
+  color: #2f6fed;
+}
+
+.trace-step__status {
+  margin-left: auto;
+}
+
+.trace-step__output {
+  margin-top: 4px;
+}
+
+/* ── LLM 调用 ── */
+
+.trace-llm-call {
+  padding: 6px 0;
+  border-bottom: 1px solid #f0f4fa;
+}
+
+.trace-llm-call:last-child {
+  border-bottom: none;
+}
+
+.trace-llm-call__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.trace-llm-call__idx {
+  font-weight: 600;
+  color: #7c3aed;
+}
+
+.trace-llm-call__skill {
+  color: #42557f;
+}
+
+.trace-llm-call__meta {
+  color: #8a97b3;
+  font-size: 11px;
+}
+
+.trace-llm-call__status {
+  margin-left: auto;
+}
+
+.trace-llm-call__purpose {
+  font-size: 12px;
+  color: #6b7fa3;
+  margin: 2px 0 4px 24px;
+}
+
+/* ── 图谱查询 ── */
+
+.trace-tool-call {
+  padding: 6px 0;
+  border-bottom: 1px solid #f0f4fa;
+}
+
+.trace-tool-call:last-child {
+  border-bottom: none;
+}
+
+.trace-tool-call__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.trace-tool-call__idx {
+  font-weight: 600;
+  color: #0f766e;
+}
+
+.trace-tool-call__name {
+  color: #42557f;
+}
+
+.trace-tool-call__meta {
+  color: #8a97b3;
+  font-size: 11px;
+}
+
+.trace-tool-call__status {
+  margin-left: auto;
+}
+
+.trace-tool-call__sub {
+  margin-top: 4px;
+  margin-left: 24px;
+}
+
+.trace-tool-call__error {
+  margin-top: 4px;
+  margin-left: 24px;
+  font-size: 12px;
+  color: #dc2626;
+}
+
+/* ── 执行摘要条 ── */
+
+.trace-summary-bar {
+  border-top: 1px solid #e4ebf7;
+  padding-top: 8px;
+}
+
+.trace-summary-bar__items {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #6b7fa3;
+  flex-wrap: wrap;
+}
+
+.trace-summary-bar__item {
+  white-space: nowrap;
+}
+
+.trace-summary-bar__sep {
+  color: #c8d4e8;
 }
 </style>

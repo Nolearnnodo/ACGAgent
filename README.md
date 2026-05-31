@@ -31,6 +31,7 @@
   - 仅管理员可访问
   - 支持 `md` / `docx` 上传
   - 支持手工输入 `title + context`
+  - 批量上传写入采用单事务，避免失败时留下半提交数据
   - 每篇文章触发一次固定 workflow
   - 在上传页 / 输入页内查看最近任务与步骤状态
 - Agent 核心：
@@ -43,7 +44,11 @@
   - 提供内置注册器，后续可继续增删改查
 - 图数据库层：
   - 已封装 Neo4j 连接管理与统一读写接口
-  - 当前图操作是占位实现，方便后续进一步下沉为 Skill
+  - 提供人物、事件、时间、地点、官职、历史事件等领域写入方法，以及受控读查询入口
+- 查询模块：
+  - 对查询类用户消息路由到 `query_workflow`
+  - 支持人物信息、人物关系、图谱统计三类查询路径
+  - Neo4j 读调用会进入工具追踪，便于后续审计与排障
 - 前端：
   - 登录页
   - 注册页
@@ -104,6 +109,8 @@ ACGAgent/
 - `ExecutionRun`：一次完整执行
 - `ExecutionStepRun`：执行中的每一步
 - `Passage`：古籍文章实体
+- `ExecutionTraceSummary` / `LLMCallLog` / `ToolCallLog` / `ModelPricingRule`：执行追踪、LLM/工具调用与费用估算
+- 字典表：年号、历史事件、资料类型、人物关系代码等抽取辅助数据
 
 ### 4.3 Agent 执行机制
 
@@ -142,13 +149,23 @@ flowchart TD
 当前内置 Skill：
 
 - `conversation_reply_atomic`
+- `conversation_reply_workflow`
 - `graph_query_atomic`
 - `graph_write_atomic`
-- `conversation_reply_workflow`
-- `passage_preprocess_atomic`
-- `passage_store_sqlite_atomic`
-- `passage_store_graph_atomic`
+- `nl_to_cypher_read_atomic`
+- `probe_atomic`
+- `passage_meta_atomic`
+- `person_layer_atomic`
+- `event_relation_atomic`
+- `passage_format_output_atomic`
+- `person_identity_resolution_atomic`
 - `passage_ingestion_workflow`
+- `query_intent_classifier_atomic`
+- `person_info_query_atomic`
+- `person_relation_query_atomic`
+- `graph_statistics_query_atomic`
+- `query_answer_compose_atomic`
+- `query_workflow`
 
 ### 4.5 图数据库抽象层
 
@@ -158,7 +175,8 @@ flowchart TD
 - 当前职责：
   - 管理 Neo4j Driver 生命周期
   - 向上提供统一 `run_read_query()` / `run_write_query()` 接口
-  - 暂时返回占位结果，为后续 Skill 扩展预留入口
+  - 封装功能 A/B 所需的领域写入、同名人物召回、证据包读取和合并操作
+  - 统一处理参数、summary 与异常返回，避免业务层直接持有 driver
 
 ## 5. 前端说明
 
@@ -283,6 +301,8 @@ uvicorn app.main:app --reload
 - `POST /api/v1/passages/manual`：手工输入古籍，仅 admin
 - `GET /api/v1/passages`：查看古籍列表，仅 admin
 - `GET /api/v1/passages/{doc_id}/runs`：查看 workflow 任务和步骤，仅 admin
+- `GET /api/v1/passages/token-usage-overview`：查看全部文章的最新任务资源用量概览
+- `GET /api/v1/passages/{doc_id}/token-usage`：查看单篇文章最新任务的 LLM 调用明细
 
 ### 7.2 前端
 
@@ -313,15 +333,16 @@ npm run dev
 ## 9. 已知限制
 
 - 当前运行环境内没有可用的 `python` / `py` 命令，因此本次实现无法在该机器上实际启动后端服务，只能完成代码与静态结构搭建。
-- Neo4j 操作目前是占位实现，后续需按你的 Skill 设计逐步补齐。
-- LLM 多供应商接口已预留，当前已接入 `DeepSeek`，并保留 `mock provider` 作为失败兜底。
-- 当前数据库迁移仍使用 `create_all`，后续建议切换到 `Alembic`。
+- 功能 A/B/C 的主链路已经接入 Neo4j Repository；具体抽取质量仍依赖 prompt、字典数据和 LLM 返回质量。
+- LLM 多供应商抽象已接入 `DeepSeek`，并保留 `mock provider` 作为失败兜底。
+- 数据库结构由 Alembic 管理；修改 ORM 后需要生成并核对迁移。
 
 ## 10. 测试
 
-当前提供基础测试文件：
+当前测试覆盖 Planner / Executor、功能 A workflow、功能 B 身份裁定、功能 C 查询、观测与用量统计、批量上传事务边界等核心路径。
 
 - [`backend/tests/test_planner_executor.py`](backend/tests/test_planner_executor.py)
+- [`backend/tests/test_passage_upload.py`](backend/tests/test_passage_upload.py)
 
 建议在具备 Python 3.11 环境后执行：
 

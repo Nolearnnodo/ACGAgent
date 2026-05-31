@@ -8,35 +8,36 @@ from sqlalchemy.orm import Session
 
 from app.agents.context import ExecutionContext
 from app.agents.models import PlannerDecision, StepExecutionResult
+from app.agents.step_output import serialize_json_preview, serialize_step_output
 from app.models.execution import ExecutionRun, ExecutionStepRun
 from app.models.skill import SkillDefinition
 from app.skills.loader import load_skill_registry
 
 
 def _truncate_output(output: Any, max_chars: int = 8000) -> str:
-    """将 skill 执行结果序列化并截断，用于写入数据库，避免存储膨胀。
+    """将 skill 执行结果序列化为有界且合法的 JSON 预览。"""
 
-    策略：
-    - 对于 dict/list，先尝试对其中的列表型字段做预处理，保留前 30 条并附统计信息；
-    - 再序列化为 JSON 字符串；
-    - 若超过 max_chars，直接截断并附 `[...截断，原始 N 字符]` 标记。
-    """
-    if isinstance(output, dict):
-        compacted: dict[str, Any] = {}
-        for key, val in output.items():
-            if isinstance(val, list) and len(val) > 30:
-                compacted[key] = val[:30] + [f"[共 {len(val)} 条，已截取前 30 条]"]
-            else:
-                compacted[key] = val
-        serialized = json.dumps(compacted, ensure_ascii=False)
-    else:
-        serialized = json.dumps(output, ensure_ascii=False)
+    return serialize_step_output(output, max_chars=max_chars)
 
-    if len(serialized) > max_chars:
-        original_len = len(serialized)
-        serialized = serialized[:max_chars] + f"[...截断，原始 {original_len} 字符]"
 
-    return serialized
+def _serialize_arguments(arguments: dict[str, Any], max_chars: int = 8000) -> str:
+    """将 step 输入参数序列化为有界且合法的 JSON 预览。"""
+
+    return serialize_json_preview(arguments, max_chars=max_chars, default=str)
+
+
+def _has_recorded_steps(db: Session, execution_run_id: int) -> bool:
+    """Best-effort check to avoid duplicating workflow-managed step rows."""
+
+    try:
+        return (
+            db.query(ExecutionStepRun)
+            .filter(ExecutionStepRun.execution_run_id == execution_run_id)
+            .first()
+            is not None
+        )
+    except Exception:
+        return False
 
 
 class Executor:
@@ -87,7 +88,7 @@ class Executor:
                     step_no=1,
                     skill_code=planner_decision.target_skill_code,
                     status="failed",
-                    input_json=json.dumps(planner_decision.arguments, ensure_ascii=False),
+                    input_json=_serialize_arguments(planner_decision.arguments),
                     output_json=_truncate_output(result.output),
                     error_message=result.error_message,
                 )
@@ -95,51 +96,86 @@ class Executor:
             db.commit()
             return result
 
-        skill = self.registry.get(planner_decision.target_skill_code)
-        metadata = db.query(SkillDefinition).filter(SkillDefinition.code == planner_decision.target_skill_code).first()
+        is_workflow = planner_decision.target_skill_code.endswith("_workflow")
 
-        # 权限优先读取数据库中的 metadata 配置；
-        # 如果 metadata 缺失或 JSON 损坏，再回退到代码内置 allowed_roles，
-        # 这样能兼顾“配置可变更”与“运行时不至于完全失效”。
-        allowed_roles = skill.allowed_roles
-        if metadata and metadata.allowed_roles_json:
-            try:
-                allowed_roles = json.loads(metadata.allowed_roles_json)
-            except json.JSONDecodeError:
-                allowed_roles = skill.allowed_roles
+        try:
+            skill = self.registry.get(planner_decision.target_skill_code)
+            metadata = db.query(SkillDefinition).filter(SkillDefinition.code == planner_decision.target_skill_code).first()
 
-        if context.user["role"] not in allowed_roles:
-            # 即便 Planner 已做过一次约束，这里仍然必须再次校验角色。
-            # Executor 是最终执行入口，二次校验可以防止前端绕过或上游决策异常。
+            # 权限优先读取数据库中的 metadata 配置；
+            # 如果 metadata 缺失或 JSON 损坏，再回退到代码内置 allowed_roles，
+            # 这样能兼顾“配置可变更”与“运行时不至于完全失效”。
+            allowed_roles = skill.allowed_roles
+            if metadata and metadata.allowed_roles_json:
+                try:
+                    allowed_roles = json.loads(metadata.allowed_roles_json)
+                except json.JSONDecodeError:
+                    allowed_roles = skill.allowed_roles
+
+            if context.user["role"] not in allowed_roles:
+                # 即便 Planner 已做过一次约束，这里仍然必须再次校验角色。
+                # Executor 是最终执行入口，二次校验可以防止前端绕过或上游决策异常。
+                result = StepExecutionResult(
+                    step_no=1,
+                    skill_code=planner_decision.target_skill_code,
+                    success=False,
+                    output={"message": "当前用户无权执行该 Skill。"},
+                    error_message="permission denied",
+                )
+                execution_run.status = "failed"
+                execution_run.finished_at = datetime.now(timezone.utc)
+                db.add(
+                    ExecutionStepRun(
+                        execution_run_id=execution_run.id,
+                        step_no=1,
+                        skill_code=planner_decision.target_skill_code,
+                        status="failed",
+                        input_json=_serialize_arguments(planner_decision.arguments),
+                        output_json=_truncate_output(result.output),
+                        error_message=result.error_message,
+                    )
+                )
+                db.commit()
+                return result
+
+            # 把 execution_run_id 注入 metadata，让 workflow 可以分阶段写 step_run。
+            context.metadata["execution_run_id"] = execution_run.id
+
+            output = skill.run(context, planner_decision.arguments)
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
             result = StepExecutionResult(
                 step_no=1,
                 skill_code=planner_decision.target_skill_code,
                 success=False,
-                output={"message": "当前用户无权执行该 Skill。"},
-                error_message="permission denied",
+                output={
+                    "message": "Skill 执行失败。",
+                    "error": error_message,
+                },
+                error_message=error_message,
             )
+            try:
+                db.rollback()
+            except Exception:
+                pass
             execution_run.status = "failed"
             execution_run.finished_at = datetime.now(timezone.utc)
-            db.add(
-                ExecutionStepRun(
-                    execution_run_id=execution_run.id,
-                    step_no=1,
-                    skill_code=planner_decision.target_skill_code,
-                    status="failed",
-                    input_json=json.dumps(planner_decision.arguments, ensure_ascii=False),
-                    output_json=_truncate_output(result.output),
-                    error_message=result.error_message,
+            if not _has_recorded_steps(db, execution_run.id):
+                db.add(
+                    ExecutionStepRun(
+                        execution_run_id=execution_run.id,
+                        step_no=1,
+                        skill_code=planner_decision.target_skill_code,
+                        status="failed",
+                        input_json=_serialize_arguments(planner_decision.arguments),
+                        output_json=_truncate_output(result.output),
+                        error_message=error_message,
+                    )
                 )
-            )
+            db.add(execution_run)
             db.commit()
             return result
 
-        # 把 execution_run_id 注入 metadata，让 workflow 可以分阶段写 step_run。
-        context.metadata["execution_run_id"] = execution_run.id
-
-        is_workflow = planner_decision.target_skill_code.endswith("_workflow")
-
-        output = skill.run(context, planner_decision.arguments)
         # 统一把当前 step 的结果写入 ExecutionContext，
         # 后续 Workflow 或更复杂的多步执行可以通过 step1_result 等键继续引用。
         context.set_step_result("step1_result", output)
@@ -159,7 +195,7 @@ class Executor:
                     step_no=1,
                     skill_code=planner_decision.target_skill_code,
                     status="success",
-                    input_json=json.dumps(planner_decision.arguments, ensure_ascii=False),
+                    input_json=_serialize_arguments(planner_decision.arguments),
                     # 截断后写入数据库，避免大量节点数据撑爆存储；
                     # 传给 context 的 output 保持原始，不受影响。
                     output_json=_truncate_output(output),
