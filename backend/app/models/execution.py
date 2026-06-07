@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base_class import Base
@@ -69,3 +69,42 @@ class ExecutionStepRun(Base):
     output_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class IdentityResolutionDecisionLog(Base):
+    """同名人物裁定每轮的可审计判断依据。"""
+
+    __tablename__ = "identity_resolution_decision_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    execution_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("execution_runs.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    execution_step_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("execution_step_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    passage_id: Mapped[int | None] = mapped_column(
+        ForeignKey("passages.doc_id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    new_person_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    candidate_person_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    hop: Mapped[int] = mapped_column(Integer, nullable=False)
+    focus_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    positive_evidence_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    negative_evidence_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    missing_evidence_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    next_hop_focus_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    used_full_text: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )

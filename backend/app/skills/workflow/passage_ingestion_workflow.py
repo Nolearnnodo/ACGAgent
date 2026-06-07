@@ -25,6 +25,10 @@ _GRAPH_WRITE_WARNING_TYPES = {
     "neo4j_write_failed",
     "function_b_candidate_recall_failed",
     "function_b_identity_llm_failed",
+    "function_b_full_text_llm_failed",
+    "function_b_full_text_load_failed",
+    "function_b_full_text_missing",
+    "function_b_decision_log_failed",
     "function_b_identity_resolution_partial",
     "function_b_review_link_failed",
 }

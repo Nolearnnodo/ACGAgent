@@ -65,6 +65,7 @@ def call_llm_structured(
     skill_code: str,
     max_retries: int = 2,
     additional_metadata: dict[str, Any] | None = None,
+    max_prompt_chars: int | None = 6000,
 ) -> T:
     """调用 LLM 期待 JSON 输出，按 pydantic schema 校验，失败自动重试。"""
 
@@ -73,7 +74,11 @@ def call_llm_structured(
     metadata = {"skill_code": skill_code, **(additional_metadata or {})}
 
     # 传入 LLM 前对 user_prompt 做长度保护，避免大量工具结果撑爆 token 限制
-    safe_user_prompt = _truncate_prompt(user_prompt)
+    safe_user_prompt = (
+        _truncate_prompt(user_prompt, max_chars=max_prompt_chars)
+        if max_prompt_chars is not None
+        else user_prompt
+    )
 
     for attempt in range(max_retries + 1):
         messages: list[dict[str, str]] = [

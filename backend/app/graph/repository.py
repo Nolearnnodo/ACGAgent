@@ -356,31 +356,28 @@ class GraphRepository:
         person_id: int,
         max_hops: int = 2,
         focus: list[str] | None = None,
+        incremental: bool = False,
     ) -> dict[str, Any]:
-        """Build a whitelisted evidence bundle for identity adjudication."""
+        """构造同人裁定白名单证据。
+
+        首轮返回人物自身的两跳基础证据。后续轮次设置 ``incremental=True``，
+        只返回当前跳数新出现的关系路径和定向周边证据，调用侧负责累计去重。
+        """
 
         hops = max(1, min(int(max_hops), 5))
         focus_set = {str(item) for item in (focus or []) if item}
+        is_increment = incremental and hops > 2
 
         basic = self.run_read_query(
             cypher="""
             MATCH (p:Person_Nodes {person_id: $person_id})
-            OPTIONAL MATCH (p)-[r:在文章中]->(pa:Passage_Info)
             RETURN p {
                 .person_id,
                 .name,
                 .zi,
                 .titles,
                 .merged_person_ids
-            } AS person,
-            collect(DISTINCT {
-                doc_id: pa.doc_id,
-                title: pa.title,
-                source_type: pa.source_type,
-                era: pa.era,
-                level: r.level,
-                path: 'Person_Nodes-在文章中-Passage_Info'
-            }) AS passages
+            } AS person
             """,
             parameters={"person_id": person_id},
         )
@@ -388,21 +385,44 @@ class GraphRepository:
         base_record = records[0] if records else {}
         bundle: dict[str, Any] = {
             "person": base_record.get("person") or {"person_id": person_id},
-            "passages": [
-                item
-                for item in (base_record.get("passages") or [])
-                if item and item.get("doc_id") is not None
-            ],
+            "passages": [],
             "life_events": [],
             "relations": [],
             "historical_events": [],
             "relation_paths": [],
+            "related_person_evidence": [],
         }
+
+        if not is_increment:
+            passages = self.run_read_query(
+                cypher="""
+                MATCH (p:Person_Nodes {person_id: $person_id})-[r:在文章中]->(pa:Passage_Info)
+                RETURN pa {
+                    .doc_id,
+                    .title,
+                    .source_type,
+                    .era
+                } AS passage,
+                r.level AS level,
+                'Person_Nodes-在文章中-Passage_Info' AS path
+                ORDER BY pa.doc_id
+                """,
+                parameters={"person_id": person_id},
+            )
+            bundle["passages"] = [
+                {
+                    **(record.get("passage") or {}),
+                    "level": record.get("level"),
+                    "path": record.get("path"),
+                }
+                for record in passages.get("records", [])
+                if (record.get("passage") or {}).get("doc_id") is not None
+            ]
 
         wants_events = not focus_set or bool(focus_set & {"events", "official_titles", "locations"})
         wants_relations = not focus_set or "relations" in focus_set
 
-        if wants_events:
+        if not is_increment and wants_events:
             events = self.run_read_query(
                 cypher="""
                 MATCH (p:Person_Nodes {person_id: $person_id})-[:生平]->(le:Life_Events)
@@ -438,30 +458,38 @@ class GraphRepository:
             historical_events = self.run_read_query(
                 cypher="""
                 MATCH (p:Person_Nodes {person_id: $person_id})-[r:历史事件]->(h:Historical_Events)
+                OPTIONAL MATCH (h)-[:发生于]->(ht:Time)
                 RETURN h {.event_name} AS historical_event,
                        r.label AS label,
-                       'Person_Nodes-历史事件-Historical_Events' AS path
+                       collect(DISTINCT ht {.era, .year, .month, .day}) AS times,
+                       'Person_Nodes-历史事件-Historical_Events-发生于-Time' AS path
                 LIMIT 50
                 """,
                 parameters={"person_id": person_id},
             )
             bundle["historical_events"] = historical_events.get("records", [])
 
-        if wants_relations:
+        if not is_increment and wants_relations:
             relations = self.run_read_query(
                 cypher="""
                 MATCH (p:Person_Nodes {person_id: $person_id})-[r:person_relation]->(other:Person_Nodes)
                 RETURN 'outgoing' AS direction,
-                       other {.person_id, .name, .zi, .titles} AS other_person,
+                       other {.person_id, .name, .zi, .titles, .merged_person_ids} AS other_person,
                        r.codes AS codes,
                        r.note AS note,
+                       r.evidence AS evidence,
+                       r.source_doc_id AS source_doc_id,
+                       r.direction_verified AS direction_verified,
                        'Person_Nodes-person_relation-Person_Nodes' AS path
                 UNION
                 MATCH (other:Person_Nodes)-[r:person_relation]->(p:Person_Nodes {person_id: $person_id})
                 RETURN 'incoming' AS direction,
-                       other {.person_id, .name, .zi, .titles} AS other_person,
+                       other {.person_id, .name, .zi, .titles, .merged_person_ids} AS other_person,
                        r.codes AS codes,
                        r.note AS note,
+                       r.evidence AS evidence,
+                       r.source_doc_id AS source_doc_id,
+                       r.direction_verified AS direction_verified,
                        'Person_Nodes-person_relation-Person_Nodes' AS path
                 LIMIT 80
                 """,
@@ -469,22 +497,169 @@ class GraphRepository:
             )
             bundle["relations"] = relations.get("records", [])
 
-            if hops > 2:
-                relation_paths = self.run_read_query(
+        if is_increment and wants_relations:
+            relation_paths = self.run_read_query(
+                cypher=f"""
+                MATCH path=(p:Person_Nodes {{person_id: $person_id}})
+                           -[:person_relation*{hops}..{hops}]-
+                           (other:Person_Nodes)
+                WHERE other.person_id <> $person_id
+                  AND all(node IN nodes(path) WHERE single(x IN nodes(path) WHERE x = node))
+                WITH path,
+                     other,
+                     size([rel IN relationships(path) WHERE rel.evidence IS NOT NULL]) AS evidence_count,
+                     size([rel IN relationships(path) WHERE coalesce(rel.direction_verified, false)]) AS verified_count
+                ORDER BY evidence_count DESC, verified_count DESC, other.person_id
+                RETURN [node IN nodes(path) |
+                            node {{.person_id, .name, .zi, .titles, .merged_person_ids}}
+                       ] AS persons,
+                       [rel IN relationships(path) | {{
+                            codes: rel.codes,
+                            note: rel.note,
+                            evidence: rel.evidence,
+                            source_doc_id: rel.source_doc_id,
+                            direction_verified: rel.direction_verified
+                       }}] AS relations,
+                       evidence_count,
+                       verified_count,
+                       'Person_Nodes-person_relation*{hops}-Person_Nodes' AS path
+                LIMIT $limit
+                """,
+                parameters={"person_id": person_id, "limit": 60},
+            )
+            bundle["relation_paths"] = relation_paths.get("records", [])
+
+        if is_increment and wants_events:
+            relation_depth = hops - 2
+            focus_values = focus_set or {"events", "official_titles", "locations"}
+            related_records: list[dict[str, Any]] = []
+
+            if "official_titles" in focus_values:
+                titles = self.run_read_query(
                     cypher=f"""
-                    MATCH path=(p:Person_Nodes {{person_id: $person_id}})-[:person_relation*1..{hops}]-(other:Person_Nodes)
-                    WHERE other.person_id <> $person_id
-                    RETURN [node IN nodes(path) | node {{.person_id, .name, .zi, .titles}}] AS persons,
-                           [rel IN relationships(path) | {{codes: rel.codes, note: rel.note}}] AS relations,
-                           'Person_Nodes-person_relation*1..{hops}-Person_Nodes' AS path
-                    LIMIT 30
+                    MATCH person_path=(p:Person_Nodes {{person_id: $person_id}})
+                                      -[:person_relation*{relation_depth}..{relation_depth}]-
+                                      (other:Person_Nodes)
+                    MATCH (other)-[:生平]->(le:Life_Events)-[:担任]->(o:Official_title)
+                    OPTIONAL MATCH (le)-[:发生于]->(t:Time)
+                    RETURN 'official_title' AS category,
+                           other {{.person_id, .name, .zi, .titles, .merged_person_ids}} AS other_person,
+                           le {{.event_id, .event_type}} AS life_event,
+                           o {{.official_title}} AS official_title,
+                           t {{.era, .year, .month, .day}} AS time,
+                           [rel IN relationships(person_path) | {{
+                               codes: rel.codes,
+                               note: rel.note,
+                               evidence: rel.evidence,
+                               source_doc_id: rel.source_doc_id,
+                               direction_verified: rel.direction_verified
+                           }}] AS relation_chain,
+                           'Person_Nodes-person_relation*{relation_depth}-Person_Nodes-生平-Life_Events-担任-Official_title' AS path
+                    ORDER BY other.person_id, le.event_id, o.official_title
+                    LIMIT $limit
                     """,
-                    parameters={"person_id": person_id},
+                    parameters={"person_id": person_id, "limit": 60},
                 )
-                bundle["relation_paths"] = relation_paths.get("records", [])
+                related_records.extend(titles.get("records", []))
+
+            if "locations" in focus_values:
+                locations = self.run_read_query(
+                    cypher=f"""
+                    MATCH person_path=(p:Person_Nodes {{person_id: $person_id}})
+                                      -[:person_relation*{relation_depth}..{relation_depth}]-
+                                      (other:Person_Nodes)
+                    MATCH (other)-[:生平]->(le:Life_Events)-[:发生于]->(l:Location)
+                    RETURN 'location' AS category,
+                           other {{.person_id, .name, .zi, .titles, .merged_person_ids}} AS other_person,
+                           le {{.event_id, .event_type}} AS life_event,
+                           l {{.dao, .fu, .zhou, .jun, .xian, .other}} AS location,
+                           [rel IN relationships(person_path) | {{
+                               codes: rel.codes,
+                               note: rel.note,
+                               evidence: rel.evidence,
+                               source_doc_id: rel.source_doc_id,
+                               direction_verified: rel.direction_verified
+                           }}] AS relation_chain,
+                           'Person_Nodes-person_relation*{relation_depth}-Person_Nodes-生平-Life_Events-发生于-Location' AS path
+                    ORDER BY other.person_id, le.event_id
+                    LIMIT $limit
+                    """,
+                    parameters={"person_id": person_id, "limit": 60},
+                )
+                related_records.extend(locations.get("records", []))
+
+            if "events" in focus_values:
+                events = self.run_read_query(
+                    cypher=f"""
+                    MATCH person_path=(p:Person_Nodes {{person_id: $person_id}})
+                                      -[:person_relation*{relation_depth}..{relation_depth}]-
+                                      (other:Person_Nodes)
+                    MATCH (other)-[:生平]->(le:Life_Events)
+                    OPTIONAL MATCH (le)-[:发生于]->(t:Time)
+                    OPTIONAL MATCH (le)-[:发生于]->(l:Location)
+                    OPTIONAL MATCH (le)-[:担任]->(o:Official_title)
+                    RETURN 'life_event' AS category,
+                           other {{.person_id, .name, .zi, .titles, .merged_person_ids}} AS other_person,
+                           le {{.event_id, .event_type}} AS life_event,
+                           t {{.era, .year, .month, .day}} AS time,
+                           l {{.dao, .fu, .zhou, .jun, .xian, .other}} AS location,
+                           o {{.official_title}} AS official_title,
+                           [rel IN relationships(person_path) | {{
+                               codes: rel.codes,
+                               note: rel.note,
+                               evidence: rel.evidence,
+                               source_doc_id: rel.source_doc_id,
+                               direction_verified: rel.direction_verified
+                           }}] AS relation_chain,
+                           'Person_Nodes-person_relation*{relation_depth}-Person_Nodes-生平-Life_Events' AS path
+                    ORDER BY other.person_id, le.event_id
+                    LIMIT $limit
+                    """,
+                    parameters={"person_id": person_id, "limit": 60},
+                )
+                related_records.extend(events.get("records", []))
+
+                historical = self.run_read_query(
+                    cypher=f"""
+                    MATCH person_path=(p:Person_Nodes {{person_id: $person_id}})
+                                      -[:person_relation*{relation_depth}..{relation_depth}]-
+                                      (other:Person_Nodes)
+                    MATCH (other)-[r:历史事件]->(h:Historical_Events)
+                    OPTIONAL MATCH (h)-[:发生于]->(t:Time)
+                    WITH person_path,
+                         other,
+                         r,
+                         h,
+                         collect(DISTINCT t {{.era, .year, .month, .day}}) AS times
+                    ORDER BY other.person_id, h.event_name
+                    RETURN 'historical_event' AS category,
+                           other {{.person_id, .name, .zi, .titles, .merged_person_ids}} AS other_person,
+                           h {{.event_name}} AS historical_event,
+                           r.label AS label,
+                           times,
+                           [rel IN relationships(person_path) | {{
+                               codes: rel.codes,
+                               note: rel.note,
+                               evidence: rel.evidence,
+                               source_doc_id: rel.source_doc_id,
+                               direction_verified: rel.direction_verified
+                           }}] AS relation_chain,
+                           'Person_Nodes-person_relation*{relation_depth}-Person_Nodes-历史事件-Historical_Events-发生于-Time' AS path
+                    LIMIT $limit
+                    """,
+                    parameters={"person_id": person_id, "limit": 60},
+                )
+                related_records.extend(historical.get("records", []))
+
+            bundle["related_person_evidence"] = related_records
 
         bundle["max_hops"] = hops
         bundle["focus"] = sorted(focus_set)
+        bundle["incremental"] = is_increment
+        bundle["limits"] = {
+            "relation_paths_per_hop": 60,
+            "related_records_per_focus": 60,
+        }
         return bundle
 
     def mark_possible_same_person(

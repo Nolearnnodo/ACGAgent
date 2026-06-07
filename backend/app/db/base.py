@@ -15,7 +15,12 @@ from app.models.dictionary import (  # noqa: E402,F401
     RelationCodeDictionary,
     SourceTypeDictionary,
 )
-from app.models.execution import ExecutionRun, ExecutionStepRun, PlannerDecisionRecord  # noqa: E402,F401
+from app.models.execution import (  # noqa: E402,F401
+    ExecutionRun,
+    ExecutionStepRun,
+    IdentityResolutionDecisionLog,
+    PlannerDecisionRecord,
+)
 from app.models.observability import (  # noqa: E402,F401
     ExecutionTraceSummary,
     LLMCallLog,

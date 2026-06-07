@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,8 @@ from app.services.passage_service import PassageService
 from app.skills.atomic.person_identity_resolution import (
     IdentityResolutionDecision,
     PersonIdentityResolutionAtomicSkill,
+    _call_full_text_identity_llm,
+    _persist_decision,
 )
 from app.skills.workflow.passage_ingestion_workflow import (
     PassageIngestionWorkflowSkill,
@@ -238,7 +241,7 @@ class _IdentityResolutionRepo:
     def __init__(self, review_raises: bool = False):
         self.merges: list[tuple[int, int]] = []
         self.reviews: list[dict] = []
-        self.evidence_calls: list[tuple[int, int, tuple[str, ...]]] = []
+        self.evidence_calls: list[tuple[int, int, tuple[str, ...], bool]] = []
         self.review_raises = review_raises
 
     def find_same_name_person_candidates_for_passage(self, doc_id):
@@ -255,11 +258,34 @@ class _IdentityResolutionRepo:
             ]
         }
 
-    def get_person_evidence_bundle(self, person_id, max_hops=2, focus=None):
-        self.evidence_calls.append((person_id, max_hops, tuple(focus or [])))
+    def get_person_evidence_bundle(
+        self,
+        person_id,
+        max_hops=2,
+        focus=None,
+        incremental=False,
+    ):
+        self.evidence_calls.append(
+            (person_id, max_hops, tuple(focus or []), incremental)
+        )
         return {
             "person": {"person_id": person_id, "name": "李某"},
-            "passages": [{"doc_id": 9001 if person_id == 9001001 else 8001}],
+            "passages": (
+                [{"doc_id": 9001 if person_id == 9001001 else 8001}]
+                if not incremental
+                else []
+            ),
+            "life_events": [],
+            "relations": [],
+            "historical_events": [],
+            "relation_paths": (
+                [{"path": f"relation-hop-{max_hops}", "person_id": person_id}]
+                if incremental
+                else []
+            ),
+            "related_person_evidence": [],
+            "max_hops": max_hops,
+            "focus": list(focus or []),
         }
 
     def merge_person_nodes(self, canonical_person_id, duplicate_person_id):
@@ -273,13 +299,29 @@ class _IdentityResolutionRepo:
         return {"status": "success"}
 
 
-def _run_identity_resolution(monkeypatch, decisions, repo=None):
+def _run_identity_resolution(monkeypatch, decisions, repo=None, final_decision=None):
     repo = repo or _IdentityResolutionRepo()
-    decision_iter = iter(decisions)
+    decision_list = list(decisions)
+    decision_iter = iter(decision_list)
     monkeypatch.setattr("app.skills.atomic.person_identity_resolution.GraphRepository", lambda: repo)
     monkeypatch.setattr(
         "app.skills.atomic.person_identity_resolution._call_identity_llm",
         lambda **kwargs: next(decision_iter),
+    )
+    monkeypatch.setattr(
+        "app.skills.atomic.person_identity_resolution._call_full_text_identity_llm",
+        lambda **kwargs: final_decision or decision_list[-1],
+    )
+    monkeypatch.setattr(
+        "app.skills.atomic.person_identity_resolution._load_full_text_sources",
+        lambda **kwargs: {
+            "new_person_sources": [
+                {"doc_id": 9001, "title": "新文章", "context": "新人物完整原文"}
+            ],
+            "candidate_person_sources": [
+                {"doc_id": 8001, "title": "旧文章", "context": "旧人物完整原文"}
+            ],
+        },
     )
     context = _build_passage_context("测试墓志", "测试正文", doc_id=9001)
     result = PersonIdentityResolutionAtomicSkill().run(context, {})
@@ -328,6 +370,10 @@ def test_person_identity_resolution_enters_manual_review_after_five_hops(monkeyp
     assert repo.merges == []
     assert len(repo.reviews) == 1
     assert [call[1] for call in repo.evidence_calls[::2]] == [2, 3, 4, 5]
+    assert [call[3] for call in repo.evidence_calls[::2]] == [False, True, True, True]
+    assert len(result["cases"][0]["decision_trace"]) == 5
+    assert result["cases"][0]["decision_trace"][-1]["round_type"] == "full_text_final"
+    assert result["cases"][0]["used_full_text"] is True
 
 
 def test_person_identity_resolution_low_confidence_same_goes_to_manual_review(monkeypatch):
@@ -350,6 +396,155 @@ def test_person_identity_resolution_low_confidence_same_goes_to_manual_review(mo
     assert result["cases"][0]["action"] == "manual_review"
     assert repo.merges == []
     assert len(repo.reviews) == 1
+
+
+def test_person_identity_resolution_full_text_can_resolve_same(monkeypatch):
+    graph_decisions = [
+        IdentityResolutionDecision(
+            decision="insufficient",
+            confidence=0.2,
+            missing_evidence=["图证据不足"],
+            next_hop_focus=["relations"],
+            reason="继续扩展",
+        )
+        for _ in range(4)
+    ]
+    final_decision = IdentityResolutionDecision(
+        decision="same",
+        confidence=0.94,
+        positive_evidence=["两篇原文记载的亲属、官职与年代一致"],
+        reason="完整原文互相印证",
+    )
+
+    result, repo, _context = _run_identity_resolution(
+        monkeypatch,
+        graph_decisions,
+        final_decision=final_decision,
+    )
+
+    assert result["merged_person_count"] == 1
+    assert result["cases"][0]["used_full_text"] is True
+    assert result["cases"][0]["final_decision"]["reason"] == "完整原文互相印证"
+    assert repo.merges == [(8001001, 9001001)]
+
+
+def test_person_identity_resolution_full_text_can_keep_separate(monkeypatch):
+    graph_decisions = [
+        IdentityResolutionDecision(
+            decision="insufficient",
+            confidence=0.2,
+            missing_evidence=["图证据不足"],
+            next_hop_focus=["events"],
+            reason="继续扩展",
+        )
+        for _ in range(4)
+    ]
+    final_decision = IdentityResolutionDecision(
+        decision="different",
+        confidence=0.96,
+        negative_evidence=["完整原文中的死亡年代冲突"],
+        reason="原文存在不可调和的年代冲突",
+    )
+
+    result, repo, _context = _run_identity_resolution(
+        monkeypatch,
+        graph_decisions,
+        final_decision=final_decision,
+    )
+
+    assert result["cases"][0]["action"] == "kept_separate"
+    assert result["cases"][0]["used_full_text"] is True
+    assert repo.merges == []
+    assert repo.reviews == []
+
+
+def test_full_text_identity_call_disables_prompt_truncation(monkeypatch):
+    captured = {}
+
+    def _fake_call_llm_structured(**kwargs):
+        captured.update(kwargs)
+        return IdentityResolutionDecision(
+            decision="insufficient",
+            confidence=0.1,
+            reason="仍不足",
+        )
+
+    monkeypatch.setattr(
+        "app.skills.atomic.person_identity_resolution.call_llm_structured",
+        _fake_call_llm_structured,
+    )
+    full_text = "甲" * 12000
+
+    _call_full_text_identity_llm(
+        doc_id=9001,
+        name="李某",
+        new_person_id=9001001,
+        candidate_person_id=8001001,
+        graph_decisions=[],
+        new_person_sources=[
+            {"doc_id": 9001, "title": "新文章", "context": full_text}
+        ],
+        candidate_person_sources=[
+            {"doc_id": 8001, "title": "旧文章", "context": full_text}
+        ],
+        trace_metadata={},
+    )
+
+    assert captured["max_prompt_chars"] is None
+    assert full_text in captured["user_prompt"]
+
+
+def test_identity_decision_basis_is_persisted(monkeypatch):
+    stored = []
+
+    class _DecisionSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def add(self, item):
+            stored.append(item)
+
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(
+        "app.skills.atomic.person_identity_resolution.SessionLocal",
+        lambda: _DecisionSession(),
+    )
+    warnings = []
+    decision = IdentityResolutionDecision(
+        decision="different",
+        confidence=0.93,
+        positive_evidence=["同名"],
+        negative_evidence=["死亡年代冲突"],
+        missing_evidence=["籍贯"],
+        next_hop_focus=["locations"],
+        reason="年代冲突足以排除同人",
+    )
+
+    _persist_decision(
+        trace_metadata={"execution_run_id": 11, "execution_step_run_id": 22},
+        passage_id=9001,
+        new_person_id=9001001,
+        candidate_person_id=8001001,
+        hop=4,
+        focus=["events"],
+        decision=decision,
+        used_full_text=False,
+        warnings=warnings,
+    )
+
+    assert warnings == []
+    assert len(stored) == 1
+    log = stored[0]
+    assert log.execution_run_id == 11
+    assert log.decision == "different"
+    assert log.confidence == 0.93
+    assert json.loads(log.negative_evidence_json) == ["死亡年代冲突"]
+    assert log.reason == "年代冲突足以排除同人"
 
 
 def test_person_identity_resolution_marks_failure_when_review_link_fails(monkeypatch):
