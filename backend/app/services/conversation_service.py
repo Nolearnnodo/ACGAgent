@@ -24,6 +24,7 @@ from app.schemas.conversation import (
     ToolCallSummaryResponse,
     TraceSummaryResponse,
 )
+from app.graph.repository import GraphRepository
 from app.skills.registry import SkillRegistry
 
 logger = logging.getLogger(__name__)
@@ -376,6 +377,37 @@ class ConversationService:
                     total_latency_ms=summary.total_latency_ms,
                 )
 
+        # 从 tool_calls 的 output_preview 收集图谱数据，提取 graph_elements
+        graph_elements: dict | None = None
+        all_output_records: list[dict] = []
+        for tc in tool_calls_resp:
+            outp = tc.output_preview
+            if isinstance(outp, dict):
+                records_in_output = outp.get("records")
+                if isinstance(records_in_output, list):
+                    all_output_records.extend(
+                        r for r in records_in_output if isinstance(r, dict)
+                    )
+                else:
+                    # output_preview 本身可能就是一个有意义的 record
+                    all_output_records.append(outp)
+            elif isinstance(outp, str):
+                try:
+                    parsed = _json.loads(outp)
+                    if isinstance(parsed, dict):
+                        records_in_output = parsed.get("records")
+                        if isinstance(records_in_output, list):
+                            all_output_records.extend(
+                                r for r in records_in_output if isinstance(r, dict)
+                            )
+                        else:
+                            all_output_records.append(parsed)
+                except (_json.JSONDecodeError, TypeError):
+                    pass
+
+        if all_output_records:
+            graph_elements = GraphRepository.extract_graph_elements(all_output_records)
+
         return MessageTraceResponse(
             planner=PlannerDecisionResponse(
                 intent=planner_record.intent,
@@ -390,4 +422,5 @@ class ConversationService:
             llm_calls=llm_calls,
             tool_calls=tool_calls_resp,
             summary=summary_resp,
+            graph_elements=graph_elements,
         )

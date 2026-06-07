@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 import { useAuthStore } from '../stores/auth'
 import ChatView from '../views/ChatView.vue'
+import IdentityReviewView from '../views/IdentityReviewView.vue'
 import LoginView from '../views/LoginView.vue'
 import PassageManualInputView from '../views/PassageManualInputView.vue'
 import PassageUploadView from '../views/PassageUploadView.vue'
@@ -26,6 +27,12 @@ const router = createRouter({
       path: '/passages/manual',
       name: 'passage-manual',
       component: PassageManualInputView,
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/review/identity',
+      name: 'identity-review',
+      component: IdentityReviewView,
       meta: { requiresAuth: true },
     },
   ],

@@ -14,6 +14,7 @@ const navItems = computed(() => {
     { label: '对话中心', to: '/chat', active: route.path.startsWith('/chat') },
     { label: '古籍上传', to: '/passages/upload', active: route.path.startsWith('/passages/upload') },
     { label: '古籍输入', to: '/passages/manual', active: route.path.startsWith('/passages/manual') },
+    { label: '同名人物审核', to: '/review/identity', active: route.path.startsWith('/review/identity') },
     { label: '个人设置', to: '/profile', active: route.path.startsWith('/profile') },
   ]
 })

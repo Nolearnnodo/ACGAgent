@@ -109,3 +109,4 @@ class MessageTraceResponse(BaseModel):
     llm_calls: list[LLMCallSummaryResponse] = []
     tool_calls: list[ToolCallSummaryResponse] = []
     summary: TraceSummaryResponse | None = None
+    graph_elements: dict[str, Any] | None = None

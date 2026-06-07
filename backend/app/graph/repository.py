@@ -770,6 +770,532 @@ class GraphRepository:
             "failures": failures,
         }
 
+    # ---------- 辅助：图谱元素提取 ----------
+
+    @staticmethod
+    def extract_graph_elements(records: list[dict]) -> dict:
+        """从 Neo4j 查询结果 records 中提取节点和边，供前端可视化。
+
+        输入：任意 Neo4j records 列表（每条 record 是 dict）。
+        输出：{"nodes": [...], "edges": [...]}，已按 id / source+target+label 去重。
+        """
+
+        nodes: dict[str, dict] = {}  # id -> node
+        edges: dict[str, dict] = {}  # source+target+label -> edge
+
+        # 暂存扁平关系记录的信息，供全局补边使用
+        # key: target_person_node_id, value: {"label": str, "properties": dict}
+        flat_relation_info: dict[str, dict] = {}
+
+        def _infer_node(d: dict) -> dict | None:
+            """尝试把一个 dict 识别为图节点，返回节点 dict 或 None。"""
+            if not isinstance(d, dict):
+                return None
+
+            if "person_id" in d:
+                nid = f"Person_Nodes_{d['person_id']}"
+                return {
+                    "id": nid,
+                    "label": d.get("name") or str(d["person_id"]),
+                    "type": "Person_Nodes",
+                    "properties": d,
+                }
+            if "doc_id" in d:
+                nid = f"Passage_Info_{d['doc_id']}"
+                return {
+                    "id": nid,
+                    "label": d.get("title") or str(d["doc_id"]),
+                    "type": "Passage_Info",
+                    "properties": d,
+                }
+            if "event_id" in d and "event_type" in d:
+                nid = f"Life_Events_{d['event_id']}"
+                return {
+                    "id": nid,
+                    "label": d.get("event_type") or str(d["event_id"]),
+                    "type": "Life_Events",
+                    "properties": d,
+                }
+            if "event_name" in d:
+                nid = f"Historical_Events_{d['event_name']}"
+                return {
+                    "id": nid,
+                    "label": d["event_name"],
+                    "type": "Historical_Events",
+                    "properties": d,
+                }
+            if "official_title" in d and isinstance(d.get("official_title"), str):
+                nid = f"Official_title_{d['official_title']}"
+                return {
+                    "id": nid,
+                    "label": d["official_title"],
+                    "type": "Official_title",
+                    "properties": d,
+                }
+            if "era" in d and "year" in d and "doc_id" not in d:
+                label = f"{d.get('era', '')}{d.get('year', '')}"
+                nid = f"Time_{label}"
+                return {
+                    "id": nid,
+                    "label": label,
+                    "type": "Time",
+                    "properties": d,
+                }
+            loc_fields = ("dao", "zhou", "xian", "fu", "jun", "other")
+            if any(d.get(k) for k in loc_fields):
+                label_val = (
+                    d.get("xian")
+                    or d.get("jun")
+                    or d.get("zhou")
+                    or d.get("fu")
+                    or d.get("dao")
+                    or d.get("other")
+                    or "未知地点"
+                )
+                nid = f"Location_{'_'.join(str(d.get(k) or '') for k in loc_fields)}"
+                return {
+                    "id": nid,
+                    "label": label_val,
+                    "type": "Location",
+                    "properties": d,
+                }
+            # 扁平关系记录：RETURN other.name AS target_name, r.codes AS codes
+            if "target_name" in d and isinstance(d["target_name"], str):
+                name = d["target_name"]
+                nid = f"Person_Nodes_name_{name}"
+                codes = d.get("codes") or []
+                note = d.get("note")
+                if codes:
+                    flat_relation_info[nid] = {
+                        "label": ",".join(str(c) for c in codes),
+                        "properties": {"codes": codes, "note": note},
+                    }
+                return {
+                    "id": nid,
+                    "label": name,
+                    "type": "Person_Nodes",
+                    "properties": {"name": name, "codes": codes, "note": note},
+                }
+            if "source_name" in d and isinstance(d["source_name"], str):
+                name = d["source_name"]
+                nid = f"Person_Nodes_name_{name}"
+                codes = d.get("codes") or []
+                note = d.get("note")
+                if codes:
+                    flat_relation_info[nid] = {
+                        "label": ",".join(str(c) for c in codes),
+                        "properties": {"codes": codes, "note": note},
+                    }
+                return {
+                    "id": nid,
+                    "label": name,
+                    "type": "Person_Nodes",
+                    "properties": {"name": name, "codes": codes, "note": note},
+                }
+            return None
+
+        def _collect_nodes_from_dict(d: dict) -> list[dict]:
+            """递归搜索 dict，返回所有可识别节点。"""
+            found: list[dict] = []
+            node = _infer_node(d)
+            if node:
+                found.append(node)
+            else:
+                for v in d.values():
+                    if isinstance(v, dict):
+                        found.extend(_collect_nodes_from_dict(v))
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, dict):
+                                found.extend(_collect_nodes_from_dict(item))
+            return found
+
+        def _add_node(node: dict) -> None:
+            nid = node["id"]
+            if nid not in nodes:
+                nodes[nid] = node
+
+        def _add_edge(source: str, target: str, label: str, props: dict | None = None) -> None:
+            key = f"{source}__{target}__{label}"
+            if key not in edges:
+                edges[key] = {
+                    "source": source,
+                    "target": target,
+                    "label": label,
+                    "properties": props or {},
+                }
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            # 收集 record 中所有可识别节点
+            record_nodes: list[dict] = []
+            # 先尝试 record 本身（扁平记录如 target_name+codes 的值不是 dict）
+            top_node = _infer_node(record)
+            if top_node:
+                record_nodes.append(top_node)
+            else:
+                for v in record.values():
+                    if isinstance(v, dict):
+                        record_nodes.extend(_collect_nodes_from_dict(v))
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, dict):
+                                record_nodes.extend(_collect_nodes_from_dict(item))
+
+            for n in record_nodes:
+                _add_node(n)
+
+            # 根据同一 record 内的节点共现 + path 字段推断边
+            path_str = record.get("path", "")
+
+            # 按类型分组
+            person_nodes = [n for n in record_nodes if n["type"] == "Person_Nodes"]
+            passage_nodes = [n for n in record_nodes if n["type"] == "Passage_Info"]
+            life_event_nodes = [n for n in record_nodes if n["type"] == "Life_Events"]
+            time_nodes = [n for n in record_nodes if n["type"] == "Time"]
+            loc_nodes = [n for n in record_nodes if n["type"] == "Location"]
+            official_nodes = [n for n in record_nodes if n["type"] == "Official_title"]
+            hist_event_nodes = [n for n in record_nodes if n["type"] == "Historical_Events"]
+
+            # 1. Person → Passage（在文章中）
+            for p in person_nodes:
+                for pa in passage_nodes:
+                    _add_edge(p["id"], pa["id"], "在文章中")
+
+            # 2. Person → Life_Events（生平）
+            for p in person_nodes:
+                for le in life_event_nodes:
+                    _add_edge(p["id"], le["id"], "生平")
+
+            # 3. Life_Events → Time/Location（发生于）
+            for le in life_event_nodes:
+                for t in time_nodes:
+                    _add_edge(le["id"], t["id"], "发生于")
+                for lo in loc_nodes:
+                    _add_edge(le["id"], lo["id"], "发生于")
+
+            # 4. Life_Events → Official_title（担任）
+            for le in life_event_nodes:
+                for o in official_nodes:
+                    _add_edge(le["id"], o["id"], "担任")
+
+            # 5. Person → Historical_Events（历史事件）
+            for p in person_nodes:
+                for he in hist_event_nodes:
+                    rel_label = record.get("label") or "历史事件"
+                    _add_edge(p["id"], he["id"], rel_label)
+
+            # 6. Person → Person（person_relation）
+            if len(person_nodes) >= 2:
+                direction = record.get("direction", "outgoing")
+                codes = record.get("codes") or []
+                rel_label = codes[0] if codes else "person_relation"
+                if isinstance(path_str, str) and "person_relation" in path_str:
+                    if direction == "incoming":
+                        _add_edge(person_nodes[1]["id"], person_nodes[0]["id"], rel_label)
+                    else:
+                        _add_edge(person_nodes[0]["id"], person_nodes[1]["id"], rel_label)
+                else:
+                    # 无 path 时，如果有 direction/codes 也尝试连边
+                    if record.get("direction") or record.get("codes"):
+                        if direction == "incoming":
+                            _add_edge(person_nodes[1]["id"], person_nodes[0]["id"], rel_label)
+                        else:
+                            _add_edge(person_nodes[0]["id"], person_nodes[1]["id"], rel_label)
+
+            # 7. 如果没有 Life_Events 但有 Person + Time/Location/Official_title，
+            #    说明是扁平化的结果，直接连 Person
+            if not life_event_nodes:
+                for p in person_nodes:
+                    for t in time_nodes:
+                        _add_edge(p["id"], t["id"], "时间")
+                    for lo in loc_nodes:
+                        _add_edge(p["id"], lo["id"], "地点")
+                    for o in official_nodes:
+                        _add_edge(p["id"], o["id"], "官职")
+
+        # ── 全局补边：修复跨 record 的孤立子图 ──
+        # 多个 tool_call 分别查询同一人物的不同方面时，不同 record
+        # 中的节点无法通过共现推断建立连边，导致孤立子图。
+        # 策略：找出没有任何边的「孤儿节点」，按图谱 schema 补边。
+
+        def _connected_targets(label: str) -> set[str]:
+            return {e["target"] for e in edges.values() if e["label"] == label}
+
+        def _connected_sources(label: str) -> set[str]:
+            return {e["source"] for e in edges.values() if e["label"] == label}
+
+        def _all_connected() -> set[str]:
+            s: set[str] = set()
+            for e in edges.values():
+                s.add(e["source"])
+                s.add(e["target"])
+            return s
+
+        by_type: dict[str, list[str]] = {}
+        for n in nodes.values():
+            by_type.setdefault(n["type"], []).append(n["id"])
+
+        person_ids = by_type.get("Person_Nodes", [])
+        le_ids = by_type.get("Life_Events", [])
+        pa_ids = by_type.get("Passage_Info", [])
+        time_ids = by_type.get("Time", [])
+        loc_ids = by_type.get("Location", [])
+        ot_ids = by_type.get("Official_title", [])
+        he_ids = by_type.get("Historical_Events", [])
+
+        # 识别"主查询人物"：有真实 person_id 的节点优先于 name-based 节点
+        real_person_ids = [p for p in person_ids if not p.startswith("Person_Nodes_name_")]
+        name_person_ids = [p for p in person_ids if p.startswith("Person_Nodes_name_")]
+
+        def _find_main_person() -> str | None:
+            if not person_ids:
+                return None
+            if len(real_person_ids) == 1:
+                return real_person_ids[0]
+            if real_person_ids:
+                ec = {
+                    pid: sum(1 for e in edges.values() if e["source"] == pid or e["target"] == pid)
+                    for pid in real_person_ids
+                }
+                return max(real_person_ids, key=lambda p: ec.get(p, 0))
+            return person_ids[0]
+
+        main_pid = _find_main_person()
+
+        # 1. 孤儿 Life_Events → 连到主 Person
+        connected_le = _connected_targets("生平")
+        orphan_le = [nid for nid in le_ids if nid not in connected_le]
+        if orphan_le and main_pid:
+            for le_id in orphan_le:
+                _add_edge(main_pid, le_id, "生平")
+
+        # 2. 孤儿 Passage_Info → 连到主 Person
+        connected_pa = _connected_targets("在文章中")
+        orphan_pa = [nid for nid in pa_ids if nid not in connected_pa]
+        if orphan_pa and main_pid:
+            for pa_id in orphan_pa:
+                _add_edge(main_pid, pa_id, "在文章中")
+
+        # 3. 孤儿 Time / Location → 连到 Life_Events（优先）或主 Person
+        connected_time = _connected_targets("发生于") | _connected_targets("时间")
+        orphan_time = [nid for nid in time_ids if nid not in connected_time]
+        if orphan_time:
+            if le_ids:
+                for t_id in orphan_time:
+                    _add_edge(le_ids[0], t_id, "发生于")
+            elif main_pid:
+                for t_id in orphan_time:
+                    _add_edge(main_pid, t_id, "时间")
+
+        connected_loc = _connected_targets("发生于") | _connected_targets("地点")
+        orphan_loc = [nid for nid in loc_ids if nid not in connected_loc]
+        if orphan_loc:
+            if le_ids:
+                for l_id in orphan_loc:
+                    _add_edge(le_ids[0], l_id, "发生于")
+            elif main_pid:
+                for l_id in orphan_loc:
+                    _add_edge(main_pid, l_id, "地点")
+
+        # 4. 孤儿 Official_title → 连到 Life_Events 或主 Person
+        connected_ot = _connected_targets("担任") | _connected_targets("官职")
+        orphan_ot = [nid for nid in ot_ids if nid not in connected_ot]
+        if orphan_ot:
+            if le_ids:
+                for o_id in orphan_ot:
+                    _add_edge(le_ids[0], o_id, "担任")
+            elif main_pid:
+                for o_id in orphan_ot:
+                    _add_edge(main_pid, o_id, "官职")
+
+        # 5. 孤儿 Historical_Events → 连到主 Person
+        connected_he = _all_connected()
+        orphan_he = [nid for nid in he_ids if nid not in connected_he]
+        if orphan_he and main_pid:
+            for he_id in orphan_he:
+                _add_edge(main_pid, he_id, "历史事件")
+
+        # 6. name-based 关系人物 → 连到主 Person，使用 flat_relation_info 的标签和属性
+        if main_pid and name_person_ids:
+            for np_id in name_person_ids:
+                info = flat_relation_info.get(np_id, {})
+                rel_label = info.get("label", "person_relation")
+                rel_props = info.get("properties")
+                _add_edge(main_pid, np_id, rel_label, rel_props)
+
+        return {
+            "nodes": list(nodes.values()),
+            "edges": list(edges.values()),
+        }
+
+    @staticmethod
+    def build_graph_elements_from_evidence_bundles(
+        bundles: list[dict],
+    ) -> dict:
+        """从 evidence bundle 列表直接构建图谱元素（节点+边）。
+
+        与 extract_graph_elements 不同，此方法利用 evidence bundle 的已知结构
+        直接建立正确的边，不依赖 record 内节点共现推断。
+        """
+
+        nodes: dict[str, dict] = {}
+        edges: dict[str, dict] = {}
+
+        def _add_node(nid: str, label: str, ntype: str, props: dict) -> None:
+            if nid not in nodes:
+                nodes[nid] = {"id": nid, "label": label, "type": ntype, "properties": props}
+
+        def _add_edge(source: str, target: str, label: str, props: dict | None = None) -> None:
+            key = f"{source}__{target}__{label}"
+            if key not in edges:
+                edges[key] = {"source": source, "target": target, "label": label, "properties": props or {}}
+
+        for bundle in bundles:
+            person = bundle.get("person") or {}
+            pid = person.get("person_id")
+            if pid is None:
+                continue
+            person_nid = f"Person_Nodes_{pid}"
+            _add_node(person_nid, person.get("name") or str(pid), "Person_Nodes", person)
+
+            for p in bundle.get("passages") or []:
+                if p.get("doc_id") is None:
+                    continue
+                pa_nid = f"Passage_Info_{p['doc_id']}"
+                _add_node(pa_nid, p.get("title") or str(p["doc_id"]), "Passage_Info", p)
+                _add_edge(person_nid, pa_nid, "在文章中")
+
+            for rec in bundle.get("life_events") or []:
+                le = rec.get("life_event") or rec
+                eid = le.get("event_id")
+                if eid is not None:
+                    le_nid = f"Life_Events_{eid}"
+                    _add_node(le_nid, le.get("event_type") or str(eid), "Life_Events", le)
+                    _add_edge(person_nid, le_nid, "生平")
+
+                    t = rec.get("time")
+                    if isinstance(t, dict) and t.get("era") and t.get("year"):
+                        t_label = f"{t['era']}{t['year']}"
+                        t_nid = f"Time_{t_label}"
+                        _add_node(t_nid, t_label, "Time", t)
+                        _add_edge(le_nid, t_nid, "发生于")
+
+                    loc = rec.get("location")
+                    if isinstance(loc, dict):
+                        loc_fields = ("dao", "zhou", "xian", "fu", "jun", "other")
+                        if any(loc.get(k) for k in loc_fields):
+                            loc_label = loc.get("xian") or loc.get("jun") or loc.get("zhou") or loc.get("fu") or loc.get("dao") or loc.get("other") or "未知"
+                            loc_nid = f"Location_{'_'.join(str(loc.get(k) or '') for k in loc_fields)}"
+                            _add_node(loc_nid, loc_label, "Location", loc)
+                            _add_edge(le_nid, loc_nid, "发生于")
+
+                    ot = rec.get("official_title")
+                    if isinstance(ot, dict) and ot.get("official_title"):
+                        ot_nid = f"Official_title_{ot['official_title']}"
+                        _add_node(ot_nid, ot["official_title"], "Official_title", ot)
+                        _add_edge(le_nid, ot_nid, "担任")
+
+            for rec in bundle.get("relations") or []:
+                other = rec.get("other_person")
+                if not isinstance(other, dict) or other.get("person_id") is None:
+                    continue
+                other_nid = f"Person_Nodes_{other['person_id']}"
+                _add_node(other_nid, other.get("name") or str(other["person_id"]), "Person_Nodes", other)
+                codes = rec.get("codes") or []
+                rel_label = ",".join(str(c) for c in codes) if codes else "person_relation"
+                edge_props = {
+                    "codes": codes,
+                    "note": rec.get("note"),
+                    "evidence": rec.get("evidence"),
+                    "direction_verified": rec.get("direction_verified"),
+                }
+                direction = rec.get("direction", "outgoing")
+                if direction == "incoming":
+                    _add_edge(other_nid, person_nid, rel_label, edge_props)
+                else:
+                    _add_edge(person_nid, other_nid, rel_label, edge_props)
+
+            for rec in bundle.get("historical_events") or []:
+                he = rec.get("historical_event")
+                if isinstance(he, dict) and he.get("event_name"):
+                    he_nid = f"Historical_Events_{he['event_name']}"
+                    _add_node(he_nid, he["event_name"], "Historical_Events", he)
+                    _add_edge(person_nid, he_nid, rec.get("label") or "历史事件")
+
+        return {"nodes": list(nodes.values()), "edges": list(edges.values())}
+
+    # ---------- 业务封装：同名人物人工审核 ----------
+
+    def list_pending_identity_reviews(self) -> dict:
+        """列出所有待人工审核的"可能同人"关系。"""
+
+        return self.run_read_query(
+            cypher="""
+            MATCH (source:Person_Nodes)-[r:可能同人]->(target:Person_Nodes)
+            OPTIONAL MATCH (source)-[:在文章中]->(sp:Passage_Info)
+            OPTIONAL MATCH (target)-[:在文章中]->(tp:Passage_Info)
+            RETURN source.person_id AS source_person_id,
+                   source.name AS source_name,
+                   target.person_id AS target_person_id,
+                   target.name AS target_name,
+                   r.confidence AS confidence,
+                   r.reason AS reason,
+                   r.evidence AS evidence,
+                   collect(DISTINCT sp.title) AS source_passages,
+                   collect(DISTINCT tp.title) AS target_passages
+            ORDER BY r.confidence DESC
+            """,
+        )
+
+    def adjudicate_identity(
+        self,
+        source_person_id: int,
+        target_person_id: int,
+        decision: str,
+    ) -> dict:
+        """执行身份裁定：merge（合并）或 keep_separate（保持独立）。"""
+
+        if decision == "merge":
+            merge_result = self.merge_person_nodes(
+                canonical_person_id=target_person_id,
+                duplicate_person_id=source_person_id,
+            )
+            # 合并后删除可能同人关系（若节点还存在的话）
+            try:
+                self.run_write_query(
+                    cypher="""
+                    MATCH (s:Person_Nodes {person_id: $source})-[r:可能同人]-(t:Person_Nodes {person_id: $target})
+                    DELETE r
+                    RETURN count(r) AS deleted_count
+                    """,
+                    parameters={"source": source_person_id, "target": target_person_id},
+                )
+            except Exception:
+                pass  # 合并后节点已删，关系自动消失
+            return {
+                "status": "success",
+                "action": "merge",
+                "merge_result": merge_result,
+            }
+
+        # keep_separate
+        del_result = self.run_write_query(
+            cypher="""
+            MATCH (s:Person_Nodes {person_id: $source})-[r:可能同人]-(t:Person_Nodes {person_id: $target})
+            DELETE r
+            RETURN count(r) AS deleted_count
+            """,
+            parameters={"source": source_person_id, "target": target_person_id},
+        )
+        return {
+            "status": "success",
+            "action": "keep_separate",
+            "deleted_count": (del_result.get("records") or [{}])[0].get("deleted_count", 0),
+        }
+
     def merge_person_nodes(
         self,
         canonical_person_id: int,

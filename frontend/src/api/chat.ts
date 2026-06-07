@@ -72,6 +72,10 @@ export interface MessageTrace {
   llm_calls: LLMCallSummary[]
   tool_calls: ToolCallSummary[]
   summary: TraceSummary | null
+  graph_elements: {
+    nodes: Array<{ id: string; label: string; type: string; properties: Record<string, unknown> }>
+    edges: Array<{ source: string; target: string; label: string; properties: Record<string, unknown> }>
+  } | null
 }
 
 export async function listConversations() {

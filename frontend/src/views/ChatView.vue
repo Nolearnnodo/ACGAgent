@@ -5,6 +5,7 @@ import { marked } from 'marked'
 import axios from 'axios'
 
 import AppLayout from '../layouts/AppLayout.vue'
+import GraphViewer from '../components/GraphViewer.vue'
 import {
   createConversation,
   deleteConversation,
@@ -277,6 +278,20 @@ onMounted(async () => {
               <div v-if="traceLoading[message.id]" class="trace-panel__loading">加载中...</div>
 
               <div v-if="traceExpanded[message.id] && traceCache[message.id]" class="trace-panel__body">
+
+                <!-- 图谱可视化 -->
+                <div v-if="traceCache[message.id]?.graph_elements?.nodes?.length" class="trace-section">
+                  <button class="trace-section__header" type="button" @click="toggleDetail(`graph-${message.id}`)">
+                    <span class="trace-section__icon" :class="{ 'trace-section__icon--open': traceDetailExpanded[`graph-${message.id}`] }">&#9654;</span>
+                    <span class="trace-section__badge trace-section__badge--orange">图谱</span>
+                    <span class="trace-section__summary">
+                      {{ traceCache[message.id].graph_elements!.nodes.length }} 节点 · {{ traceCache[message.id].graph_elements!.edges.length }} 关系
+                    </span>
+                  </button>
+                  <div v-if="traceDetailExpanded[`graph-${message.id}`]" class="trace-section__detail trace-section__detail--graph">
+                    <GraphViewer :elements="traceCache[message.id].graph_elements!" height="360px" />
+                  </div>
+                </div>
 
                 <!-- 意图识别 -->
                 <div v-if="traceCache[message.id].planner" class="trace-section">
@@ -847,6 +862,7 @@ onMounted(async () => {
 .trace-section__badge--green { background: #e3f8e8; color: #1e8a3c; }
 .trace-section__badge--purple { background: #efe3ff; color: #7c3aed; }
 .trace-section__badge--teal { background: #e0f5f0; color: #0f766e; }
+.trace-section__badge--orange { background: #fff3e0; color: #e65100; }
 
 .trace-section__summary {
   color: #6b7fa3;
@@ -862,6 +878,12 @@ onMounted(async () => {
   background: #fff;
   border-radius: 8px;
   border: 1px solid #eef2fa;
+}
+
+.trace-section__detail--graph {
+  padding: 0;
+  border: none;
+  background: none;
 }
 
 /* ── 键值对 ── */

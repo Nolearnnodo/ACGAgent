@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.routers import auth, chat, health, passages, users
+from app.api.v1.routers.review import router as review_router
 from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.skills.registry import SkillRegistry
@@ -33,6 +34,7 @@ def create_app() -> FastAPI:
     app.include_router(users.router, prefix="/api/v1")
     app.include_router(chat.router, prefix="/api/v1")
     app.include_router(passages.router, prefix="/api/v1")
+    app.include_router(review_router, prefix="/api/v1")
 
     @app.on_event("startup")
     def _sync_skill_metadata() -> None:
