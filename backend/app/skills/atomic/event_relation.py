@@ -74,6 +74,8 @@ class PersonRelationOut(BaseModel):
     tgt_person_id: int
     codes: list[str]
     note: str | None = None
+    reverse_codes: list[str]
+    reverse_note: str | None = None
     evidence: str = ""
 
 
@@ -123,6 +125,8 @@ def _build_system_prompt(persons_summary: list[dict]) -> str:
       "src_person_id": <int>, "tgt_person_id": <int>,
       "codes": ["F"|"M"|"S"|"D"|"H"|"W"|"Z"|"C"|"B"|"O"],
       "note": "<仅 codes=['O'] 时填，≤15 字>",
+      "reverse_codes": ["反向关系字母序列"],
+      "reverse_note": "<仅 reverse_codes=['O'] 时填，≤15 字>",
       "evidence": "<原文≤30字>"
     }}
   ]
@@ -137,7 +141,11 @@ def _build_system_prompt(persons_summary: list[dict]) -> str:
 - historic_events.event_name 必须落在历史事件字典内（不在的让我处理）。
 - person_relations.codes 字母序列长度 ≤ 3；超过 3 字母时强制写 ["O"] + note≤15字。
   关系字母编码：F=父 M=母 S=子 D=女 H=夫 W=妻 Z=妾 C=非直系兄弟姐妹 B=直系兄弟姐妹 O=其他。
-- person_relations 只列单向，系统会自动补反向。
+- 每条 person_relations 必须同时给出 reverse_codes，禁止让系统猜测人物性别。
+  例如：女儿→父亲 codes=["F"]，父亲→女儿 reverse_codes=["D"]；
+  儿子→母亲 codes=["M"]，母亲→儿子 reverse_codes=["S"]。
+- codes=["O"] 时 note 描述 src→tgt，reverse_note 必须单独描述 tgt→src；
+  对称关系可填写相同说明，非对称关系禁止直接镜像说明。
 
 不输出任何解释或代码块，仅输出 JSON。
 """
@@ -305,38 +313,80 @@ class EventRelationAtomicSkill(BaseSkill):
         # ---- Skill-7：人物 ↔ 人物（双向） ----
         for rel in person_relations:
             codes = rel.get("codes") or []
-            # 长度上限 3，超出强制改 ["O"] + note
-            if len(codes) > 3 or any(c not in valid_codes for c in codes):
+            reverse_codes = rel.get("reverse_codes") or []
+            if (
+                len(codes) > 3
+                or len(reverse_codes) > 3
+                or any(c not in valid_codes for c in codes + reverse_codes)
+            ):
                 warnings.append(
                     {
                         "type": "relation_chain_invalid",
-                        "detail": f"原 codes={codes} 不合法，已降级为 ['O']",
+                        "detail": (
+                            f"codes={codes}, reverse_codes={reverse_codes} 不合法，"
+                            "已跳过该关系"
+                        ),
                     }
                 )
-                codes = ["O"]
-                if not rel.get("note"):
-                    rel["note"] = "复合关系"
+                continue
 
-            if not is_valid_relation_chain(codes):
+            if not (
+                is_valid_relation_chain(codes)
+                and is_valid_relation_chain(reverse_codes)
+                and _are_inverse_chains(codes, reverse_codes)
+            ):
+                warnings.append(
+                    {
+                        "type": "relation_inverse_invalid",
+                        "detail": (
+                            f"{rel.get('src_person_id')}→{rel.get('tgt_person_id')} "
+                            f"codes={codes}, reverse_codes={reverse_codes} 不互逆，已跳过"
+                        ),
+                    }
+                )
                 continue
 
             src = int(rel["src_person_id"])
             tgt = int(rel["tgt_person_id"])
             note = rel.get("note")
+            reverse_note = rel.get("reverse_note")
+            if codes == ["O"] and not _valid_other_note(note):
+                warnings.append(
+                    {
+                        "type": "relation_note_invalid",
+                        "detail": f"{src}→{tgt} 的 O 关系缺少有效 note，已跳过",
+                    }
+                )
+                continue
+            if reverse_codes == ["O"] and not _valid_other_note(reverse_note):
+                warnings.append(
+                    {
+                        "type": "relation_note_invalid",
+                        "detail": f"{tgt}→{src} 的 O 关系缺少有效 reverse_note，已跳过",
+                    }
+                )
+                continue
+
+            evidence = (rel.get("evidence") or "")[:30]
+            source_doc_id = int(passage["doc_id"])
             try:
                 repo.upsert_person_relation(
                     source_person_id=src,
                     target_person_id=tgt,
                     codes=codes,
                     note=note,
+                    evidence=evidence,
+                    source_doc_id=source_doc_id,
+                    direction_verified=True,
                 )
-                # 反向：纯 ["O"] 直接镜像；亲属编码可由调用方人工核对，
-                # 此处先按字母级镜像（满足图遍历需要，正确性 review 由专家）
                 repo.upsert_person_relation(
                     source_person_id=tgt,
                     target_person_id=src,
-                    codes=_inverse_codes(codes),
-                    note=note,
+                    codes=reverse_codes,
+                    note=reverse_note,
+                    evidence=evidence,
+                    source_doc_id=source_doc_id,
+                    direction_verified=True,
                 )
             except Exception as exc:
                 warnings.append(
@@ -351,21 +401,30 @@ class EventRelationAtomicSkill(BaseSkill):
         return output
 
 
-_INVERSE_MAP = {
-    "F": "S",
-    "M": "S",  # 反向「子」与「女」无法仅从字母推断性别，统一回填 S
-    "S": "F",  # 同理
-    "D": "F",
-    "H": "W",
-    "W": "H",
-    "Z": "H",
-    "C": "C",
-    "B": "B",
-    "O": "O",
+_ALLOWED_INVERSES = {
+    "F": {"S", "D"},
+    "M": {"S", "D"},
+    "S": {"F", "M"},
+    "D": {"F", "M"},
+    "H": {"W", "Z"},
+    "W": {"H"},
+    "Z": {"H"},
+    "C": {"C"},
+    "B": {"B"},
+    "O": {"O"},
 }
 
 
-def _inverse_codes(codes: list[str]) -> list[str]:
-    """字母关系链反向。仅做字母层翻转，不区分性别（图层细化由专家校对）。"""
+def _are_inverse_chains(codes: list[str], reverse_codes: list[str]) -> bool:
+    """校验显式正反向关系链，允许父母/子女性别分支。"""
 
-    return [_INVERSE_MAP.get(c, c) for c in reversed(codes)]
+    if len(codes) != len(reverse_codes):
+        return False
+    return all(
+        reverse_code in _ALLOWED_INVERSES.get(code, set())
+        for code, reverse_code in zip(codes, reversed(reverse_codes), strict=True)
+    )
+
+
+def _valid_other_note(note: str | None) -> bool:
+    return bool(note and note.strip() and len(note.strip()) <= 15)

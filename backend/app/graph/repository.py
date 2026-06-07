@@ -271,15 +271,22 @@ class GraphRepository:
         target_person_id: int,
         codes: list[str],
         note: str | None = None,
+        evidence: str | None = None,
+        source_doc_id: int | None = None,
+        direction_verified: bool = False,
     ) -> dict[str, Any]:
-        """Stage 3 (Skill-7)：人物 ↔ 人物 字母关系边（单向，调用方负责双向）。"""
+        """Stage 3 (Skill-7)：写入带来源和方向校验状态的人物关系边。"""
 
         return self.run_write_query(
             cypher="""
             MATCH (a:Person_Nodes {person_id: $source_person_id})
             MATCH (b:Person_Nodes {person_id: $target_person_id})
             MERGE (a)-[r:person_relation]->(b)
-            SET r.codes = $codes, r.note = $note
+            SET r.codes = $codes,
+                r.note = $note,
+                r.evidence = $evidence,
+                r.source_doc_id = $source_doc_id,
+                r.direction_verified = $direction_verified
             RETURN r
             """,
             parameters={
@@ -287,6 +294,9 @@ class GraphRepository:
                 "target_person_id": target_person_id,
                 "codes": codes,
                 "note": note,
+                "evidence": evidence,
+                "source_doc_id": source_doc_id,
+                "direction_verified": direction_verified,
             },
         )
 
@@ -648,7 +658,12 @@ class GraphRepository:
               AND target.person_id <> $duplicate_person_id
             MERGE (keep)-[new_rel:person_relation]->(target)
             SET new_rel.codes = coalesce(new_rel.codes, r.codes),
-                new_rel.note = coalesce(new_rel.note, r.note)
+                new_rel.note = coalesce(new_rel.note, r.note),
+                new_rel.evidence = coalesce(new_rel.evidence, r.evidence),
+                new_rel.source_doc_id = coalesce(new_rel.source_doc_id, r.source_doc_id),
+                new_rel.direction_verified =
+                    coalesce(new_rel.direction_verified, false) OR
+                    coalesce(r.direction_verified, false)
             RETURN count(new_rel) AS transferred
             """,
             """
@@ -658,7 +673,12 @@ class GraphRepository:
               AND source.person_id <> $duplicate_person_id
             MERGE (source)-[new_rel:person_relation]->(keep)
             SET new_rel.codes = coalesce(new_rel.codes, r.codes),
-                new_rel.note = coalesce(new_rel.note, r.note)
+                new_rel.note = coalesce(new_rel.note, r.note),
+                new_rel.evidence = coalesce(new_rel.evidence, r.evidence),
+                new_rel.source_doc_id = coalesce(new_rel.source_doc_id, r.source_doc_id),
+                new_rel.direction_verified =
+                    coalesce(new_rel.direction_verified, false) OR
+                    coalesce(r.direction_verified, false)
             RETURN count(new_rel) AS transferred
             """,
             """
