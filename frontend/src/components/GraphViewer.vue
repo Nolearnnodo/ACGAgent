@@ -137,9 +137,28 @@ function buildNvlNodes(elements: GraphElements): Node[] {
 
   for (const n of elements.nodes) {
     const pos = placed.get(n.id) || { x: (Math.random() - 0.5) * 400, y: (Math.random() - 0.5) * 400 }
+    const labelEl = document.createElement('div')
+    labelEl.textContent = n.label
+    labelEl.style.cssText = `
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-family: "Noto Serif SC", "Source Han Serif SC", serif;
+      max-width: 52px;
+      font-size: 13px;
+      color: #fff;
+      text-align: center;
+      line-height: 1;
+      pointer-events: none;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.4);
+    `
     result.push({
       id: n.id,
-      captions: [{ value: n.label, styles: ['bold'] }],
+      html: labelEl,
       color: colorMap[n.type] || '#95A5A6',
       size: 30,
       x: pos.x,
