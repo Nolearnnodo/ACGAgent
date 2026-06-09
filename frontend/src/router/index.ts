@@ -21,13 +21,13 @@ const router = createRouter({
       path: '/passages/upload',
       name: 'passage-upload',
       component: PassageUploadView,
-      meta: { requiresAuth: true },
+      meta: { requiresAuth: true, requiresAdmin: true },
     },
     {
       path: '/passages/manual',
       name: 'passage-manual',
       component: PassageManualInputView,
-      meta: { requiresAuth: true },
+      meta: { requiresAuth: true, requiresAdmin: true },
     },
     {
       path: '/review/identity',
@@ -46,6 +46,14 @@ router.beforeEach(async (to) => {
 
   if (to.meta.requiresAuth && !authStore.isAuthenticated) {
     return { name: 'login' }
+  }
+
+  if (to.meta.requiresAdmin && !authStore.isAdmin) {
+    return { name: 'chat' }
+  }
+
+  if (to.name === 'identity-review' && to.query.mode !== 'annotation' && !authStore.isAdmin) {
+    return { name: 'identity-review', query: { mode: 'annotation' } }
   }
 
   if (to.meta.guestOnly && authStore.isAuthenticated) {

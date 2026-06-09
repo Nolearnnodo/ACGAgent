@@ -15,6 +15,7 @@ export const useAuthStore = defineStore('auth', () => {
   const loading = ref(false)
 
   const isAuthenticated = computed(() => Boolean(user.value && localStorage.getItem('access_token')))
+  const isAdmin = computed(() => user.value?.role === 'admin')
 
   function persistTokens(accessToken: string, refreshToken: string) {
     localStorage.setItem('access_token', accessToken)
@@ -77,6 +78,7 @@ export const useAuthStore = defineStore('auth', () => {
     user,
     loading,
     isAuthenticated,
+    isAdmin,
     loginAction,
     registerAction,
     restoreSession,

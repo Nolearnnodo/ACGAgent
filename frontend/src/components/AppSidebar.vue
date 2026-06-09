@@ -8,15 +8,30 @@ const route = useRoute()
 const authStore = useAuthStore()
 
 const navItems = computed(() => {
-  // 科研阶段：古籍模块对所有登录用户开放（后端权限同步放开）
-  void authStore.user
-  return [
+  const items = [
     { label: '对话中心', to: '/chat', active: route.path.startsWith('/chat') },
-    { label: '古籍上传', to: '/passages/upload', active: route.path.startsWith('/passages/upload') },
-    { label: '古籍输入', to: '/passages/manual', active: route.path.startsWith('/passages/manual') },
-    { label: '同名人物审核', to: '/review/identity', active: route.path.startsWith('/review/identity') },
+    {
+      label: '古籍上传',
+      to: '/passages/upload',
+      active: route.path.startsWith('/passages/upload'),
+      adminOnly: true,
+    },
+    {
+      label: '古籍输入',
+      to: '/passages/manual',
+      active: route.path.startsWith('/passages/manual'),
+      adminOnly: true,
+    },
+    {
+      label: '同名人物审核',
+      to: '/review/identity',
+      active: route.path.startsWith('/review/identity') && !route.query.mode,
+      adminOnly: true,
+    },
+    { label: '同名标注', to: '/review/identity?mode=annotation', active: route.query.mode === 'annotation' },
     { label: '个人设置', to: '/profile', active: route.path.startsWith('/profile') },
   ]
+  return items.filter((item) => !item.adminOnly || authStore.isAdmin)
 })
 </script>
 

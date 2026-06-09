@@ -18,15 +18,31 @@ if "app.core.deps" not in sys.modules:
     def get_current_user():
         raise RuntimeError("dependency override is not used in direct route tests")
 
+    def get_current_admin_user():
+        raise RuntimeError("dependency override is not used in direct route tests")
+
     deps_stub.get_current_user = get_current_user
+    deps_stub.get_current_admin_user = get_current_admin_user
     sys.modules["app.core.deps"] = deps_stub
 
+from app.api.v1.routers import passages as passages_router
 from app.api.v1.routers.passages import upload_passages
 from app.db import base  # noqa: F401
 from app.db.base_class import Base
 from app.models.passage import Passage
 from app.models.user import User
 from app.services.passage_service import PassageService
+
+
+ADMIN_ONLY_PASSAGE_ENDPOINTS = {
+    "create_manual_passage",
+    "upload_passages",
+    "list_passages",
+    "get_all_passages_token_usage_overview",
+    "get_passage",
+    "list_passage_runs",
+    "get_passage_token_usage",
+}
 
 
 def _upload_file(filename: str, text: str) -> UploadFile:
@@ -66,6 +82,20 @@ def _install_plain_text_extractor(monkeypatch, *, fail_filename: str | None = No
         "extract_text_via_markitdown",
         fake_extract,
     )
+
+
+def test_passage_routes_require_admin_user_dependency():
+    protected_endpoints = {
+        route.endpoint.__name__: route
+        for route in passages_router.router.routes
+        if getattr(route, "endpoint", None)
+        and route.endpoint.__name__ in ADMIN_ONLY_PASSAGE_ENDPOINTS
+    }
+
+    assert set(protected_endpoints) == ADMIN_ONLY_PASSAGE_ENDPOINTS
+    for route in protected_endpoints.values():
+        dependency_calls = {dependency.call for dependency in route.dependant.dependencies}
+        assert passages_router.get_current_admin_user in dependency_calls
 
 
 @pytest.mark.asyncio
@@ -124,3 +154,42 @@ async def test_upload_batch_write_failure_rolls_back_all_new_passages(
     assert exc_info.value.status_code == 500
     assert db.query(Passage).count() == 0
     assert len(background_tasks.tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_upload_batch_queues_one_concurrent_workflow_dispatch(
+    monkeypatch,
+    passage_db,
+):
+    db, user = passage_db
+    _install_plain_text_extractor(monkeypatch)
+    dispatched: list[tuple[int, list[int], str]] = []
+
+    def fake_submit_upload_workflows(user_id: int, passage_ids: list[int], trigger_type: str) -> None:
+        dispatched.append((user_id, passage_ids, trigger_type))
+
+    monkeypatch.setattr(
+        passages_router,
+        "_submit_upload_workflows",
+        fake_submit_upload_workflows,
+    )
+    background_tasks = BackgroundTasks()
+
+    result = await upload_passages(
+        background_tasks=background_tasks,
+        files=[
+            _upload_file("first.txt", "第一篇"),
+            _upload_file("second.txt", "第二篇"),
+        ],
+        current_user=user,
+        db=db,
+    )
+
+    assert len(result) == 2
+    assert db.query(Passage).count() == 2
+    assert len(background_tasks.tasks) == 1
+
+    await background_tasks()
+    assert dispatched == [
+        (user.id, [item.doc_id for item in result], "passage_upload"),
+    ]

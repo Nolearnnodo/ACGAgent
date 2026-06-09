@@ -6,6 +6,8 @@
 - 前端拿到 pending 列表后立刻进任务监控页，polling /runs 看 5 个 step 进度。
 """
 
+from concurrent.futures import Future, ThreadPoolExecutor
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
@@ -14,7 +16,8 @@ from sqlalchemy.orm import Session
 from app.agents.context import ExecutionContext
 from app.agents.executor import Executor
 from app.agents.models import PlannerDecision, StepExecutionResult
-from app.core.deps import get_current_user
+from app.core.config import get_settings
+from app.core.deps import get_current_admin_user
 from app.db.session import SessionLocal, get_db
 from app.models.passage import Passage
 from app.models.user import User
@@ -33,7 +36,31 @@ from app.schemas.passage import (
 )
 from app.services.passage_service import MARKITDOWN_SUPPORTED_SUFFIXES, PassageService
 
+logger = logging.getLogger(__name__)
+settings = get_settings()
 router = APIRouter(prefix="/passages", tags=["古籍文章"])
+_upload_workflow_executor = ThreadPoolExecutor(
+    max_workers=max(1, settings.passage_upload_concurrency),
+    thread_name_prefix="passage-upload",
+)
+
+
+def _log_upload_workflow_failure(future: Future[None]) -> None:
+    try:
+        future.result()
+    except Exception:
+        logger.exception("Passage upload workflow failed in background executor")
+
+
+def _submit_upload_workflows(user_id: int, passage_ids: list[int], trigger_type: str) -> None:
+    for passage_id in passage_ids:
+        future = _upload_workflow_executor.submit(
+            _run_workflow_background,
+            user_id,
+            passage_id,
+            trigger_type,
+        )
+        future.add_done_callback(_log_upload_workflow_failure)
 
 
 def _build_skipped_upload_response(
@@ -131,7 +158,7 @@ def _run_workflow_background(user_id: int, passage_id: int, trigger_type: str) -
 def create_manual_passage(
     payload: PassageManualCreateRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> PassageResponse:
     """手工录入古籍文章；立即返回 pending，workflow 后台跑。"""
@@ -159,7 +186,7 @@ def create_manual_passage(
 async def upload_passages(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> list[PassageUploadResponse]:
     """上传一个或多个古籍文件；立即返回 pending 列表，workflow 后台跑。"""
@@ -241,9 +268,12 @@ async def upload_passages(
             detail="批量上传写入失败，已回滚本次新增文章。",
         ) from exc
 
-    for passage_id in created_passage_ids:
+    if created_passage_ids:
         background_tasks.add_task(
-            _run_workflow_background, current_user.id, passage_id, "passage_upload"
+            _submit_upload_workflows,
+            current_user.id,
+            created_passage_ids,
+            "passage_upload",
         )
 
     return [response for response in responses if response is not None]
@@ -251,7 +281,7 @@ async def upload_passages(
 
 @router.get("", response_model=list[PassageSummaryResponse])
 def list_passages(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> list[PassageSummaryResponse]:
     service = PassageService(db)
@@ -260,7 +290,7 @@ def list_passages(
 
 @router.get("/token-usage-overview", response_model=PassageUsageOverviewResponse)
 def get_all_passages_token_usage_overview(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> PassageUsageOverviewResponse:
     """返回所有古籍的资源追踪汇总数据。"""
@@ -303,7 +333,7 @@ def get_all_passages_token_usage_overview(
 @router.get("/{doc_id}", response_model=PassageResponse)
 def get_passage(
     doc_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> PassageResponse:
     service = PassageService(db)
@@ -317,7 +347,7 @@ def get_passage(
 @router.get("/{doc_id}/runs", response_model=list[PassageExecutionRunResponse])
 def list_passage_runs(
     doc_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> list[PassageExecutionRunResponse]:
     service = PassageService(db)
@@ -344,7 +374,7 @@ def list_passage_runs(
 @router.get("/{doc_id}/token-usage", response_model=PassageTokenUsageResponse)
 def get_passage_token_usage(
     doc_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> PassageTokenUsageResponse:
     service = PassageService(db)
