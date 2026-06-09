@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     llm_api_base_url: str = Field(default="", alias="LLM_API_BASE_URL")
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_timeout_seconds: int = Field(default=120, alias="LLM_TIMEOUT_SECONDS")
+    passage_upload_concurrency: int = Field(default=10, alias="PASSAGE_UPLOAD_CONCURRENCY")
+    identity_merge_disabled: bool = Field(default=False, alias="IDENTITY_MERGE_DISABLED")
 
     @property
     def cors_origins(self) -> list[str]:

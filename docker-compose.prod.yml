@@ -1,0 +1,70 @@
+services:
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: acgagent-neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      - NEO4J_server_memory_heap_initial__size=${NEO4J_HEAP_INITIAL:-512m}
+      - NEO4J_server_memory_heap_max__size=${NEO4J_HEAP_MAX:-1G}
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  backend:
+    image: acgagent-backend:latest
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: acgagent-backend
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=production
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - APP_CORS_ORIGINS=${APP_CORS_ORIGINS:-http://localhost}
+      - SQLITE_DATABASE_URL=sqlite:////app/backend/data/acg_agent.sqlite3
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USERNAME=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      - NEO4J_DATABASE=${NEO4J_DATABASE:-neo4j}
+      - PASSAGE_UPLOAD_CONCURRENCY=${PASSAGE_UPLOAD_CONCURRENCY:-10}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    expose:
+      - "8000"
+    volumes:
+      - sqlite_data:/app/backend/data
+      - ./output:/app/output
+      - ./data:/app/data:ro
+      - ./bg_knowledge:/app/bg_knowledge:ro
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    restart: unless-stopped
+
+  frontend:
+    image: acgagent-frontend:latest
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile.prod
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api/v1}
+    container_name: acgagent-frontend
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT_HOST:-8080}:80"
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  sqlite_data:

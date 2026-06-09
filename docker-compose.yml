@@ -62,6 +62,7 @@ services:
       # 容器内 host 必须是 0.0.0.0
       - APP_HOST=0.0.0.0
       - APP_PORT=8000
+      - PASSAGE_UPLOAD_CONCURRENCY=${PASSAGE_UPLOAD_CONCURRENCY:-10}
       # 前端通过 nginx 反代访问，CORS 放开 5173 即可
       - APP_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
     depends_on:
