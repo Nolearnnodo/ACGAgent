@@ -386,6 +386,8 @@ def _call_identity_llm(
         "reason 为简短、可审计的判断依据，不要输出隐含思维过程。"
         "只有证据明确互相支持时才返回 same；有明显冲突时返回 different；"
         "证据不足时返回 insufficient。"
+        "【关键规则】缺乏证据 ≠ 不同人。"
+        "一方信息稀少不构成 different 的理由，只有存在明确冲突（如朝代不同、亲属互斥）时才可判 different。"
     )
     user_payload = {
         "doc_id": doc_id,
@@ -432,7 +434,11 @@ def _call_full_text_identity_llm(
         "必须返回 JSON：decision=same|different|insufficient、confidence、"
         "positive_evidence、negative_evidence、missing_evidence、next_hop_focus、reason。"
         "reason 只写简短、可审计的判断依据，不要输出隐含思维过程。"
-        "若全文仍不足，必须返回 insufficient，不得猜测。"
+        "若全文仍不足，必须返回 insufficient，不得猜测。\n"
+        "【关键规则】缺乏证据 ≠ 不同人。"
+        "当两人完全同名且无任何矛盾证据时，即使新人物信息稀少，也不得判定 different。"
+        "只有存在明确冲突（如生卒年矛盾、朝代不同、亲属关系互斥等）时才可判 different。"
+        "新人物仅在文中被简略提及、缺少详细信息，不构成 different 的理由，应判 insufficient。"
     )
     payload = {
         "doc_id": doc_id,
@@ -588,8 +594,28 @@ def _apply_terminal_decision(
     decisions: list[dict[str, Any]],
     used_full_text: bool,
 ) -> dict[str, Any] | None:
+    from app.core.config import get_settings
+
     decision_payload = decision.model_dump()
     if decision.decision == "same" and decision.confidence >= _CONFIDENCE_THRESHOLD:
+        if get_settings().identity_merge_disabled:
+            review = _mark_review(
+                repo=repo,
+                candidate=candidate,
+                decision=decision_payload,
+                hop=hop,
+                decision_trace=decisions,
+            )
+            return {
+                **_case_base(candidate),
+                "action": "manual_review",
+                "final_decision": decision_payload,
+                "hops_used": hop,
+                "used_full_text": used_full_text,
+                "decision_trace": decisions,
+                "review_result": review,
+                "merge_suppressed": True,
+            }
         try:
             merge_result = repo.merge_person_nodes(
                 canonical_person_id=int(candidate["candidate_person_id"]),
@@ -608,6 +634,8 @@ def _apply_terminal_decision(
         }
 
     if decision.decision == "different":
+        if used_full_text:
+            return None
         return {
             **_case_base(candidate),
             "action": "kept_separate",

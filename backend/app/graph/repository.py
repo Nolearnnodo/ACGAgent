@@ -1227,6 +1227,151 @@ class GraphRepository:
 
         return {"nodes": list(nodes.values()), "edges": list(edges.values())}
 
+    @staticmethod
+    def _graph_node_id(labels: list[str], properties: dict[str, Any], element_id: str) -> str:
+        primary_label = labels[0] if labels else "Node"
+        if "Person_Nodes" in labels and properties.get("person_id") is not None:
+            return f"Person_Nodes_{properties['person_id']}"
+        if "Passage_Info" in labels and properties.get("doc_id") is not None:
+            return f"Passage_Info_{properties['doc_id']}"
+        if "Life_Events" in labels and properties.get("event_id") is not None:
+            return f"Life_Events_{properties['event_id']}"
+        if "Historical_Events" in labels and properties.get("event_name"):
+            return f"Historical_Events_{properties['event_name']}"
+        if "Official_title" in labels and properties.get("official_title"):
+            return f"Official_title_{properties['official_title']}"
+        if "Time" in labels:
+            parts = [
+                str(properties.get("era") or ""),
+                str(properties.get("year") or ""),
+                str(properties.get("month") or ""),
+                str(properties.get("day") or ""),
+            ]
+            return f"Time_{'_'.join(parts)}"
+        if "Location" in labels:
+            loc_fields = ("dao", "fu", "zhou", "jun", "xian", "other")
+            return f"Location_{'_'.join(str(properties.get(k) or '') for k in loc_fields)}"
+        return f"{primary_label}_{element_id}"
+
+    @staticmethod
+    def _graph_node_label(labels: list[str], properties: dict[str, Any], element_id: str) -> str:
+        if "Person_Nodes" in labels:
+            return str(properties.get("name") or properties.get("person_id") or element_id)
+        if "Passage_Info" in labels:
+            return str(properties.get("title") or properties.get("doc_id") or element_id)
+        if "Life_Events" in labels:
+            return str(properties.get("event_type") or properties.get("event_id") or element_id)
+        if "Historical_Events" in labels:
+            return str(properties.get("event_name") or element_id)
+        if "Official_title" in labels:
+            return str(properties.get("official_title") or element_id)
+        if "Time" in labels:
+            label = f"{properties.get('era') or ''}{properties.get('year') or ''}"
+            return label or str(element_id)
+        if "Location" in labels:
+            for key in ("xian", "jun", "zhou", "fu", "dao", "other"):
+                if properties.get(key):
+                    return str(properties[key])
+        return str(properties.get("name") or properties.get("title") or element_id)
+
+    def get_person_neighborhood_graph_elements(
+        self,
+        person_ids: list[int],
+        max_hops: int = 2,
+    ) -> dict[str, Any]:
+        """Return all graph nodes/relationships within N hops of the given persons."""
+
+        normalized_person_ids = sorted({int(pid) for pid in person_ids})
+        if not normalized_person_ids:
+            return {"nodes": [], "edges": []}
+
+        hops = max(1, min(int(max_hops), 2))
+        result = self.run_read_query(
+            cypher=f"""
+            MATCH (root:Person_Nodes)
+            WHERE root.person_id IN $person_ids
+            OPTIONAL MATCH path=(root)-[*1..{hops}]-(neighbor)
+            WHERE path IS NULL
+               OR (
+                 all(node IN nodes(path) WHERE single(x IN nodes(path) WHERE x = node))
+                 AND all(
+                   idx IN range(1, length(path) - 1)
+                   WHERE NOT 'Passage_Info' IN labels(nodes(path)[idx])
+                     AND NOT 'Person_Nodes' IN labels(nodes(path)[idx])
+                 )
+               )
+            WITH collect(DISTINCT root) AS roots, collect(DISTINCT path) AS paths
+            WITH roots, [path IN paths WHERE path IS NOT NULL] AS paths
+            WITH roots + reduce(node_acc = [], path IN paths | node_acc + nodes(path)) AS node_rows,
+                 reduce(rel_acc = [], path IN paths | rel_acc + relationships(path)) AS rel_rows
+            UNWIND node_rows AS graph_node
+            WITH collect(DISTINCT graph_node) AS graph_nodes, rel_rows
+            UNWIND CASE WHEN rel_rows = [] THEN [null] ELSE rel_rows END AS graph_rel
+            WITH graph_nodes,
+                 [rel IN collect(DISTINCT graph_rel) WHERE rel IS NOT NULL] AS graph_rels
+            RETURN
+              [node IN graph_nodes | {{
+                element_id: elementId(node),
+                labels: labels(node),
+                properties: properties(node)
+              }}] AS nodes,
+              [rel IN graph_rels | {{
+                element_id: elementId(rel),
+                start_element_id: elementId(startNode(rel)),
+                end_element_id: elementId(endNode(rel)),
+                type: type(rel),
+                properties: properties(rel)
+              }}] AS edges
+            """,
+            parameters={"person_ids": normalized_person_ids},
+        )
+        record = (result.get("records") or [{}])[0]
+        raw_nodes = record.get("nodes") or []
+        raw_edges = record.get("edges") or []
+
+        element_to_node_id: dict[str, str] = {}
+        nodes: dict[str, dict[str, Any]] = {}
+        for raw_node in raw_nodes:
+            labels = [str(label) for label in (raw_node.get("labels") or [])]
+            properties = dict(raw_node.get("properties") or {})
+            element_id = str(raw_node.get("element_id") or "")
+            node_id = self._graph_node_id(labels, properties, element_id)
+            if (
+                "Person_Nodes" in labels
+                and properties.get("person_id") in normalized_person_ids
+            ):
+                properties["review_focus"] = True
+            element_to_node_id[element_id] = node_id
+            node_type = labels[0] if labels else "Node"
+            nodes[node_id] = {
+                "id": node_id,
+                "label": self._graph_node_label(labels, properties, element_id),
+                "type": node_type,
+                "properties": properties,
+            }
+
+        edges: dict[str, dict[str, Any]] = {}
+        for raw_edge in raw_edges:
+            source = element_to_node_id.get(str(raw_edge.get("start_element_id") or ""))
+            target = element_to_node_id.get(str(raw_edge.get("end_element_id") or ""))
+            if not source or not target:
+                continue
+            label = str(raw_edge.get("type") or "")
+            properties = dict(raw_edge.get("properties") or {})
+            properties.pop("level", None)
+            codes = properties.get("codes") or []
+            if label == "person_relation" and isinstance(codes, list) and codes:
+                label = ",".join(str(code) for code in codes)
+            edge_id = str(raw_edge.get("element_id") or f"{source}__{target}__{label}")
+            edges[edge_id] = {
+                "source": source,
+                "target": target,
+                "label": label,
+                "properties": properties,
+            }
+
+        return {"nodes": list(nodes.values()), "edges": list(edges.values())}
+
     # ---------- 业务封装：同名人物人工审核 ----------
 
     def list_pending_identity_reviews(self) -> dict:
@@ -1295,6 +1440,50 @@ class GraphRepository:
             "action": "keep_separate",
             "deleted_count": (del_result.get("records") or [{}])[0].get("deleted_count", 0),
         }
+
+    def list_all_same_name_pairs(self) -> dict:
+        """列出所有同名 Person_Nodes 对（用于标注模式）。"""
+
+        return self.run_read_query(
+            cypher="""
+            MATCH (a:Person_Nodes), (b:Person_Nodes)
+            WHERE a.name = b.name
+              AND a.name IS NOT NULL
+              AND trim(a.name) <> ''
+              AND a.person_id < b.person_id
+            OPTIONAL MATCH (a)-[:在文章中]->(sp:Passage_Info)
+            OPTIONAL MATCH (b)-[:在文章中]->(tp:Passage_Info)
+            OPTIONAL MATCH (a)-[review:可能同人]->(b)
+            WITH a, b,
+                 coalesce(review.confidence, 0) AS confidence,
+                 coalesce(review.reason, '') AS reason,
+                 review.evidence AS evidence,
+                 collect(DISTINCT sp.title) AS source_passages,
+                 collect(DISTINCT tp.title) AS target_passages
+            RETURN a.person_id AS source_person_id,
+                   a.name AS source_name,
+                   b.person_id AS target_person_id,
+                   b.name AS target_name,
+                   confidence,
+                   reason,
+                   evidence,
+                   source_passages,
+                   target_passages
+            ORDER BY a.name, a.person_id
+            """,
+        )
+
+    def get_person_passage_doc_ids(self, person_id: int) -> list[int]:
+        """获取人物关联的所有 Passage doc_id。"""
+
+        result = self.run_read_query(
+            cypher="""
+            MATCH (p:Person_Nodes {person_id: $person_id})-[:在文章中]->(pa:Passage_Info)
+            RETURN pa.doc_id AS doc_id
+            """,
+            parameters={"person_id": person_id},
+        )
+        return [r["doc_id"] for r in result.get("records", []) if r.get("doc_id") is not None]
 
     def merge_person_nodes(
         self,

@@ -1,29 +1,102 @@
 """人工审核路由：同名人物身份裁定。"""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
+from app.db.session import get_db
 from app.graph.repository import GraphRepository
+from app.models.annotation import IdentityAnnotation
+from app.models.execution import IdentityResolutionDecisionLog
+from app.models.passage import Passage
 from app.models.user import User
 from app.schemas.review import (
     AdjudicateRequest,
     AdjudicateResponse,
+    AnnotateRequest,
+    AnnotateResponse,
     IdentityEvidenceResponse,
     IdentityReviewItem,
     IdentityReviewListResponse,
+    PassageText,
 )
 
 router = APIRouter(prefix="/review", tags=["人工审核"])
 
 
+def _pair_key(source_id: int, target_id: int) -> tuple[int, int]:
+    return (min(source_id, target_id), max(source_id, target_id))
+
+
 @router.get("/identity-pending", response_model=IdentityReviewListResponse)
-def list_pending_reviews(current_user: User = Depends(get_current_user)):
-    """列出所有待人工审核的"可能同人"对。"""
+def list_pending_reviews(
+    mode: str = Query("pending", pattern="^(pending|annotation)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """列出待审核的同名人物对。mode=annotation 时返回所有同名对。"""
+
+    if mode != "annotation" and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="仅管理员可访问待审核列表。",
+        )
 
     repo = GraphRepository()
-    result = repo.list_pending_identity_reviews()
+
+    if mode == "annotation":
+        result = repo.list_all_same_name_pairs()
+    else:
+        result = repo.list_pending_identity_reviews()
+
     records = result.get("records", [])
-    items = [IdentityReviewItem(**r) for r in records]
+
+    annotated_pairs: set[tuple[int, int]] = set()
+    if mode == "annotation" and records:
+        all_annotations = (
+            db.query(
+                IdentityAnnotation.source_person_id,
+                IdentityAnnotation.target_person_id,
+            )
+            .filter(IdentityAnnotation.annotator_id == current_user.id)
+            .all()
+        )
+        annotated_pairs = {_pair_key(a[0], a[1]) for a in all_annotations}
+
+    # 从 IdentityResolutionDecisionLog 取每对的首次可判定跳数+结论
+    first_decisions: dict[tuple[int, int], tuple[int, str]] = {}
+    if records:
+        decision_rows = (
+            db.query(IdentityResolutionDecisionLog)
+            .filter(IdentityResolutionDecisionLog.decision.in_(("same", "different")))
+            .order_by(IdentityResolutionDecisionLog.hop)
+            .all()
+        )
+        for row in decision_rows:
+            key = _pair_key(row.new_person_id, row.candidate_person_id)
+            if key not in first_decisions:
+                first_decisions[key] = (row.hop, row.decision)
+
+    items = []
+    for r in records:
+        pk = _pair_key(r["source_person_id"], r["target_person_id"])
+        fd = first_decisions.get(pk)
+        item = IdentityReviewItem(
+            source_person_id=r["source_person_id"],
+            source_name=r.get("source_name"),
+            target_person_id=r["target_person_id"],
+            target_name=r.get("target_name"),
+            confidence=r.get("confidence", 0),
+            reason=r.get("reason", ""),
+            evidence=r.get("evidence"),
+            source_passages=r.get("source_passages", []),
+            target_passages=r.get("target_passages", []),
+            hops=fd[0] if fd else None,
+            llm_decision=fd[1] if fd else None,
+            annotated=pk in annotated_pairs,
+        )
+        items.append(item)
+
     return IdentityReviewListResponse(pending_count=len(items), items=items)
 
 
@@ -35,6 +108,7 @@ def get_review_evidence(
     source_id: int,
     target_id: int,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """获取两个候选同人的证据包及图谱元素。"""
 
@@ -42,11 +116,11 @@ def get_review_evidence(
     source_evidence = repo.get_person_evidence_bundle(person_id=source_id, max_hops=3)
     target_evidence = repo.get_person_evidence_bundle(person_id=target_id, max_hops=3)
 
-    graph_elements = GraphRepository.build_graph_elements_from_evidence_bundles(
-        [source_evidence, target_evidence]
+    graph_elements = repo.get_person_neighborhood_graph_elements(
+        [source_id, target_id],
+        max_hops=2,
     )
 
-    # 查询 review 关系详情
     review_rel = repo.run_read_query(
         cypher="""
         MATCH (s:Person_Nodes {person_id: $source})-[r:可能同人]->(t:Person_Nodes {person_id: $target})
@@ -57,12 +131,100 @@ def get_review_evidence(
     review_records = review_rel.get("records", [])
     review_record = review_records[0] if review_records else None
 
+    source_doc_ids = repo.get_person_passage_doc_ids(source_id)
+    target_doc_ids = repo.get_person_passage_doc_ids(target_id)
+    all_doc_ids = list(set(source_doc_ids + target_doc_ids))
+
+    passage_map: dict[int, Passage] = {}
+    if all_doc_ids:
+        passages = db.query(Passage).filter(Passage.doc_id.in_(all_doc_ids)).all()
+        passage_map = {p.doc_id: p for p in passages}
+
+    source_passage_texts = [
+        PassageText(doc_id=did, title=passage_map[did].title, context=passage_map[did].context)
+        for did in source_doc_ids
+        if did in passage_map
+    ]
+    target_passage_texts = [
+        PassageText(doc_id=did, title=passage_map[did].title, context=passage_map[did].context)
+        for did in target_doc_ids
+        if did in passage_map
+    ]
+
     return IdentityEvidenceResponse(
         source_evidence=source_evidence,
         target_evidence=target_evidence,
         graph_elements=graph_elements,
         review_relation=review_record,
+        source_passage_texts=source_passage_texts,
+        target_passage_texts=target_passage_texts,
     )
+
+
+@router.post(
+    "/identity/{source_id}/{target_id}/annotate",
+    response_model=AnnotateResponse,
+)
+def annotate_identity(
+    source_id: int,
+    target_id: int,
+    payload: AnnotateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """保存人工标注（不改写图数据库）。"""
+
+    if payload.decision not in ("merge", "keep_separate"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="decision 必须为 merge 或 keep_separate。",
+        )
+
+    repo = GraphRepository()
+    names = repo.run_read_query(
+        cypher="""
+        MATCH (a:Person_Nodes {person_id: $s}), (b:Person_Nodes {person_id: $t})
+        RETURN a.name AS source_name, b.name AS target_name
+        """,
+        parameters={"s": source_id, "t": target_id},
+    )
+    name_record = (names.get("records") or [{}])[0]
+
+    key = _pair_key(source_id, target_id)
+    existing = (
+        db.query(IdentityAnnotation)
+        .filter(
+            IdentityAnnotation.source_person_id == key[0],
+            IdentityAnnotation.target_person_id == key[1],
+            IdentityAnnotation.annotator_id == current_user.id,
+        )
+        .first()
+    )
+
+    if existing:
+        existing.decision = payload.decision
+        existing.human_confidence = payload.human_confidence
+        existing.note = payload.note
+        existing.source_name = name_record.get("source_name")
+        existing.target_name = name_record.get("target_name")
+        db.commit()
+        return AnnotateResponse(status="updated", annotation_id=existing.id)
+
+    annotation = IdentityAnnotation(
+        source_person_id=key[0],
+        target_person_id=key[1],
+        source_name=name_record.get("source_name"),
+        target_name=name_record.get("target_name"),
+        decision=payload.decision,
+        human_confidence=payload.human_confidence,
+        note=payload.note,
+        annotator_id=current_user.id,
+    )
+    db.add(annotation)
+    db.commit()
+    db.refresh(annotation)
+
+    return AnnotateResponse(status="success", annotation_id=annotation.id)
 
 
 @router.post(

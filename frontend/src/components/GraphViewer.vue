@@ -62,12 +62,16 @@ const RELATION_CODE_LABELS: Record<string, string> = {
   M: '母',
   S: '子',
   D: '女',
-  W: '妻/妾',
+  W: '妻',
   H: '夫',
   B: '兄弟',
-  Z: '姐妹',
+  Z: '妾',
   O: '臣属/部下',
   T: '师生',
+}
+
+function isReviewFocusNode(node: GraphNode) {
+  return node.properties.review_focus === true
 }
 
 function buildNvlNodes(elements: GraphElements): Node[] {
@@ -137,6 +141,7 @@ function buildNvlNodes(elements: GraphElements): Node[] {
 
   for (const n of elements.nodes) {
     const pos = placed.get(n.id) || { x: (Math.random() - 0.5) * 400, y: (Math.random() - 0.5) * 400 }
+    const isFocus = isReviewFocusNode(n)
     const labelEl = document.createElement('div')
     labelEl.textContent = n.label
     labelEl.style.cssText = `
@@ -146,7 +151,8 @@ function buildNvlNodes(elements: GraphElements): Node[] {
       transform: translate(-50%, -50%);
       font-family: "Noto Serif SC", "Source Han Serif SC", serif;
       max-width: 52px;
-      font-size: 13px;
+      font-size: ${isFocus ? '15px' : '13px'};
+      font-weight: ${isFocus ? '700' : '400'};
       color: #fff;
       text-align: center;
       line-height: 1;
@@ -159,7 +165,7 @@ function buildNvlNodes(elements: GraphElements): Node[] {
     result.push({
       id: n.id,
       html: labelEl,
-      color: colorMap[n.type] || '#95A5A6',
+      color: isFocus ? '#DC2626' : colorMap[n.type] || '#95A5A6',
       size: 30,
       x: pos.x,
       y: pos.y,
@@ -193,6 +199,7 @@ function initNvl() {
 
   const nodes = buildNvlNodes(props.elements)
   const relationships = buildNvlRelationships(props.elements)
+  const focusNodeIds = props.elements.nodes.filter(isReviewFocusNode).map((n) => n.id)
 
   const options: NvlOptions = {
     disableTelemetry: true,
@@ -205,7 +212,7 @@ function initNvl() {
 
   nvl = new NVL(nvlContainer.value, nodes, relationships, options, {
     onLayoutDone: () => {
-      nvl?.fit([], { animated: true } as never)
+      nvl?.fit(focusNodeIds.length >= 2 ? focusNodeIds : [], { animated: true } as never)
     },
   })
 
@@ -215,7 +222,8 @@ function initNvl() {
     const zoom = new ZoomInteraction(nvl)
     const hover = new HoverInteraction(nvl)
 
-    hover.updateCallback('onHover', (element: Node | Relationship | null, _hitElements: unknown, event: MouseEvent) => {
+    hover.updateCallback('onHover', (...args: unknown[]) => {
+      const [element, _hitElements, event] = args as [Node | Relationship | null, unknown, MouseEvent]
       if (!element) {
         tooltipVisible.value = false
         return
@@ -306,7 +314,7 @@ onBeforeUnmount(() => {
 function toggleFullscreen() {
   isFullscreen.value = !isFullscreen.value
   setTimeout(() => {
-    nvl?.fit()
+    nvl?.fit([], { animated: true } as never)
   }, 100)
 }
 </script>

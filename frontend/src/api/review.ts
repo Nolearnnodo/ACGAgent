@@ -10,6 +10,9 @@ export interface IdentityReviewItem {
   evidence: Record<string, unknown> | null
   source_passages: string[]
   target_passages: string[]
+  hops: number | null
+  llm_decision: string | null
+  annotated: boolean
 }
 
 export interface IdentityReviewListResponse {
@@ -22,11 +25,19 @@ export interface GraphElements {
   edges: Array<{ source: string; target: string; label: string; properties: Record<string, unknown> }>
 }
 
+export interface PassageText {
+  doc_id: number
+  title: string
+  context: string
+}
+
 export interface IdentityEvidenceResponse {
   source_evidence: Record<string, unknown>
   target_evidence: Record<string, unknown>
   graph_elements: GraphElements
   review_relation: Record<string, unknown> | null
+  source_passage_texts: PassageText[]
+  target_passage_texts: PassageText[]
 }
 
 export interface AdjudicateResponse {
@@ -35,8 +46,16 @@ export interface AdjudicateResponse {
   detail: Record<string, unknown>
 }
 
-export async function listPendingReviews() {
-  const { data } = await apiClient.get<IdentityReviewListResponse>('/review/identity-pending')
+export interface AnnotateResponse {
+  status: string
+  annotation_id: number
+}
+
+export async function listPendingReviews(mode: 'pending' | 'annotation' = 'pending') {
+  const { data } = await apiClient.get<IdentityReviewListResponse>(
+    '/review/identity-pending',
+    { params: { mode } },
+  )
   return data
 }
 
@@ -51,6 +70,20 @@ export async function adjudicateIdentity(sourceId: number, targetId: number, dec
   const { data } = await apiClient.post<AdjudicateResponse>(
     `/review/identity/${sourceId}/${targetId}/adjudicate`,
     { decision },
+  )
+  return data
+}
+
+export async function annotateIdentity(
+  sourceId: number,
+  targetId: number,
+  decision: string,
+  humanConfidence: number,
+  note: string = '',
+) {
+  const { data } = await apiClient.post<AnnotateResponse>(
+    `/review/identity/${sourceId}/${targetId}/annotate`,
+    { decision, human_confidence: humanConfidence, note },
   )
   return data
 }
