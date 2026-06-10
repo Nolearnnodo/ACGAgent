@@ -10,6 +10,21 @@ import {
   type UserProfile,
 } from '../api/auth'
 
+let authStorageSyncInstalled = false
+
+export function installAuthStorageSync() {
+  if (authStorageSyncInstalled || typeof window === 'undefined') {
+    return
+  }
+
+  window.addEventListener('storage', (event) => {
+    if (event.storageArea === localStorage && event.key === 'access_token' && event.oldValue !== event.newValue) {
+      window.location.reload()
+    }
+  })
+  authStorageSyncInstalled = true
+}
+
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<UserProfile | null>(null)
   const loading = ref(false)
