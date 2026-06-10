@@ -40,6 +40,17 @@ class IdentityResolutionDecision(BaseModel):
     reason: str = ""
 
 
+class FullTextIdentityResolutionDecision(BaseModel):
+    """全文终局裁定不再需要下一跳取证方向。"""
+
+    decision: Decision
+    confidence: float = Field(ge=0, le=1)
+    positive_evidence: list[str] = Field(default_factory=list)
+    negative_evidence: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
 class PersonIdentityResolutionAtomicSkill(BaseSkill):
     """同名候选召回、增量取证、逐轮留痕和安全合并。"""
 
@@ -70,6 +81,23 @@ class PersonIdentityResolutionAtomicSkill(BaseSkill):
             return output
 
         records = candidates.get("records", [])
+        target_new_person_id = arguments.get("new_person_id")
+        target_candidate_person_id = arguments.get("candidate_person_id")
+        if (target_new_person_id is None) != (target_candidate_person_id is None):
+            raise ValueError(
+                "new_person_id and candidate_person_id must be provided together."
+            )
+        if target_new_person_id is not None:
+            target_pair = (int(target_new_person_id), int(target_candidate_person_id))
+            records = [
+                candidate
+                for candidate in records
+                if (
+                    int(candidate["new_person_id"]),
+                    int(candidate["candidate_person_id"]),
+                )
+                == target_pair
+            ]
         if not records:
             output = _empty_output(int(doc_id), status="skipped")
             context.metadata["person_identity_resolution"] = output
@@ -432,7 +460,8 @@ def _call_full_text_identity_llm(
         "图证据经过 2 到 5 跳仍不能完成判断，现在提供两个人物全部来源文章的完整原文。"
         "只能依据这些原文和已记录的图证据裁定，不得引入外部知识。"
         "必须返回 JSON：decision=same|different|insufficient、confidence、"
-        "positive_evidence、negative_evidence、missing_evidence、next_hop_focus、reason。"
+        "positive_evidence、negative_evidence、missing_evidence、reason。"
+        "这是最后一轮裁定，不要返回 next_hop_focus 或其他下一步取证字段。"
         "reason 只写简短、可审计的判断依据，不要输出隐含思维过程。"
         "若全文仍不足，必须返回 insufficient，不得猜测。\n"
         "【关键规则】缺乏证据 ≠ 不同人。"
@@ -449,16 +478,20 @@ def _call_full_text_identity_llm(
         "new_person_full_source_texts": new_person_sources,
         "candidate_person_full_source_texts": candidate_person_sources,
     }
-    return call_llm_structured(
+    final_response = call_llm_structured(
         system_prompt=system_prompt,
         user_prompt=json.dumps(payload, ensure_ascii=False),
-        schema=IdentityResolutionDecision,
+        schema=FullTextIdentityResolutionDecision,
         skill_code="person_identity_resolution_atomic",
         additional_metadata={
             **trace_metadata,
             "purpose": "identity_resolution_full_text_final",
         },
         max_prompt_chars=None,
+    )
+    return IdentityResolutionDecision(
+        **final_response.model_dump(exclude={"next_hop_focus"}),
+        next_hop_focus=[],
     )
 
 

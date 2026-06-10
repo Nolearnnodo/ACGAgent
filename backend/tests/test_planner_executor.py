@@ -158,6 +158,109 @@ def test_executor_marks_run_failed_when_skill_raises():
     assert "RuntimeError: boom" in step.error_message
 
 
+def test_executor_persists_workflow_partial_status():
+    class _PartialWorkflow:
+        allowed_roles = ["user"]
+
+        def run(self, context, arguments):
+            return {"status": "partial", "warning_count": 1}
+
+    executor = Executor()
+    executor.registry = SimpleNamespace(get=lambda _code: _PartialWorkflow())
+    db = _DummySession()
+    context = ExecutionContext(
+        user={"id": 1, "role": "user", "email": "demo@example.com"},
+        conversation={"id": 1, "title": "测试会话"},
+    )
+    decision = PlannerDecision(
+        intent="partial_case",
+        decision_type="workflow",
+        target_skill_code="partial_test_workflow",
+        reason="测试 partial 状态落库",
+        arguments={},
+    )
+
+    result = executor.execute(
+        db=db,
+        context=context,
+        planner_decision=decision,
+        planner_record_id=None,
+        trigger_message_id=None,
+    )
+
+    run = next(item for item in db.records if item.__class__.__name__ == "ExecutionRun")
+    assert result.success is True
+    assert run.status == "partial"
+
+
+def test_executor_defaults_missing_output_status_to_success():
+    class _SuccessfulWorkflow:
+        allowed_roles = ["user"]
+
+        def run(self, context, arguments):
+            return {"reply": "done"}
+
+    executor = Executor()
+    executor.registry = SimpleNamespace(get=lambda _code: _SuccessfulWorkflow())
+    db = _DummySession()
+    context = ExecutionContext(
+        user={"id": 1, "role": "user", "email": "demo@example.com"},
+        conversation={"id": 1, "title": "测试会话"},
+    )
+    decision = PlannerDecision(
+        intent="success_case",
+        decision_type="workflow",
+        target_skill_code="success_test_workflow",
+        reason="测试默认成功状态",
+        arguments={},
+    )
+
+    executor.execute(
+        db=db,
+        context=context,
+        planner_decision=decision,
+        planner_record_id=None,
+        trigger_message_id=None,
+    )
+
+    run = next(item for item in db.records if item.__class__.__name__ == "ExecutionRun")
+    assert run.status == "success"
+
+
+def test_executor_persists_business_failed_status():
+    class _FailedWorkflow:
+        allowed_roles = ["user"]
+
+        def run(self, context, arguments):
+            return {"status": "failed", "failures": [{"error": "graph unavailable"}]}
+
+    executor = Executor()
+    executor.registry = SimpleNamespace(get=lambda _code: _FailedWorkflow())
+    db = _DummySession()
+    context = ExecutionContext(
+        user={"id": 1, "role": "user", "email": "demo@example.com"},
+        conversation={"id": 1, "title": "测试会话"},
+    )
+    decision = PlannerDecision(
+        intent="business_failure",
+        decision_type="workflow",
+        target_skill_code="failed_test_workflow",
+        reason="测试业务失败状态",
+        arguments={},
+    )
+
+    executor.execute(
+        db=db,
+        context=context,
+        planner_decision=decision,
+        planner_record_id=None,
+        trigger_message_id=None,
+    )
+
+    run = next(item for item in db.records if item.__class__.__name__ == "ExecutionRun")
+    assert run.status == "failed"
+
+
 # ---------------- 功能 A workflow ----------------
 
 
@@ -235,6 +338,48 @@ def test_person_identity_resolution_merges_only_after_llm_same(monkeypatch):
     assert result["merged_person_count"] == 1
     assert repo.merges == [(8001001, 9001001)]
     assert context.metadata["person_identity_resolution"]["status"] == "success"
+
+
+def test_person_identity_resolution_can_target_one_candidate_pair(monkeypatch):
+    class _TwoPairRepo(_IdentityResolutionRepo):
+        def find_same_name_person_candidates_for_passage(self, doc_id):
+            first = super().find_same_name_person_candidates_for_passage(doc_id)["records"][0]
+            return {
+                "records": [
+                    first,
+                    {
+                        **first,
+                        "name": "孟轲",
+                        "new_person_id": 9001002,
+                        "candidate_person_id": 8001002,
+                    },
+                ]
+            }
+
+    repo = _TwoPairRepo()
+    monkeypatch.setattr(
+        "app.skills.atomic.person_identity_resolution.GraphRepository",
+        lambda: repo,
+    )
+    monkeypatch.setattr(
+        "app.skills.atomic.person_identity_resolution._call_identity_llm",
+        lambda **kwargs: IdentityResolutionDecision(
+            decision="different",
+            confidence=0.95,
+            negative_evidence=["年代冲突"],
+            reason="不是同一人",
+        ),
+    )
+    context = _build_passage_context("测试墓志", "测试正文", doc_id=9001)
+
+    result = PersonIdentityResolutionAtomicSkill().run(
+        context,
+        {"new_person_id": 9001002, "candidate_person_id": 8001002},
+    )
+
+    assert result["candidate_pair_count"] == 1
+    assert result["cases"][0]["new_person_id"] == 9001002
+    assert result["cases"][0]["candidate_person_id"] == 8001002
 
 
 class _IdentityResolutionRepo:
@@ -492,6 +637,40 @@ def test_full_text_identity_call_disables_prompt_truncation(monkeypatch):
 
     assert captured["max_prompt_chars"] is None
     assert full_text in captured["user_prompt"]
+
+
+def test_full_text_identity_call_ignores_next_hop_focus(monkeypatch):
+    captured = {}
+
+    def _fake_call_llm_structured(**kwargs):
+        captured.update(kwargs)
+        return kwargs["schema"](
+            decision="insufficient",
+            confidence=0.1,
+            missing_evidence=["证据不足"],
+            next_hop_focus=["需要提供原文"],
+            reason="全文仍无法判定",
+        )
+
+    monkeypatch.setattr(
+        "app.skills.atomic.person_identity_resolution.call_llm_structured",
+        _fake_call_llm_structured,
+    )
+
+    decision = _call_full_text_identity_llm(
+        doc_id=9001,
+        name="孟轲",
+        new_person_id=9001001,
+        candidate_person_id=8001001,
+        graph_decisions=[],
+        new_person_sources=[{"doc_id": 9001, "title": "新文章", "context": "原文甲"}],
+        candidate_person_sources=[{"doc_id": 8001, "title": "旧文章", "context": "原文乙"}],
+        trace_metadata={},
+    )
+
+    assert "next_hop_focus" not in captured["schema"].model_fields
+    assert decision.next_hop_focus == []
+    assert decision.reason == "全文仍无法判定"
 
 
 def test_identity_decision_basis_is_persisted(monkeypatch):

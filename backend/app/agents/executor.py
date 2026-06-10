@@ -40,6 +40,16 @@ def _has_recorded_steps(db: Session, execution_run_id: int) -> bool:
         return False
 
 
+def _resolve_success_status(output: Any) -> str:
+    """Read a controlled terminal status from a successful skill output."""
+
+    if isinstance(output, dict):
+        output_status = output.get("status")
+        if output_status in {"success", "partial", "skipped", "failed"}:
+            return output_status
+    return "success"
+
+
 class Executor:
     """执行已被 Planner 选中的 Skill / Workflow。"""
 
@@ -202,7 +212,7 @@ class Executor:
                     error_message="",
                 )
             )
-        execution_run.status = "success"
+        execution_run.status = _resolve_success_status(output)
         execution_run.finished_at = datetime.now(timezone.utc)
         db.commit()
         return step_result

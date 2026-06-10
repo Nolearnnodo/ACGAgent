@@ -169,7 +169,7 @@ Expected: 后端容器重建成功，健康检查返回 `{"status":"ok"}`。
 Run:
 
 ```bash
-docker exec acgagent-backend python -m scripts.rerun_identity_resolution --doc-id 51
+docker exec acgagent-backend python -m scripts.rerun_identity_resolution --doc-id 51 --new-person-id 51015 --candidate-person-id 22030
 ```
 
 Expected: 新运行状态为 `success`，文章状态更新为 `success`。
