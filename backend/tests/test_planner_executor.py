@@ -383,11 +383,17 @@ def test_person_identity_resolution_can_target_one_candidate_pair(monkeypatch):
 
 
 class _IdentityResolutionRepo:
-    def __init__(self, review_raises: bool = False):
+    def __init__(
+        self,
+        review_raises: bool = False,
+        keep_separate_raises: bool = False,
+    ):
         self.merges: list[tuple[int, int]] = []
+        self.separations: list[tuple[int, int]] = []
         self.reviews: list[dict] = []
         self.evidence_calls: list[tuple[int, int, tuple[str, ...], bool]] = []
         self.review_raises = review_raises
+        self.keep_separate_raises = keep_separate_raises
 
     def find_same_name_person_candidates_for_passage(self, doc_id):
         return {
@@ -443,6 +449,13 @@ class _IdentityResolutionRepo:
         self.reviews.append(kwargs)
         return {"status": "success"}
 
+    def adjudicate_identity(self, source_person_id, target_person_id, decision):
+        assert decision == "keep_separate"
+        if self.keep_separate_raises:
+            raise RuntimeError("review edge delete failed")
+        self.separations.append((source_person_id, target_person_id))
+        return {"status": "success", "action": "keep_separate"}
+
 
 def _run_identity_resolution(monkeypatch, decisions, repo=None, final_decision=None):
     repo = repo or _IdentityResolutionRepo()
@@ -491,6 +504,7 @@ def test_person_identity_resolution_keeps_different_people_separate(monkeypatch)
     assert result["cases"][0]["action"] == "kept_separate"
     assert repo.merges == []
     assert repo.reviews == []
+    assert repo.separations == [(9001001, 8001001)]
 
 
 def test_person_identity_resolution_enters_manual_review_after_five_hops(monkeypatch):
@@ -601,6 +615,34 @@ def test_person_identity_resolution_full_text_can_keep_separate(monkeypatch):
     assert result["cases"][0]["used_full_text"] is True
     assert repo.merges == []
     assert repo.reviews == []
+    assert repo.separations == [(9001001, 8001001)]
+
+
+def test_person_identity_resolution_marks_failure_when_stale_review_delete_fails(
+    monkeypatch,
+):
+    result, repo, context = _run_identity_resolution(
+        monkeypatch,
+        [
+            IdentityResolutionDecision(
+                decision="different",
+                confidence=0.95,
+                negative_evidence=["年代冲突"],
+                reason="不是同一人",
+            )
+        ],
+        repo=_IdentityResolutionRepo(keep_separate_raises=True),
+    )
+
+    assert result["status"] == "partial"
+    assert result["failed_resolution_count"] == 1
+    assert result["cases"][0]["action"] == "failed"
+    assert "keep_separate_failed" in result["cases"][0]["error"]
+    assert repo.reviews == []
+    assert any(
+        warning.get("type") == "function_b_identity_resolution_partial"
+        for warning in context.metadata["warnings"]
+    )
 
 
 def test_full_text_identity_call_disables_prompt_truncation(monkeypatch):

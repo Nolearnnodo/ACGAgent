@@ -667,8 +667,19 @@ def _apply_terminal_decision(
         }
 
     if decision.decision == "different":
-        if used_full_text:
-            return None
+        try:
+            keep_separate_result = repo.adjudicate_identity(
+                source_person_id=int(candidate["new_person_id"]),
+                target_person_id=int(candidate["candidate_person_id"]),
+                decision="keep_separate",
+            )
+        except Exception as exc:
+            return _failed_case(
+                candidate,
+                hop,
+                f"keep_separate_failed: {exc}",
+                decisions,
+            )
         return {
             **_case_base(candidate),
             "action": "kept_separate",
@@ -676,6 +687,7 @@ def _apply_terminal_decision(
             "hops_used": hop,
             "used_full_text": used_full_text,
             "decision_trace": decisions,
+            "keep_separate_result": keep_separate_result,
         }
     return None
 
