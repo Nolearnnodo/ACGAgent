@@ -56,6 +56,9 @@ submit.zip
 # local tooling artifacts
 .playwright-mcp/
 docs/
+!docs/
+docs/*
+!docs/server-deployment.md
 
 # 本地规划文件
 todo/

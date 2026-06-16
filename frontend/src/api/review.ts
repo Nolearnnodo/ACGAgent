@@ -12,6 +12,7 @@ export interface IdentityReviewItem {
   target_passages: string[]
   hops: number | null
   llm_decision: string | null
+  llm_used_full_text: boolean
   annotated: boolean
 }
 
@@ -31,11 +32,24 @@ export interface PassageText {
   context: string
 }
 
+export interface IdentityDecisionLog {
+  hop: number
+  decision: string
+  confidence: number
+  reason: string
+  positive_evidence: string[]
+  negative_evidence: string[]
+  missing_evidence: string[]
+  used_full_text: boolean
+  created_at: string | null
+}
+
 export interface IdentityEvidenceResponse {
   source_evidence: Record<string, unknown>
   target_evidence: Record<string, unknown>
   graph_elements: GraphElements
   review_relation: Record<string, unknown> | null
+  decision_logs: IdentityDecisionLog[]
   source_passage_texts: PassageText[]
   target_passage_texts: PassageText[]
 }
@@ -77,13 +91,12 @@ export async function adjudicateIdentity(sourceId: number, targetId: number, dec
 export async function annotateIdentity(
   sourceId: number,
   targetId: number,
-  decision: string,
   humanConfidence: number,
   note: string = '',
 ) {
   const { data } = await apiClient.post<AnnotateResponse>(
     `/review/identity/${sourceId}/${targetId}/annotate`,
-    { decision, human_confidence: humanConfidence, note },
+    { human_confidence: humanConfidence, note },
   )
   return data
 }

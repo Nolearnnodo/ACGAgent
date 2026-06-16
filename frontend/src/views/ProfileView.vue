@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { reactive, watch } from 'vue'
+import { reactive, ref, watch } from 'vue'
 
 import AppLayout from '../layouts/AppLayout.vue'
+import { getApiErrorMessage } from '../api/client'
 import { updateProfile } from '../api/auth'
 import { useAuthStore } from '../stores/auth'
 
 const authStore = useAuthStore()
+const errorMessage = ref('')
+const successMessage = ref('')
 const formState = reactive({
   email: '',
   password: '',
@@ -21,12 +24,20 @@ watch(
 )
 
 async function handleSubmit() {
-  const updatedUser = await updateProfile({
-    email: formState.email,
-    password: formState.password || undefined,
-  })
-  authStore.user = updatedUser
-  formState.password = ''
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    const updatedUser = await updateProfile({
+      email: formState.email,
+      password: formState.password || undefined,
+    })
+    authStore.user = updatedUser
+    formState.password = ''
+    successMessage.value = '保存成功。'
+  } catch (error) {
+    errorMessage.value = getApiErrorMessage(error, '保存失败，请检查输入内容。')
+    console.error(error)
+  }
 }
 </script>
 
@@ -49,6 +60,9 @@ async function handleSubmit() {
 
         <button type="submit">保存修改</button>
       </form>
+
+      <p v-if="errorMessage" class="profile-card__error">{{ errorMessage }}</p>
+      <p v-if="successMessage" class="profile-card__success">{{ successMessage }}</p>
     </div>
   </AppLayout>
 </template>
@@ -100,5 +114,15 @@ async function handleSubmit() {
   background: #2f6fed;
   color: #fff;
   cursor: pointer;
+}
+
+.profile-card__error {
+  margin-top: 16px;
+  color: #d64545;
+}
+
+.profile-card__success {
+  margin-top: 16px;
+  color: #17803d;
 }
 </style>

@@ -16,4 +16,53 @@ apiClient.interceptors.request.use((config) => {
   return config
 })
 
+interface ApiValidationItem {
+  loc?: unknown[]
+  msg?: string
+  type?: string
+}
+
+function isValidationItem(value: unknown): value is ApiValidationItem {
+  return Boolean(value && typeof value === 'object')
+}
+
+function formatValidationItem(item: ApiValidationItem) {
+  const field = Array.isArray(item.loc) ? String(item.loc[item.loc.length - 1] ?? '') : ''
+  const message = item.msg ?? '输入内容不符合要求。'
+
+  if (field === 'email') {
+    return '请输入合法邮箱。'
+  }
+
+  if (field === 'password' && (item.type?.includes('too_short') || message.includes('at least 6'))) {
+    return '密码至少需要 6 位。'
+  }
+
+  if (field === 'password' && item.type?.includes('too_long')) {
+    return '密码不能超过 128 位。'
+  }
+
+  return message
+}
+
+export function getApiErrorMessage(error: unknown, fallback = '请求失败，请稍后重试。') {
+  if (!axios.isAxiosError(error)) {
+    return error instanceof Error ? error.message : fallback
+  }
+
+  const detail = error.response?.data?.detail
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail
+  }
+
+  if (Array.isArray(detail)) {
+    const messages = detail.filter(isValidationItem).map(formatValidationItem)
+    if (messages.length) {
+      return Array.from(new Set(messages)).join(' ')
+    }
+  }
+
+  return error.message || fallback
+}
+
 export default apiClient

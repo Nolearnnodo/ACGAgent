@@ -2,6 +2,7 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
+import { getApiErrorMessage } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
@@ -19,7 +20,7 @@ async function handleSubmit() {
     await authStore.loginAction(formState)
     await router.push('/chat')
   } catch (error) {
-    errorMessage.value = '登录失败，请检查邮箱和密码。'
+    errorMessage.value = getApiErrorMessage(error, '登录失败，请检查邮箱和密码。')
     console.error(error)
   }
 }

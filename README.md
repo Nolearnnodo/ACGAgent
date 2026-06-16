@@ -222,6 +222,9 @@ cp .env.example .env       # 填好 LLM_API_KEY（DeepSeek）
 docker compose up -d --build
 ```
 
+生产服务器的 SSH 登录、镜像传输、部署脚本、nginx、日志与故障排查见
+[服务器登录与生产部署手册](docs/server-deployment.md)。该文档不记录任何实际密钥或账号密码。
+
 启动后：
 
 | 入口 | URL |

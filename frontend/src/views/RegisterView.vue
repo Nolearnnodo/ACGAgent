@@ -2,6 +2,7 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
+import { getApiErrorMessage } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
@@ -19,7 +20,7 @@ async function handleSubmit() {
     await authStore.registerAction(formState)
     await router.push('/chat')
   } catch (error) {
-    errorMessage.value = '注册失败，请检查输入内容。'
+    errorMessage.value = getApiErrorMessage(error, '注册失败，请检查输入内容。')
     console.error(error)
   }
 }

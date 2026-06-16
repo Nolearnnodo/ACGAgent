@@ -9,6 +9,7 @@ import {
   annotateIdentity,
   getReviewEvidence,
   listPendingReviews,
+  type IdentityDecisionLog,
   type IdentityEvidenceResponse,
   type IdentityReviewItem,
 } from '../api/review'
@@ -28,6 +29,26 @@ const annotateNote = ref('')
 interface PassageSegment {
   text: string
   matched: boolean
+}
+
+const DECISION_LABELS: Record<string, string> = {
+  same: '判定同人',
+  different: '判定不同人',
+  insufficient: '证据不足',
+}
+
+function decisionLabel(decision: string): string {
+  return DECISION_LABELS[decision] ?? decision
+}
+
+function decisionClass(decision: string): string {
+  if (decision === 'same') return 'review-page__decision--same'
+  if (decision === 'different') return 'review-page__decision--diff'
+  return 'review-page__decision--unknown'
+}
+
+function hopLabel(log: IdentityDecisionLog): string {
+  return log.used_full_text ? '全文终局裁定' : `第 ${log.hop} 跳`
 }
 
 function isActiveItem(item: IdentityReviewItem) {
@@ -85,35 +106,42 @@ async function selectItem(item: IdentityReviewItem) {
   }
 }
 
-async function handleAdjudicate(decision: string) {
+// 标注模式：置信度（1~10）本身即方向信号，提交单一标注
+async function handleAnnotateSubmit() {
   if (!activeItem.value) return
-  if (annotationMode.value && humanConfidence.value == null) {
-    alert('请先选择人工置信度（1~10）')
+  if (humanConfidence.value == null) {
+    alert('请先选择置信度（1~10）')
     return
   }
   adjudicating.value = true
   try {
-    if (annotationMode.value) {
-      await annotateIdentity(
-        activeItem.value.source_person_id,
-        activeItem.value.target_person_id,
-        decision,
-        humanConfidence.value!,
-        annotateNote.value,
-      )
-      activeItem.value.annotated = true
-    } else {
-      await adjudicateIdentity(
-        activeItem.value.source_person_id,
-        activeItem.value.target_person_id,
-        decision,
-      )
-    }
+    await annotateIdentity(
+      activeItem.value.source_person_id,
+      activeItem.value.target_person_id,
+      humanConfidence.value,
+      annotateNote.value,
+    )
+    activeItem.value.annotated = true
     activeItem.value = null
     evidence.value = null
-    if (!annotationMode.value) {
-      await loadPending()
-    }
+  } finally {
+    adjudicating.value = false
+  }
+}
+
+// 管理员裁定模式：merge / keep_separate 直接改写图谱
+async function handleAdjudicate(decision: string) {
+  if (!activeItem.value) return
+  adjudicating.value = true
+  try {
+    await adjudicateIdentity(
+      activeItem.value.source_person_id,
+      activeItem.value.target_person_id,
+      decision,
+    )
+    activeItem.value = null
+    evidence.value = null
+    await loadPending()
   } finally {
     adjudicating.value = false
   }
@@ -154,7 +182,8 @@ onMounted(async () => {
           <span v-if="!annotationMode" class="review-page__confidence">置信度: {{ (item.confidence * 100).toFixed(0) }}%</span>
           <span class="review-page__hops">
             <template v-if="item.hops != null">
-              LLM {{ item.hops }} 跳判定:
+              <template v-if="item.llm_used_full_text">LLM 全文裁定:</template>
+              <template v-else>LLM {{ item.hops }} 跳判定:</template>
               <strong :class="item.llm_decision === 'same' ? 'review-page__decision--same' : 'review-page__decision--diff'">
                 {{ item.llm_decision === 'same' ? '同人' : '不同人' }}
               </strong>
@@ -173,27 +202,43 @@ onMounted(async () => {
         <template v-else>
           <header class="review-page__detail-header">
             <h3>{{ activeItem.source_name }} vs {{ activeItem.target_name }}</h3>
+            <!-- 标注模式：置信度即方向信号，单一提交 -->
             <div v-if="annotationMode" class="review-page__annotation-controls">
-              <span class="review-page__confidence-label">人工置信度:</span>
-              <div class="review-page__confidence-btns">
-                <button
-                  v-for="n in 10"
-                  :key="n"
-                  type="button"
-                  class="review-page__conf-btn"
-                  :class="{ 'review-page__conf-btn--active': humanConfidence === n }"
-                  @click="humanConfidence = n"
-                >{{ n }}</button>
+              <div class="review-page__confidence-block">
+                <span class="review-page__confidence-label">同人置信度（1~10）:</span>
+                <div class="review-page__confidence-btns">
+                  <button
+                    v-for="n in 10"
+                    :key="n"
+                    type="button"
+                    class="review-page__conf-btn"
+                    :class="{ 'review-page__conf-btn--active': humanConfidence === n }"
+                    @click="humanConfidence = n"
+                  >{{ n }}</button>
+                </div>
+                <div class="review-page__confidence-hint">
+                  <span class="review-page__confidence-hint--low">1 = 非常确定不是同人</span>
+                  <span class="review-page__confidence-hint--high">10 = 非常确定是同人</span>
+                </div>
               </div>
+              <button
+                class="review-page__merge-btn"
+                :disabled="adjudicating"
+                type="button"
+                @click="handleAnnotateSubmit"
+              >
+                保存标注
+              </button>
             </div>
-            <div class="review-page__actions">
+            <!-- 管理员裁定模式：直接改写图谱 -->
+            <div v-else class="review-page__actions">
               <button
                 class="review-page__merge-btn"
                 :disabled="adjudicating"
                 type="button"
                 @click="handleAdjudicate('merge')"
               >
-                确认同人{{ annotationMode ? '' : '（合并）' }}
+                确认同人（合并）
               </button>
               <button
                 class="review-page__separate-btn"
@@ -201,7 +246,7 @@ onMounted(async () => {
                 type="button"
                 @click="handleAdjudicate('keep_separate')"
               >
-                确认不同人{{ annotationMode ? '' : '（保留）' }}
+                确认不同人（保留）
               </button>
             </div>
           </header>
@@ -251,6 +296,36 @@ onMounted(async () => {
               <p v-if="!annotationMode"><strong>置信度:</strong> {{ evidence.review_relation.confidence }}</p>
               <p><strong>理由:</strong> {{ evidence.review_relation.reason }}</p>
               <pre v-if="evidence.review_relation.evidence" class="review-page__evidence-json">{{ JSON.stringify(evidence.review_relation.evidence, null, 2) }}</pre>
+            </div>
+
+            <!-- LLM 同名判断过程（逐轮留痕） -->
+            <div v-if="evidence.decision_logs.length" class="review-page__review-detail">
+              <h4>LLM 同名判断过程</h4>
+              <div
+                v-for="(log, index) in evidence.decision_logs"
+                :key="index"
+                class="review-page__decision-log"
+              >
+                <div class="review-page__decision-log-header">
+                  <span class="review-page__decision-log-hop">{{ hopLabel(log) }}</span>
+                  <strong :class="decisionClass(log.decision)">{{ decisionLabel(log.decision) }}</strong>
+                  <span v-if="!annotationMode" class="review-page__decision-log-conf">
+                    置信度 {{ (log.confidence * 100).toFixed(0) }}%
+                  </span>
+                </div>
+                <p v-if="log.reason" class="review-page__decision-log-reason">
+                  <strong>理由:</strong> {{ log.reason }}
+                </p>
+                <p v-if="log.positive_evidence.length" class="review-page__decision-log-ev">
+                  <strong>支持同人:</strong> {{ log.positive_evidence.join('；') }}
+                </p>
+                <p v-if="log.negative_evidence.length" class="review-page__decision-log-ev">
+                  <strong>反对同人:</strong> {{ log.negative_evidence.join('；') }}
+                </p>
+                <p v-if="log.missing_evidence.length" class="review-page__decision-log-ev">
+                  <strong>缺失证据:</strong> {{ log.missing_evidence.join('；') }}
+                </p>
+              </div>
             </div>
 
             <!-- 原文对照 -->
@@ -453,6 +528,12 @@ onMounted(async () => {
   gap: 12px;
 }
 
+.review-page__confidence-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .review-page__confidence-label {
   font-size: 13px;
   color: #506287;
@@ -462,6 +543,20 @@ onMounted(async () => {
 .review-page__confidence-btns {
   display: flex;
   gap: 4px;
+}
+
+.review-page__confidence-hint {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.review-page__confidence-hint--low {
+  color: #c44040;
+}
+
+.review-page__confidence-hint--high {
+  color: #1e8a3c;
 }
 
 .review-page__conf-btn {
@@ -596,6 +691,47 @@ onMounted(async () => {
 }
 
 .review-page__review-detail strong {
+  color: #42557f;
+}
+
+.review-page__decision-log {
+  border-top: 1px dashed #e0e7f3;
+  padding: 10px 0 2px;
+}
+
+.review-page__decision-log:first-of-type {
+  border-top: none;
+  padding-top: 4px;
+}
+
+.review-page__decision-log-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.review-page__decision-log-hop {
+  font-weight: 600;
+  color: #31456f;
+}
+
+.review-page__decision-log-conf {
+  font-size: 12px;
+  color: #7085b0;
+}
+
+.review-page__decision-log-reason,
+.review-page__decision-log-ev {
+  margin: 3px 0;
+  font-size: 13px;
+  color: #506287;
+  line-height: 1.6;
+}
+
+.review-page__decision-log-reason strong,
+.review-page__decision-log-ev strong {
   color: #42557f;
 }
 

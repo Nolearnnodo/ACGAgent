@@ -1,6 +1,9 @@
 """人工审核路由：同名人物身份裁定。"""
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
@@ -15,6 +18,7 @@ from app.schemas.review import (
     AdjudicateResponse,
     AnnotateRequest,
     AnnotateResponse,
+    IdentityDecisionLog,
     IdentityEvidenceResponse,
     IdentityReviewItem,
     IdentityReviewListResponse,
@@ -63,19 +67,24 @@ def list_pending_reviews(
         )
         annotated_pairs = {_pair_key(a[0], a[1]) for a in all_annotations}
 
-    # 从 IdentityResolutionDecisionLog 取每对的首次可判定跳数+结论
-    first_decisions: dict[tuple[int, int], tuple[int, str]] = {}
+    # 从 IdentityResolutionDecisionLog 取每对的首次可判定跳数+结论。
+    # 全文终局裁定也存为 hop=5，按 (hop, used_full_text) 排序保证图证据裁定优先于全文裁定，
+    # 仅当 5 跳图证据仍无法判定、靠全文才判出时，used_full_text 才为 True。
+    first_decisions: dict[tuple[int, int], tuple[int, str, bool]] = {}
     if records:
         decision_rows = (
             db.query(IdentityResolutionDecisionLog)
             .filter(IdentityResolutionDecisionLog.decision.in_(("same", "different")))
-            .order_by(IdentityResolutionDecisionLog.hop)
+            .order_by(
+                IdentityResolutionDecisionLog.hop,
+                IdentityResolutionDecisionLog.used_full_text,
+            )
             .all()
         )
         for row in decision_rows:
             key = _pair_key(row.new_person_id, row.candidate_person_id)
             if key not in first_decisions:
-                first_decisions[key] = (row.hop, row.decision)
+                first_decisions[key] = (row.hop, row.decision, row.used_full_text)
 
     items = []
     for r in records:
@@ -93,6 +102,7 @@ def list_pending_reviews(
             target_passages=r.get("target_passages", []),
             hops=fd[0] if fd else None,
             llm_decision=fd[1] if fd else None,
+            llm_used_full_text=fd[2] if fd else False,
             annotated=pk in annotated_pairs,
         )
         items.append(item)
@@ -131,6 +141,50 @@ def get_review_evidence(
     review_records = review_rel.get("records", [])
     review_record = review_records[0] if review_records else None
 
+    # LLM 逐轮同名判断留痕（与图关系无关，自动合并/判不同人的对也能看到判断理由）
+    log_rows = (
+        db.query(IdentityResolutionDecisionLog)
+        .filter(
+            or_(
+                and_(
+                    IdentityResolutionDecisionLog.new_person_id == source_id,
+                    IdentityResolutionDecisionLog.candidate_person_id == target_id,
+                ),
+                and_(
+                    IdentityResolutionDecisionLog.new_person_id == target_id,
+                    IdentityResolutionDecisionLog.candidate_person_id == source_id,
+                ),
+            )
+        )
+        .order_by(
+            IdentityResolutionDecisionLog.created_at,
+            IdentityResolutionDecisionLog.hop,
+        )
+        .all()
+    )
+
+    def _parse_list(raw: str | None) -> list[str]:
+        try:
+            value = json.loads(raw or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    decision_logs = [
+        IdentityDecisionLog(
+            hop=row.hop,
+            decision=row.decision,
+            confidence=row.confidence,
+            reason=row.reason or "",
+            positive_evidence=_parse_list(row.positive_evidence_json),
+            negative_evidence=_parse_list(row.negative_evidence_json),
+            missing_evidence=_parse_list(row.missing_evidence_json),
+            used_full_text=row.used_full_text,
+            created_at=row.created_at.isoformat() if row.created_at else None,
+        )
+        for row in log_rows
+    ]
+
     source_doc_ids = repo.get_person_passage_doc_ids(source_id)
     target_doc_ids = repo.get_person_passage_doc_ids(target_id)
     all_doc_ids = list(set(source_doc_ids + target_doc_ids))
@@ -156,6 +210,7 @@ def get_review_evidence(
         target_evidence=target_evidence,
         graph_elements=graph_elements,
         review_relation=review_record,
+        decision_logs=decision_logs,
         source_passage_texts=source_passage_texts,
         target_passage_texts=target_passage_texts,
     )
@@ -172,9 +227,17 @@ def annotate_identity(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """保存人工标注（不改写图数据库）。"""
+    """保存人工标注（不改写图数据库）。
 
-    if payload.decision not in ("merge", "keep_separate"):
+    置信度 1~10 即方向信号：1 表示非常确定不是同人，10 表示非常确定是同人。
+    decision 未显式提供时按置信度推导（>=6 视为同人，<=5 视为不同人）。
+    """
+
+    if payload.decision is None:
+        decision = "merge" if payload.human_confidence >= 6 else "keep_separate"
+    elif payload.decision in ("merge", "keep_separate"):
+        decision = payload.decision
+    else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="decision 必须为 merge 或 keep_separate。",
@@ -202,7 +265,7 @@ def annotate_identity(
     )
 
     if existing:
-        existing.decision = payload.decision
+        existing.decision = decision
         existing.human_confidence = payload.human_confidence
         existing.note = payload.note
         existing.source_name = name_record.get("source_name")
@@ -215,7 +278,7 @@ def annotate_identity(
         target_person_id=key[1],
         source_name=name_record.get("source_name"),
         target_name=name_record.get("target_name"),
-        decision=payload.decision,
+        decision=decision,
         human_confidence=payload.human_confidence,
         note=payload.note,
         annotator_id=current_user.id,

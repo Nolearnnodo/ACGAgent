@@ -99,6 +99,8 @@ try {
     }
 
     Invoke-Step "Load image(s), refresh remote env defaults, restart service(s)" {
+        $remoteScriptName = "acgagent-deploy-$Service.sh"
+        $localRemoteScriptPath = Join-Path $env:TEMP $remoteScriptName
         $remoteScript = @"
 set -eu
 cd '$RemoteDir'
@@ -120,10 +122,16 @@ docker load -i '/tmp/acgagent-images-$Service.tar'
 docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build $($services -join ' ')
 docker compose -f docker-compose.prod.yml ps
 "@
-        $remoteScript = $remoteScript -replace "`r`n", "`n"
-        $remoteScript | ssh $remote "bash -s"
-        if ($LASTEXITCODE -ne 0) {
-            throw "Remote deploy failed."
+        try {
+            $remoteScript = $remoteScript -replace "`r`n", "`n"
+            [System.IO.File]::WriteAllText($localRemoteScriptPath, $remoteScript, [System.Text.UTF8Encoding]::new($false))
+            Invoke-CheckedCommand "scp" @($localRemoteScriptPath, "${remote}:/tmp/$remoteScriptName")
+            Invoke-CheckedCommand "ssh" @($remote, "bash '/tmp/$remoteScriptName'")
+        }
+        finally {
+            if (Test-Path $localRemoteScriptPath) {
+                Remove-Item -LiteralPath $localRemoteScriptPath -Force
+            }
         }
     }
 
