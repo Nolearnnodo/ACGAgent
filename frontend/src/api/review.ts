@@ -16,6 +16,16 @@ export interface IdentityReviewItem {
   annotated: boolean
 }
 
+export interface IdentityAIReport {
+  id: number
+  source_person_id: number
+  target_person_id: number
+  source_name: string | null
+  target_name: string | null
+  report_markdown: string
+  updated_at: string | null
+}
+
 export interface IdentityReviewListResponse {
   pending_count: number
   items: IdentityReviewItem[]
@@ -52,6 +62,7 @@ export interface IdentityEvidenceResponse {
   decision_logs: IdentityDecisionLog[]
   source_passage_texts: PassageText[]
   target_passage_texts: PassageText[]
+  ai_report: IdentityAIReport | null
 }
 
 export interface AdjudicateResponse {
@@ -63,6 +74,15 @@ export interface AdjudicateResponse {
 export interface AnnotateResponse {
   status: string
   annotation_id: number
+}
+
+export interface GenerateIdentityReportsResponse {
+  pair_count: number
+  created_count: number
+  updated_count: number
+  skipped_count: number
+  failed_count: number
+  failures: Array<Record<string, unknown>>
 }
 
 export async function listPendingReviews(mode: 'pending' | 'annotation' = 'pending') {
@@ -97,6 +117,14 @@ export async function annotateIdentity(
   const { data } = await apiClient.post<AnnotateResponse>(
     `/review/identity/${sourceId}/${targetId}/annotate`,
     { human_confidence: humanConfidence, note },
+  )
+  return data
+}
+
+export async function generateIdentityReports(force = false) {
+  const { data } = await apiClient.post<GenerateIdentityReportsResponse>(
+    '/review/identity/reports/generate',
+    { force },
   )
   return data
 }

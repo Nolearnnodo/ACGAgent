@@ -97,21 +97,24 @@ class DeepSeekProvider(BaseLLMProvider):
     def _post_chat_completion_result(
         self,
         messages: list[dict[str, str]],
+        metadata: dict[str, Any] | None = None,
     ) -> LLMCallResult:
         if not self.settings.llm_api_base_url or not self.settings.llm_api_key:
             raise ValueError("DeepSeek API configuration is incomplete.")
 
         trimmed = _trim_messages(messages, MAX_INPUT_TOKENS)
+        payload: dict[str, Any] = {
+            "model": self.settings.llm_model_name,
+            "messages": trimmed,
+            "temperature": 0.1,
+        }
+        if (metadata or {}).get("response_format") != "text":
+            payload["response_format"] = {"type": "json_object"}
         started = time.perf_counter()
         response = httpx.post(
             f"{self.settings.llm_api_base_url.rstrip('/')}/chat/completions",
             headers=self._build_headers(),
-            json={
-                "model": self.settings.llm_model_name,
-                "messages": trimmed,
-                "temperature": 0.1,
-                "response_format": {"type": "json_object"},
-            },
+            json=payload,
             timeout=self.settings.llm_timeout_seconds,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
@@ -126,12 +129,17 @@ class DeepSeekProvider(BaseLLMProvider):
             latency_ms=latency_ms,
         )
 
-    def _post_chat_completion(self, messages: list[dict[str, str]]) -> str:
-        return self._post_chat_completion_result(messages).content
+    def _post_chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        return self._post_chat_completion_result(messages, metadata=metadata).content
 
     def _post_chat_completion_result_with_retry(
         self,
         messages: list[dict[str, str]],
+        metadata: dict[str, Any] | None = None,
     ) -> LLMCallResult:
         last_exc: Exception | None = None
         started = time.perf_counter()
@@ -139,7 +147,7 @@ class DeepSeekProvider(BaseLLMProvider):
             if delay:
                 time.sleep(delay)
             try:
-                result = self._post_chat_completion_result(messages)
+                result = self._post_chat_completion_result(messages, metadata=metadata)
                 result.retry_count = attempt
                 result.latency_ms = int((time.perf_counter() - started) * 1000)
                 return result
@@ -153,8 +161,15 @@ class DeepSeekProvider(BaseLLMProvider):
         assert last_exc is not None
         raise last_exc
 
-    def _post_chat_completion_with_retry(self, messages: list[dict[str, str]]) -> str:
-        return self._post_chat_completion_result_with_retry(messages).content
+    def _post_chat_completion_with_retry(
+        self,
+        messages: list[dict[str, str]],
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        return self._post_chat_completion_result_with_retry(
+            messages,
+            metadata=metadata,
+        ).content
 
     def generate_structured_intent(self, prompt: str, metadata: dict[str, Any]) -> dict[str, Any]:
         allowed_skill_codes = [
@@ -219,7 +234,7 @@ class DeepSeekProvider(BaseLLMProvider):
 
     def chat_completion(self, messages: list[dict[str, str]], metadata: dict[str, Any]) -> str:
         try:
-            return self._post_chat_completion_with_retry(messages)
+            return self._post_chat_completion_with_retry(messages, metadata=metadata)
         except httpx.HTTPStatusError as exc:
             if _is_fatal_auth(exc):
                 raise RuntimeError(
@@ -234,7 +249,10 @@ class DeepSeekProvider(BaseLLMProvider):
         metadata: dict[str, Any],
     ) -> LLMCallResult:
         try:
-            return self._post_chat_completion_result_with_retry(messages)
+            return self._post_chat_completion_result_with_retry(
+                messages,
+                metadata=metadata,
+            )
         except httpx.HTTPStatusError as exc:
             if _is_fatal_auth(exc):
                 raise RuntimeError(

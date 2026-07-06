@@ -1,12 +1,17 @@
 <script setup lang="ts">
+import 'katex/dist/katex.min.css'
+
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
 import AppLayout from '../layouts/AppLayout.vue'
 import GraphViewer from '../components/GraphViewer.vue'
+import { useAuthStore } from '../stores/auth'
+import { renderReportMarkdown } from '../utils/reportRenderer'
 import {
   adjudicateIdentity,
   annotateIdentity,
+  generateIdentityReports,
   getReviewEvidence,
   listPendingReviews,
   type IdentityDecisionLog,
@@ -15,7 +20,9 @@ import {
 } from '../api/review'
 
 const route = useRoute()
+const authStore = useAuthStore()
 const annotationMode = computed(() => route.query.mode === 'annotation')
+const canGenerateReports = computed(() => annotationMode.value && authStore.isAdmin)
 
 const pendingItems = ref<IdentityReviewItem[]>([])
 const loading = ref(false)
@@ -23,8 +30,16 @@ const activeItem = ref<IdentityReviewItem | null>(null)
 const evidence = ref<IdentityEvidenceResponse | null>(null)
 const evidenceLoading = ref(false)
 const adjudicating = ref(false)
+const reportGenerating = ref(false)
+const reportMessage = ref('')
 const humanConfidence = ref<number | null>(null)
 const annotateNote = ref('')
+const confidenceOptions = Array.from({ length: 11 }, (_, index) => index)
+const renderedAiReport = computed(() => (
+  evidence.value?.ai_report
+    ? renderReportMarkdown(evidence.value.ai_report.report_markdown)
+    : ''
+))
 
 interface PassageSegment {
   text: string
@@ -106,11 +121,32 @@ async function selectItem(item: IdentityReviewItem) {
   }
 }
 
-// 标注模式：置信度（1~10）本身即方向信号，提交单一标注
+async function handleGenerateReports() {
+  if (!canGenerateReports.value || reportGenerating.value) return
+  reportGenerating.value = true
+  reportMessage.value = ''
+  try {
+    const result = await generateIdentityReports(false)
+    reportMessage.value = `完成：共 ${result.pair_count} 对，新增 ${result.created_count} 份，跳过 ${result.skipped_count} 份，失败 ${result.failed_count} 份。`
+    if (activeItem.value) {
+      evidence.value = await getReviewEvidence(
+        activeItem.value.source_person_id,
+        activeItem.value.target_person_id,
+      )
+    }
+  } catch (error) {
+    reportMessage.value = '生成失败，请检查后端日志或管理员权限。'
+    throw error
+  } finally {
+    reportGenerating.value = false
+  }
+}
+
+// 标注模式：置信度（0~10）本身即方向信号，提交单一标注
 async function handleAnnotateSubmit() {
   if (!activeItem.value) return
   if (humanConfidence.value == null) {
-    alert('请先选择置信度（1~10）')
+    alert('请先选择置信度（0~10）')
     return
   }
   adjudicating.value = true
@@ -161,6 +197,17 @@ onMounted(async () => {
           <template v-if="annotationMode">同名人物标注 ({{ pendingItems.length }})</template>
           <template v-else>待审核同名人物 ({{ pendingItems.length }})</template>
         </h3>
+        <div v-if="canGenerateReports" class="review-page__report-tools">
+          <button
+            class="review-page__report-btn"
+            type="button"
+            :disabled="reportGenerating"
+            @click="handleGenerateReports"
+          >
+            {{ reportGenerating ? '生成中...' : '一键生成 AI 参考报告' }}
+          </button>
+          <p v-if="reportMessage" class="review-page__report-message">{{ reportMessage }}</p>
+        </div>
         <div v-if="loading" class="review-page__loading">加载中...</div>
         <div v-else-if="!pendingItems.length" class="review-page__empty">暂无待审核项</div>
         <button
@@ -205,10 +252,10 @@ onMounted(async () => {
             <!-- 标注模式：置信度即方向信号，单一提交 -->
             <div v-if="annotationMode" class="review-page__annotation-controls">
               <div class="review-page__confidence-block">
-                <span class="review-page__confidence-label">同人置信度（1~10）:</span>
+                <span class="review-page__confidence-label">同人置信度（0~10）:</span>
                 <div class="review-page__confidence-btns">
                   <button
-                    v-for="n in 10"
+                    v-for="n in confidenceOptions"
                     :key="n"
                     type="button"
                     class="review-page__conf-btn"
@@ -217,7 +264,8 @@ onMounted(async () => {
                   >{{ n }}</button>
                 </div>
                 <div class="review-page__confidence-hint">
-                  <span class="review-page__confidence-hint--low">1 = 非常确定不是同人</span>
+                  <span class="review-page__confidence-hint--low">0 = 非常确定不是同人</span>
+                  <span class="review-page__confidence-hint--mid">5 = 存疑</span>
                   <span class="review-page__confidence-hint--high">10 = 非常确定是同人</span>
                 </div>
               </div>
@@ -268,6 +316,24 @@ onMounted(async () => {
             <div class="review-page__graph-section">
               <h4>证据图谱</h4>
               <GraphViewer :elements="evidence.graph_elements" height="450px" />
+            </div>
+
+            <!-- AI 考据报告 -->
+            <div class="review-page__ai-report">
+              <div class="review-page__ai-report-header">
+                <h4>AI 考据报告</h4>
+                <span v-if="evidence.ai_report?.updated_at">
+                  更新于 {{ evidence.ai_report.updated_at }}
+                </span>
+              </div>
+              <div
+                v-if="evidence.ai_report"
+                class="review-page__ai-report-body"
+                v-html="renderedAiReport"
+              />
+              <p v-else class="review-page__ai-report-empty">
+                暂无 AI 考据报告。管理员可在左侧一键生成全部同名人物参考报告。
+              </p>
             </div>
 
             <!-- 证据摘要 -->
@@ -419,6 +485,38 @@ onMounted(async () => {
   text-align: center;
 }
 
+.review-page__report-tools {
+  border: 1px solid #e4ebf7;
+  border-radius: 12px;
+  background: #fafcff;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.review-page__report-btn {
+  width: 100%;
+  border: none;
+  border-radius: 10px;
+  background: #2f6fed;
+  color: #ffffff;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.review-page__report-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.review-page__report-message {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #506287;
+}
+
 .review-page__placeholder {
   flex: 1;
   display: flex;
@@ -555,6 +653,10 @@ onMounted(async () => {
   color: #c44040;
 }
 
+.review-page__confidence-hint--mid {
+  color: #7085b0;
+}
+
 .review-page__confidence-hint--high {
   color: #1e8a3c;
 }
@@ -642,10 +744,127 @@ onMounted(async () => {
 }
 
 .review-page__graph-section h4,
+.review-page__ai-report h4,
 .review-page__review-detail h4 {
   margin: 0 0 10px;
   color: #31456f;
   font-size: 14px;
+}
+
+.review-page__ai-report {
+  background: #fafcff;
+  border: 1px solid #e4ebf7;
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.review-page__ai-report-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.review-page__ai-report-header span {
+  font-size: 12px;
+  color: #8a97b3;
+}
+
+.review-page__ai-report-body {
+  margin: 0;
+  background: #ffffff;
+  border: 1px solid #e4ebf7;
+  border-radius: 10px;
+  padding: 12px;
+  max-height: 520px;
+  overflow: auto;
+  white-space: normal;
+  word-break: break-word;
+  font-family: 'Noto Serif SC', 'Source Han Serif SC', 'SimSun', serif;
+  font-size: 13px;
+  line-height: 1.8;
+  color: #31456f;
+}
+
+.review-page__ai-report-body :deep(h1),
+.review-page__ai-report-body :deep(h2),
+.review-page__ai-report-body :deep(h3),
+.review-page__ai-report-body :deep(h4) {
+  margin: 14px 0 8px;
+  color: #31456f;
+  line-height: 1.5;
+}
+
+.review-page__ai-report-body :deep(h1:first-child),
+.review-page__ai-report-body :deep(h2:first-child),
+.review-page__ai-report-body :deep(h3:first-child),
+.review-page__ai-report-body :deep(h4:first-child) {
+  margin-top: 0;
+}
+
+.review-page__ai-report-body :deep(p),
+.review-page__ai-report-body :deep(ul),
+.review-page__ai-report-body :deep(ol) {
+  margin: 8px 0;
+}
+
+.review-page__ai-report-body :deep(ul),
+.review-page__ai-report-body :deep(ol) {
+  padding-left: 22px;
+}
+
+.review-page__ai-report-body :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.review-page__ai-report-body :deep(th),
+.review-page__ai-report-body :deep(td) {
+  border: 1px solid #dce5f3;
+  padding: 7px 8px;
+  vertical-align: top;
+}
+
+.review-page__ai-report-body :deep(th) {
+  background: #f0f6ff;
+  color: #31456f;
+  font-weight: 700;
+}
+
+.review-page__ai-report-body :deep(code) {
+  font-family: 'Fira Code', 'Consolas', monospace;
+  background: #eef3fb;
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.review-page__ai-report-body :deep(pre) {
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+
+.review-page__ai-report-body :deep(pre code) {
+  background: transparent;
+  padding: 0;
+}
+
+.review-page__ai-report-body :deep(.katex-display) {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 6px 0;
+}
+
+.review-page__ai-report-empty {
+  margin: 0;
+  font-size: 13px;
+  color: #8a97b3;
+  line-height: 1.7;
 }
 
 .review-page__summary-grid {

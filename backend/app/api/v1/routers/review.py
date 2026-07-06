@@ -18,11 +18,18 @@ from app.schemas.review import (
     AdjudicateResponse,
     AnnotateRequest,
     AnnotateResponse,
+    GenerateIdentityReportsRequest,
+    GenerateIdentityReportsResponse,
     IdentityDecisionLog,
+    IdentityAIReportRead,
     IdentityEvidenceResponse,
     IdentityReviewItem,
     IdentityReviewListResponse,
     PassageText,
+)
+from app.services.identity_report_service import (
+    generate_all_same_name_identity_reports,
+    get_identity_report_for_pair,
 )
 
 router = APIRouter(prefix="/review", tags=["人工审核"])
@@ -108,6 +115,30 @@ def list_pending_reviews(
         items.append(item)
 
     return IdentityReviewListResponse(pending_count=len(items), items=items)
+
+
+@router.post(
+    "/identity/reports/generate",
+    response_model=GenerateIdentityReportsResponse,
+)
+def generate_identity_ai_reports(
+    payload: GenerateIdentityReportsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """为全部同名人物对生成 AI 考据报告。"""
+
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="仅管理员可批量生成同名人物 AI 报告。",
+        )
+    result = generate_all_same_name_identity_reports(
+        db=db,
+        generated_by_id=current_user.id,
+        force=payload.force,
+    )
+    return GenerateIdentityReportsResponse(**result)
 
 
 @router.get(
@@ -204,6 +235,20 @@ def get_review_evidence(
         for did in target_doc_ids
         if did in passage_map
     ]
+    report = get_identity_report_for_pair(db, source_id, target_id)
+    ai_report = (
+        IdentityAIReportRead(
+            id=report.id,
+            source_person_id=report.source_person_id,
+            target_person_id=report.target_person_id,
+            source_name=report.source_name,
+            target_name=report.target_name,
+            report_markdown=report.report_markdown,
+            updated_at=report.updated_at.isoformat() if report.updated_at else None,
+        )
+        if report
+        else None
+    )
 
     return IdentityEvidenceResponse(
         source_evidence=source_evidence,
@@ -213,6 +258,7 @@ def get_review_evidence(
         decision_logs=decision_logs,
         source_passage_texts=source_passage_texts,
         target_passage_texts=target_passage_texts,
+        ai_report=ai_report,
     )
 
 
@@ -229,7 +275,7 @@ def annotate_identity(
 ):
     """保存人工标注（不改写图数据库）。
 
-    置信度 1~10 即方向信号：1 表示非常确定不是同人，10 表示非常确定是同人。
+    置信度 0~10 即方向信号：0 表示非常确定不是同人，10 表示非常确定是同人。
     decision 未显式提供时按置信度推导（>=6 视为同人，<=5 视为不同人）。
     """
 

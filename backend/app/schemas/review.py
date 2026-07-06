@@ -46,6 +46,16 @@ class IdentityDecisionLog(BaseModel):
     created_at: str | None = None
 
 
+class IdentityAIReportRead(BaseModel):
+    id: int
+    source_person_id: int
+    target_person_id: int
+    source_name: str | None = None
+    target_name: str | None = None
+    report_markdown: str
+    updated_at: str | None = None
+
+
 class IdentityEvidenceResponse(BaseModel):
     source_evidence: dict[str, Any]
     target_evidence: dict[str, Any]
@@ -54,6 +64,20 @@ class IdentityEvidenceResponse(BaseModel):
     decision_logs: list[IdentityDecisionLog] = Field(default_factory=list)
     source_passage_texts: list[PassageText] = Field(default_factory=list)
     target_passage_texts: list[PassageText] = Field(default_factory=list)
+    ai_report: IdentityAIReportRead | None = None
+
+
+class GenerateIdentityReportsRequest(BaseModel):
+    force: bool = False
+
+
+class GenerateIdentityReportsResponse(BaseModel):
+    pair_count: int
+    created_count: int
+    updated_count: int
+    skipped_count: int
+    failed_count: int
+    failures: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AdjudicateRequest(BaseModel):
@@ -67,9 +91,9 @@ class AdjudicateResponse(BaseModel):
 
 
 class AnnotateRequest(BaseModel):
-    # 置信度本身即方向信号（1=非常确定不是同人，10=非常确定是同人），
+    # 置信度本身即方向信号（0=非常确定不是同人，10=非常确定是同人），
     # decision 可省略，由后端按置信度推导，仅为兼容旧数据保留。
-    human_confidence: int = Field(ge=1, le=10)
+    human_confidence: int = Field(ge=0, le=10)
     decision: str | None = None
     note: str = ""
 
