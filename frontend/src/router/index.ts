@@ -35,6 +35,18 @@ const router = createRouter({
       component: IdentityReviewView,
       meta: { requiresAuth: true },
     },
+    {
+      path: '/annotations/extraction',
+      name: 'extraction-annotation',
+      component: () => import('../views/ExtractionAnnotationView.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/annotations/extraction/adjudication',
+      name: 'extraction-adjudication',
+      component: () => import('../views/ExtractionAdjudicationView.vue'),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
   ],
 })
 

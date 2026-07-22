@@ -30,4 +30,10 @@ from app.models.observability import (  # noqa: E402,F401
 from app.models.passage import Passage  # noqa: E402,F401
 from app.models.skill import SkillDefinition, SkillRelation  # noqa: E402,F401
 from app.models.annotation import IdentityAnnotation  # noqa: E402,F401
+from app.models.extraction_annotation import (  # noqa: E402,F401
+    ExtractionAdjudicationDraft,
+    ExtractionAnnotationSubmission,
+    ExtractionAnnotationTask,
+    ExtractionGoldVersion,
+)
 from app.models.user import User  # noqa: E402,F401

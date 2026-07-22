@@ -178,6 +178,14 @@ flowchart TD
   - 封装功能 A/B 所需的领域写入、同名人物召回、证据包读取和合并操作
   - 统一处理参数、summary 与异常返回，避免业务层直接持有 driver
 
+### 4.6 功能 A 人工标注
+
+- 标注员和复核员使用：[`docs/superpowers/specs/2026-07-16-function-a-annotation-guideline.md`](docs/superpowers/specs/2026-07-16-function-a-annotation-guideline.md)
+
+### 4.7 功能 A 技术评测
+
+- 当前 AI 抽取链路、字段映射、评测指标和标注工具要求见：[`docs/superpowers/specs/2026-07-22-function-a-annotation-evaluation-appendix.md`](docs/superpowers/specs/2026-07-22-function-a-annotation-evaluation-appendix.md)
+
 ## 5. 前端说明
 
 前端采用简洁亮色风格，当前页面包括：

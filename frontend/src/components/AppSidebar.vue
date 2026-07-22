@@ -23,6 +23,17 @@ const navItems = computed(() => {
       adminOnly: true,
     },
     {
+      label: '抽取标注',
+      to: '/annotations/extraction',
+      active: route.path === '/annotations/extraction',
+    },
+    {
+      label: '抽取裁定',
+      to: '/annotations/extraction/adjudication',
+      active: route.path.startsWith('/annotations/extraction/adjudication'),
+      adminOnly: true,
+    },
+    {
       label: '同名人物审核',
       to: '/review/identity',
       active: route.path.startsWith('/review/identity') && !route.query.mode,

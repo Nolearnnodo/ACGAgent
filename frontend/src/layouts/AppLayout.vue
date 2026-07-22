@@ -4,6 +4,12 @@ import { useRouter } from 'vue-router'
 import AppSidebar from '../components/AppSidebar.vue'
 import { useAuthStore } from '../stores/auth'
 
+withDefaults(defineProps<{
+  variant?: 'default' | 'workspace'
+}>(), {
+  variant: 'default',
+})
+
 const router = useRouter()
 const authStore = useAuthStore()
 
@@ -14,10 +20,10 @@ async function handleLogout() {
 </script>
 
 <template>
-  <div class="layout">
+  <div class="layout" :class="{ 'layout--workspace': variant === 'workspace' }">
     <AppSidebar />
-    <main class="layout__main">
-      <header class="layout__header">
+    <main class="layout__main" :class="{ 'layout__main--workspace': variant === 'workspace' }">
+      <header v-if="variant !== 'workspace'" class="layout__header">
         <div>
           <h2>欢迎使用图数据库维护系统</h2>
           <p>当前用户：{{ authStore.user?.email ?? '未登录' }}</p>
@@ -46,6 +52,13 @@ async function handleLogout() {
   box-sizing: border-box;
 }
 
+.layout__main--workspace {
+  min-width: 0;
+  height: 100vh;
+  padding: 0;
+  overflow: hidden;
+}
+
 .layout__header {
   display: flex;
   align-items: center;
@@ -67,6 +80,23 @@ async function handleLogout() {
 
 .layout__content {
   flex: 1;
+}
+
+.layout__main--workspace .layout__content {
+  min-width: 0;
+  min-height: 0;
+}
+
+@media (max-width: 1050px) {
+  .layout--workspace {
+    min-height: 100vh;
+  }
+
+  .layout__main--workspace {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
 }
 
 .layout__logout {

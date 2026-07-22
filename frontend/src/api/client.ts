@@ -20,6 +20,8 @@ interface ApiValidationItem {
   loc?: unknown[]
   msg?: string
   type?: string
+  path?: string
+  message?: string
 }
 
 function isValidationItem(value: unknown): value is ApiValidationItem {
@@ -27,6 +29,9 @@ function isValidationItem(value: unknown): value is ApiValidationItem {
 }
 
 function formatValidationItem(item: ApiValidationItem) {
+  if (item.message) {
+    return item.path ? `${item.path}：${item.message}` : item.message
+  }
   const field = Array.isArray(item.loc) ? String(item.loc[item.loc.length - 1] ?? '') : ''
   const message = item.msg ?? '输入内容不符合要求。'
 
