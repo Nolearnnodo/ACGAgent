@@ -9,7 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base_class import Base
 
 if TYPE_CHECKING:
-    from app.models.auth import AuthSession
+    from app.models.auth import AuthSession, PasswordResetCode
     from app.models.conversation import Conversation
 
 
@@ -33,4 +33,8 @@ class User(Base):
     )
 
     auth_sessions: Mapped[list["AuthSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    password_reset_codes: Mapped[list["PasswordResetCode"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
     conversations: Mapped[list["Conversation"]] = relationship(back_populates="user", cascade="all, delete-orphan")

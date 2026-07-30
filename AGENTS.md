@@ -89,7 +89,7 @@ ChatRouter → ConversationService → Planner.plan() → PlannerDecision
 
 ### 数据库分工
 
-- **SQLite（关系型，由 Alembic 管理）**：`users`、`auth_sessions`、`conversations`、`messages`、`conversation_memories`、`skill_definitions`、`skill_relations`、`planner_decisions`、`execution_runs`、`execution_step_runs`、`passages`
+- **SQLite（关系型，由 Alembic 管理）**：`users`、`auth_sessions`、`password_reset_codes`、`conversations`、`messages`、`conversation_memories`、`skill_definitions`、`skill_relations`、`planner_decisions`、`execution_runs`、`execution_step_runs`、`passages`
 - **Neo4j（图）**：领域知识图谱，schema 来自 `bg_knowledge/数据库存储格式（…）.pdf`：
   - 节点：`Passage_Info`、`Person_Nodes`、`Life_Events`、`Time`、`Location`、`Official_title`、`Historical_Events`
   - 关键 ID 约定：`person_id = doc_id * 1000 + 文章内出现次序`（受文章规模影响，必要时上调倍率）

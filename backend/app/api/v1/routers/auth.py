@@ -10,8 +10,11 @@ from app.schemas.auth import (
     AuthResponse,
     LoginRequest,
     LogoutRequest,
+    PasswordResetCodeResponse,
     RefreshTokenRequest,
     RegisterRequest,
+    ResetPasswordRequest,
+    SendPasswordResetCodeRequest,
     TokenPair,
     UpdateProfileRequest,
     UserProfileResponse,
@@ -68,6 +71,37 @@ def logout(payload: LogoutRequest, db: Session = Depends(get_db)) -> MessageResp
     service = AuthService(db)
     service.logout(payload.refresh_token)
     return MessageResponse(message="已成功登出。")
+
+
+@router.post("/password-reset/code", response_model=PasswordResetCodeResponse)
+def send_password_reset_code(
+    payload: SendPasswordResetCodeRequest,
+    db: Session = Depends(get_db),
+) -> PasswordResetCodeResponse:
+    """向已注册邮箱发送密码重置验证码。"""
+
+    service = AuthService(db)
+    message = service.request_password_reset(email=payload.email)
+    return PasswordResetCodeResponse(
+        message=message,
+        cooldown_seconds=service.settings.password_reset_code_cooldown_seconds,
+    )
+
+
+@router.post("/password-reset", response_model=MessageResponse)
+def reset_password(
+    payload: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+) -> MessageResponse:
+    """校验邮箱验证码并设置新密码。"""
+
+    service = AuthService(db)
+    service.reset_password(
+        email=payload.email,
+        code=payload.code,
+        new_password=payload.new_password,
+    )
+    return MessageResponse(message="密码已重置，请使用新密码登录。")
 
 
 @router.get("/me", response_model=UserProfileResponse)

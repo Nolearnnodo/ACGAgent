@@ -163,6 +163,16 @@ class ExtractionTaskCreateRequest(BaseModel):
     spec_version: str = Field(default=ANNOTATION_SPEC_VERSION, min_length=1, max_length=32)
 
 
+class ExtractionTaskAssignmentResponse(BaseModel):
+    submission_id: int
+    slot_no: int
+    annotator_id: int
+    annotator_email: str
+    state: str
+    submitted_at: datetime | None
+    updated_at: datetime
+
+
 class ExtractionTaskSummaryResponse(BaseModel):
     id: int
     passage_id: int
@@ -180,6 +190,7 @@ class ExtractionTaskSummaryResponse(BaseModel):
     slot_no: int | None
     revision: int | None
     updated_at: datetime
+    assignments: list[ExtractionTaskAssignmentResponse] = Field(default_factory=list)
 
 
 class AnnotationPassageResponse(BaseModel):

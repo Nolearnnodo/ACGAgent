@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 import { useAuthStore } from '../stores/auth'
 import ChatView from '../views/ChatView.vue'
+import ForgotPasswordView from '../views/ForgotPasswordView.vue'
 import IdentityReviewView from '../views/IdentityReviewView.vue'
 import LoginView from '../views/LoginView.vue'
 import PassageManualInputView from '../views/PassageManualInputView.vue'
@@ -15,6 +16,12 @@ const router = createRouter({
     { path: '/', redirect: '/chat' },
     { path: '/login', name: 'login', component: LoginView, meta: { guestOnly: true } },
     { path: '/register', name: 'register', component: RegisterView, meta: { guestOnly: true } },
+    {
+      path: '/forgot-password',
+      name: 'forgot-password',
+      component: ForgotPasswordView,
+      meta: { guestOnly: true },
+    },
     { path: '/chat', name: 'chat', component: ChatView, meta: { requiresAuth: true } },
     { path: '/profile', name: 'profile', component: ProfileView, meta: { requiresAuth: true } },
     {

@@ -20,6 +20,12 @@ export interface AuthResponse {
   }
 }
 
+export interface PasswordResetPayload {
+  email: string
+  code: string
+  new_password: string
+}
+
 export async function register(payload: AuthPayload) {
   const { data } = await apiClient.post<AuthResponse>('/auth/register', payload)
   return data
@@ -27,6 +33,19 @@ export async function register(payload: AuthPayload) {
 
 export async function login(payload: AuthPayload) {
   const { data } = await apiClient.post<AuthResponse>('/auth/login', payload)
+  return data
+}
+
+export async function sendPasswordResetCode(email: string) {
+  const { data } = await apiClient.post<{ message: string; cooldown_seconds: number }>(
+    '/auth/password-reset/code',
+    { email },
+  )
+  return data
+}
+
+export async function resetPassword(payload: PasswordResetPayload) {
+  const { data } = await apiClient.post<{ message: string }>('/auth/password-reset', payload)
   return data
 }
 

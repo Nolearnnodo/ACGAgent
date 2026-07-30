@@ -7,7 +7,7 @@ from app.db.base_class import Base
 
 
 # 导入模型以确保 Base.metadata.create_all 能发现它们。
-from app.models.auth import AuthSession  # noqa: E402,F401
+from app.models.auth import AuthSession, PasswordResetCode  # noqa: E402,F401
 from app.models.conversation import Conversation, ConversationMemory, Message  # noqa: E402,F401
 from app.models.dictionary import (  # noqa: E402,F401
     EraDictionary,

@@ -148,6 +148,17 @@ export interface ExtractionTaskSummary {
   slot_no: number | null
   revision: number | null
   updated_at: string
+  assignments: ExtractionTaskAssignment[]
+}
+
+export interface ExtractionTaskAssignment {
+  submission_id: number
+  slot_no: number
+  annotator_id: number
+  annotator_email: string
+  state: string
+  submitted_at: string | null
+  updated_at: string
 }
 
 export interface AnnotationPassage {
@@ -306,6 +317,13 @@ export async function createExtractionTask(payload: {
 export async function claimExtractionTask(taskId: number) {
   const { data } = await apiClient.post<ExtractionTaskDetail>(
     `/annotations/extraction/tasks/${taskId}/claim`,
+  )
+  return data
+}
+
+export async function releaseExtractionDraft(taskId: number, submissionId: number) {
+  const { data } = await apiClient.delete<ExtractionTaskSummary>(
+    `/annotations/extraction/tasks/${taskId}/submissions/${submissionId}`,
   )
   return data
 }

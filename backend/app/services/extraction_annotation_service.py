@@ -24,6 +24,7 @@ from app.schemas.extraction_annotation import (
     EvidenceSpan,
     ExtractionAnnotationLabel,
     ExtractionSubmissionResponse,
+    ExtractionTaskAssignmentResponse,
     ExtractionTaskCreateRequest,
     ExtractionTaskDetailResponse,
     ExtractionTaskSummaryResponse,
@@ -404,7 +405,7 @@ class ExtractionAnnotationService:
             .first()
         )
         if existing is not None:
-            return self._build_summary(existing, passage, current_user.id)
+            return self._build_summary(existing, passage, current_user)
 
         task = ExtractionAnnotationTask(
             passage_id=passage.doc_id,
@@ -418,7 +419,7 @@ class ExtractionAnnotationService:
         self.db.add(task)
         self.db.commit()
         self.db.refresh(task)
-        return self._build_summary(task, passage, current_user.id)
+        return self._build_summary(task, passage, current_user)
 
     def list_tasks(self, current_user: User) -> list[ExtractionTaskSummaryResponse]:
         tasks = (
@@ -439,7 +440,7 @@ class ExtractionAnnotationService:
             for passage in self.db.query(Passage).filter(Passage.doc_id.in_(passage_ids)).all()
         }
         return [
-            self._build_summary(task, passages[task.passage_id], current_user.id)
+            self._build_summary(task, passages[task.passage_id], current_user)
             for task in tasks
             if task.passage_id in passages
         ]
@@ -488,6 +489,32 @@ class ExtractionAnnotationService:
         self.db.refresh(task)
         self.db.refresh(submission)
         return self._build_detail(task, passage, submission)
+
+    def release_draft(
+        self,
+        task_id: int,
+        submission_id: int,
+        current_user: User,
+    ) -> ExtractionTaskSummaryResponse:
+        if current_user.role != "admin":
+            raise AnnotationForbiddenError("仅管理员可以释放标注槽位。")
+
+        task, passage = self._get_task_and_passage(task_id)
+        submission = self.db.get(ExtractionAnnotationSubmission, submission_id)
+        if submission is None or submission.task_id != task.id:
+            raise AnnotationNotFoundError("未找到指定的标注槽位。")
+        if submission.state == "submitted" or submission.submitted_at is not None:
+            raise AnnotationConflictError("已提交的盲标结果不能释放。")
+        if submission.state != "draft":
+            raise AnnotationConflictError("只有未提交的草稿槽位可以释放。")
+
+        self.db.delete(submission)
+        self.db.flush()
+        self._refresh_task_status(task)
+        self.db.add(task)
+        self.db.commit()
+        self.db.refresh(task)
+        return self._build_summary(task, passage, current_user)
 
     def get_task_detail(
         self,
@@ -619,15 +646,38 @@ class ExtractionAnnotationService:
         self,
         task: ExtractionAnnotationTask,
         passage: Passage,
-        current_user_id: int,
+        current_user: User,
     ) -> ExtractionTaskSummaryResponse:
         submissions = (
             self.db.query(ExtractionAnnotationSubmission)
             .filter(ExtractionAnnotationSubmission.task_id == task.id)
             .all()
         )
-        own = next((item for item in submissions if item.annotator_id == current_user_id), None)
+        own = next((item for item in submissions if item.annotator_id == current_user.id), None)
         submitted_count = sum(item.state == "submitted" for item in submissions)
+        assignments: list[ExtractionTaskAssignmentResponse] = []
+        if current_user.role == "admin" and submissions:
+            annotator_ids = {item.annotator_id for item in submissions}
+            annotators = {
+                user.id: user
+                for user in self.db.query(User).filter(User.id.in_(annotator_ids)).all()
+            }
+            assignments = [
+                ExtractionTaskAssignmentResponse(
+                    submission_id=item.id,
+                    slot_no=item.slot_no,
+                    annotator_id=item.annotator_id,
+                    annotator_email=(
+                        annotators[item.annotator_id].email
+                        if item.annotator_id in annotators
+                        else f"用户 #{item.annotator_id}"
+                    ),
+                    state=item.state,
+                    submitted_at=item.submitted_at,
+                    updated_at=item.updated_at,
+                )
+                for item in sorted(submissions, key=lambda submission: submission.slot_no)
+            ]
         return ExtractionTaskSummaryResponse(
             id=task.id,
             passage_id=task.passage_id,
@@ -645,6 +695,7 @@ class ExtractionAnnotationService:
             slot_no=own.slot_no if own else None,
             revision=own.revision if own else None,
             updated_at=task.updated_at,
+            assignments=assignments,
         )
 
     @staticmethod

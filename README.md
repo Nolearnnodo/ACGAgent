@@ -15,6 +15,7 @@
 - 鉴权模块：
   - 用户注册：邮箱 + 密码
   - 用户登录
+  - 忘记密码：邮箱验证码校验后重置密码
   - 刷新令牌
   - 用户登出
   - 获取当前用户信息
@@ -52,6 +53,7 @@
 - 前端：
   - 登录页
   - 注册页
+  - 忘记密码页
   - 对话页
   - 个人设置页
   - 亮色风格侧边导航
@@ -100,6 +102,7 @@ ACGAgent/
 
 - `User`：用户信息
 - `AuthSession`：Refresh Token 会话
+- `PasswordResetCode`：邮箱密码重置验证码摘要、有效期与尝试次数
 - `Conversation`：对话
 - `Message`：消息
 - `ConversationMemory`：短期记忆摘要与窗口配置
@@ -192,6 +195,7 @@ flowchart TD
 
 - 登录页：[`frontend/src/views/LoginView.vue`](frontend/src/views/LoginView.vue)
 - 注册页：[`frontend/src/views/RegisterView.vue`](frontend/src/views/RegisterView.vue)
+- 忘记密码页：[`frontend/src/views/ForgotPasswordView.vue`](frontend/src/views/ForgotPasswordView.vue)
 - 对话页：[`frontend/src/views/ChatView.vue`](frontend/src/views/ChatView.vue)
 - 个人设置页：[`frontend/src/views/ProfileView.vue`](frontend/src/views/ProfileView.vue)
 - 古籍上传页：[`frontend/src/views/PassageUploadView.vue`](frontend/src/views/PassageUploadView.vue)
@@ -210,9 +214,16 @@ flowchart TD
 - `SQLITE_DATABASE_URL`：SQLite 数据库地址
 - `NEO4J_*`：Neo4j 连接配置
 - `JWT_*`：JWT 令牌配置
+- `SMTP_*`：密码重置邮件的 SMTP 服务器、账号、发件地址与 TLS/SSL 配置
+- `PASSWORD_RESET_*`：验证码有效期、发送冷却时间与最大尝试次数
 - `CONVERSATION_MEMORY_WINDOW`：短期记忆窗口大小
 - `LLM_*`：外部 LLM 供应商配置
 - `VITE_API_BASE_URL`：前端调用后端的 API 地址
+
+忘记密码功能启用前必须配置可用的 SMTP 服务。常见的 587 端口使用
+`SMTP_USE_TLS=true`、`SMTP_USE_SSL=false`；常见的 465 端口使用
+`SMTP_USE_TLS=false`、`SMTP_USE_SSL=true`。`SMTP_PASSWORD` 通常应填写邮箱服务商生成的
+SMTP 授权码，而不是网页登录密码。
 
 当前推荐的 DeepSeek 配置为：
 

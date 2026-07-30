@@ -27,6 +27,7 @@ import {
   fetchAnnotationDictionaries,
   fetchExtractionTask,
   listExtractionTasks,
+  releaseExtractionDraft,
   saveExtractionDraft,
   submitExtractionAnnotation,
 } from '../api/extractionAnnotations'
@@ -84,6 +85,7 @@ const taskFilter = ref<TaskFilter>('mine')
 const loadingTasks = ref(false)
 const creatingTask = ref(false)
 const openingTaskId = ref<number | null>(null)
+const releasingSubmissionId = ref<number | null>(null)
 const activeDetail = ref<ExtractionTaskDetail | null>(null)
 const label = ref<ExtractionAnnotationLabel | null>(null)
 const activeStep = ref<StepId>('document')
@@ -291,6 +293,12 @@ function canLeaveCurrentTask() {
 
 async function openTask(task: ExtractionTaskSummary) {
   if (openingTaskId.value || (activeDetail.value?.id !== task.id && !canLeaveCurrentTask())) return
+  if (!task.submission_id) {
+    const warning = authStore.isAdmin
+      ? '管理员领取也会占用一个双人盲标槽位。确定要以当前管理员账号领取吗？'
+      : '领取后将占用一个双人盲标槽位。确定领取这篇古籍吗？'
+    if (!window.confirm(warning)) return
+  }
   openingTaskId.value = task.id
   serverIssues.value = []
   saveMessage.value = ''
@@ -304,6 +312,40 @@ async function openTask(task: ExtractionTaskSummary) {
     saveMessage.value = getApiErrorMessage(error, '打开任务失败。')
   } finally {
     openingTaskId.value = null
+  }
+}
+
+async function handleReleaseDraft(
+  task: ExtractionTaskSummary,
+  assignment: ExtractionTaskSummary['assignments'][number],
+) {
+  if (releasingSubmissionId.value !== null || assignment.state === 'submitted') return
+  const isActiveSubmission = activeDetail.value?.submission.id === assignment.submission_id
+  if (isActiveSubmission && !canLeaveCurrentTask()) return
+  if (!window.confirm(
+    `确定释放槽位 ${assignment.slot_no}（${assignment.annotator_email}）吗？该用户尚未提交的草稿将被删除，操作不可撤销。`,
+  )) return
+
+  releasingSubmissionId.value = assignment.submission_id
+  try {
+    if (isActiveSubmission) {
+      clearSaveTimer()
+      if (activeSavePromise) await activeSavePromise
+      clearSaveTimer()
+    }
+    await releaseExtractionDraft(task.id, assignment.submission_id)
+    if (isActiveSubmission) {
+      activeDetail.value = null
+      label.value = null
+      dirty.value = false
+      saveState.value = 'idle'
+    }
+    await loadTasks()
+    saveMessage.value = `已释放任务 #${task.id} 的槽位 ${assignment.slot_no}。`
+  } catch (error) {
+    saveMessage.value = getApiErrorMessage(error, '释放标注槽位失败。')
+  } finally {
+    releasingSubmissionId.value = null
   }
 }
 
@@ -807,22 +849,57 @@ onBeforeUnmount(() => {
             <p v-else-if="!filteredTasks.length" class="task-list__empty">
               {{ taskFilter === 'mine' ? '还没有领取任务' : '当前没有符合条件的任务' }}
             </p>
-            <button
+            <div
               v-for="task in filteredTasks"
               :key="task.id"
-              class="task-item"
-              :class="{ active: activeDetail?.id === task.id }"
-              type="button"
-              :disabled="openingTaskId === task.id || (!task.submission_id && task.available_slots === 0)"
-              @click="openTask(task)"
+              class="task-entry"
             >
-              <span class="task-item__index">#{{ String(task.id).padStart(3, '0') }}</span>
-              <strong>{{ task.passage_title }}</strong>
-              <small>
-                <span>{{ statusLabel(task.submission_state || task.status) }}</span>
-                <span>{{ task.claimed_count }}/{{ task.required_annotation_count }} 人</span>
-              </small>
-            </button>
+              <button
+                class="task-item"
+                :class="{ active: activeDetail?.id === task.id }"
+                type="button"
+                :disabled="openingTaskId === task.id || (!task.submission_id && task.available_slots === 0)"
+                @click="openTask(task)"
+              >
+                <span class="task-item__index">#{{ String(task.id).padStart(3, '0') }}</span>
+                <strong>{{ task.passage_title }}</strong>
+                <small>
+                  <span>
+                    {{
+                      task.submission_id
+                        ? statusLabel(task.submission_state)
+                        : task.available_slots > 0
+                          ? '确认后领取'
+                          : '槽位已满'
+                    }}
+                  </span>
+                  <span>{{ task.claimed_count }}/{{ task.required_annotation_count }} 人</span>
+                </small>
+              </button>
+              <div
+                v-if="authStore.isAdmin && task.assignments?.length"
+                class="task-assignments"
+                aria-label="标注槽位"
+              >
+                <div
+                  v-for="assignment in task.assignments"
+                  :key="assignment.submission_id"
+                  class="task-assignment"
+                >
+                  <span>槽位 {{ assignment.slot_no }}</span>
+                  <strong :title="assignment.annotator_email">{{ assignment.annotator_email }}</strong>
+                  <em>{{ statusLabel(assignment.state) }}</em>
+                  <button
+                    v-if="assignment.state !== 'submitted'"
+                    type="button"
+                    :disabled="releasingSubmissionId !== null"
+                    @click="handleReleaseDraft(task, assignment)"
+                  >
+                    {{ releasingSubmissionId === assignment.submission_id ? '释放中…' : '释放' }}
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </aside>
 
@@ -1596,6 +1673,7 @@ onBeforeUnmount(() => {
 
 .task-list { flex: 1; overflow-y: auto; }
 .task-list__empty { margin: 28px 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.task-entry { border-bottom: 1px solid rgba(207, 198, 183, 0.68); }
 
 .task-item {
   width: 100%;
@@ -1604,7 +1682,7 @@ onBeforeUnmount(() => {
   gap: 5px 8px;
   padding: 13px 14px;
   border: 0;
-  border-bottom: 1px solid rgba(207, 198, 183, 0.68);
+  border-bottom: 0;
   text-align: left;
   background: transparent;
   color: var(--ink);
@@ -1618,6 +1696,13 @@ onBeforeUnmount(() => {
 .task-item__index { grid-row: span 2; color: #9c9284; font: 10px/1.5 ui-monospace, monospace; }
 .task-item strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 600 12px/1.5 'Noto Serif SC', serif; }
 .task-item small { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+.task-assignments { display: grid; gap: 5px; padding: 0 14px 10px 60px; }
+.task-assignment { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 5px; font-size: 9px; }
+.task-assignment > span { color: var(--muted); }
+.task-assignment > strong { overflow: hidden; color: var(--ink); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.task-assignment > em { color: var(--muted); font-style: normal; }
+.task-assignment > button { border: 0; padding: 2px 5px; background: transparent; color: var(--vermilion); cursor: pointer; font-size: 9px; }
+.task-assignment > button:disabled { opacity: 0.5; cursor: wait; }
 
 .text-workspace {
   position: relative;
@@ -2009,11 +2094,17 @@ onBeforeUnmount(() => {
 .task-create button { border-radius: 9px; padding: 8px; background: #2f6fed; color: #ffffff; font-weight: 600; }
 .task-create button:disabled { background: #e7edf7; color: #8b99b2; cursor: not-allowed; }
 .task-list { padding: 0 8px 10px; }
-.task-item { width: calc(100% - 4px); margin: 4px 2px; border: 1px solid #e4ebf7; border-radius: 12px; background: #fafcff; }
+.task-entry { margin: 4px 2px; border: 1px solid #e4ebf7; border-radius: 12px; background: #fafcff; overflow: hidden; }
+.task-item { width: 100%; margin: 0; border: 0; border-radius: 0; background: transparent; }
 .task-item:hover:not(:disabled) { border-color: #8fb3ff; background: #f0f6ff; }
 .task-item.active { border-color: #2f6fed; background: #eef5ff; box-shadow: none; }
 .task-item strong { color: #31456f; font-family: 'Segoe UI', 'PingFang SC', sans-serif; }
 .task-item__index { color: #8a97b3; }
+.task-assignments { border-top: 1px solid #edf2fa; background: #f8fbff; }
+.task-assignment > span,
+.task-assignment > em { color: #7b89a5; }
+.task-assignment > strong { color: #44536f; }
+.task-assignment > button { color: #d14f55; }
 
 .text-workspace { background: #ffffff; background-image: none; }
 .text-workspace__meta { border-bottom-color: #e9eef8; background: #fafcff; }

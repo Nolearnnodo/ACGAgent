@@ -17,6 +17,27 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=6, max_length=128)
 
 
+class SendPasswordResetCodeRequest(BaseModel):
+    """发送密码重置验证码请求。"""
+
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    """使用邮箱验证码重置密码请求。"""
+
+    email: EmailStr
+    code: str = Field(pattern=r"^\d{6}$")
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class PasswordResetCodeResponse(BaseModel):
+    """验证码发送响应。"""
+
+    message: str
+    cooldown_seconds: int
+
+
 class UpdateProfileRequest(BaseModel):
     """修改个人信息请求。"""
 

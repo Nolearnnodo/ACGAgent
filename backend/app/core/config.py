@@ -41,6 +41,28 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = Field(default=60, alias="JWT_ACCESS_TOKEN_EXPIRE_MINUTES")
     jwt_refresh_token_expire_days: int = Field(default=7, alias="JWT_REFRESH_TOKEN_EXPIRE_DAYS")
 
+    smtp_host: str = Field(default="", alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, ge=1, le=65535, alias="SMTP_PORT")
+    smtp_username: str = Field(default="", alias="SMTP_USERNAME")
+    smtp_password: str = Field(default="", alias="SMTP_PASSWORD")
+    smtp_from_email: str = Field(default="", alias="SMTP_FROM_EMAIL")
+    smtp_from_name: str = Field(default="ACGAgent", alias="SMTP_FROM_NAME")
+    smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
+    smtp_use_ssl: bool = Field(default=False, alias="SMTP_USE_SSL")
+    smtp_timeout_seconds: int = Field(default=10, gt=0, alias="SMTP_TIMEOUT_SECONDS")
+
+    password_reset_code_expire_minutes: int = Field(
+        default=10,
+        gt=0,
+        alias="PASSWORD_RESET_CODE_EXPIRE_MINUTES",
+    )
+    password_reset_code_cooldown_seconds: int = Field(
+        default=60,
+        ge=0,
+        alias="PASSWORD_RESET_CODE_COOLDOWN_SECONDS",
+    )
+    password_reset_max_attempts: int = Field(default=5, gt=0, alias="PASSWORD_RESET_MAX_ATTEMPTS")
+
     conversation_memory_window: int = Field(default=8, alias="CONVERSATION_MEMORY_WINDOW")
 
     llm_provider: str = Field(default="mock", alias="LLM_PROVIDER")

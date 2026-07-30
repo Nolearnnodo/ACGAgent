@@ -39,12 +39,19 @@ function formatValidationItem(item: ApiValidationItem) {
     return '请输入合法邮箱。'
   }
 
-  if (field === 'password' && (item.type?.includes('too_short') || message.includes('at least 6'))) {
+  if (
+    (field === 'password' || field === 'new_password') &&
+    (item.type?.includes('too_short') || message.includes('at least 6'))
+  ) {
     return '密码至少需要 6 位。'
   }
 
-  if (field === 'password' && item.type?.includes('too_long')) {
+  if ((field === 'password' || field === 'new_password') && item.type?.includes('too_long')) {
     return '密码不能超过 128 位。'
+  }
+
+  if (field === 'code') {
+    return '请输入 6 位数字验证码。'
   }
 
   return message

@@ -48,7 +48,10 @@ async function handleSubmit() {
         {{ authStore.loading ? '登录中...' : '登录' }}
       </button>
 
-      <RouterLink to="/register" class="auth-card__link">没有账号？去注册</RouterLink>
+      <div class="auth-card__links">
+        <RouterLink to="/forgot-password" class="auth-card__link">忘记密码？</RouterLink>
+        <RouterLink to="/register" class="auth-card__link">没有账号？去注册</RouterLink>
+      </div>
     </form>
   </div>
 </template>
@@ -111,6 +114,13 @@ async function handleSubmit() {
 .auth-card__link {
   color: #2f6fed;
   text-align: center;
+}
+
+.auth-card__links {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 14px;
 }
 
 .auth-card__error {

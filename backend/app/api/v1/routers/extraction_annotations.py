@@ -50,7 +50,7 @@ def list_extraction_tasks(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[ExtractionTaskSummaryResponse]:
-    """返回任务队列；只包含当前用户自己的提交状态。"""
+    """返回任务队列；普通用户只看自己的状态，管理员额外看到槽位标注员。"""
 
     return _run_service(lambda: ExtractionAnnotationService(db).list_tasks(current_user))
 
@@ -76,6 +76,27 @@ def claim_extraction_task(
 ) -> ExtractionTaskDetailResponse:
     return _run_service(
         lambda: ExtractionAnnotationService(db).claim_task(task_id, current_user)
+    )
+
+
+@router.delete(
+    "/tasks/{task_id}/submissions/{submission_id}",
+    response_model=ExtractionTaskSummaryResponse,
+)
+def release_extraction_draft(
+    task_id: int,
+    submission_id: int,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+) -> ExtractionTaskSummaryResponse:
+    """管理员释放误领的未提交草稿槽位；已提交结果不可释放。"""
+
+    return _run_service(
+        lambda: ExtractionAnnotationService(db).release_draft(
+            task_id,
+            submission_id,
+            current_user,
+        )
     )
 
 

@@ -98,6 +98,10 @@ def test_claimed_submissions_are_blind_and_revision_is_optimistic(annotation_db)
         ExtractionTaskCreateRequest(passage_id=passage.doc_id),
         admin,
     )
+    assert task.claimed_count == 0
+    assert task.available_slots == 2
+    assert task.submission_id is None
+    assert task.assignments == []
 
     with pytest.raises(AnnotationForbiddenError):
         service.get_task_detail(task.id, annotator_a)
@@ -127,6 +131,46 @@ def test_claimed_submissions_are_blind_and_revision_is_optimistic(annotation_db)
     )
     assert submitted.submission.state == "submitted"
     assert submitted.submission.revision == 2
+
+
+def test_admin_can_see_assignees_and_release_only_unsubmitted_drafts(annotation_db):
+    db, admin, annotator_a, annotator_b, passage = annotation_db
+    service = ExtractionAnnotationService(db)
+    task = service.create_task(
+        ExtractionTaskCreateRequest(passage_id=passage.doc_id),
+        admin,
+    )
+    claimed = service.claim_task(task.id, annotator_a)
+
+    admin_summary = service.list_tasks(admin)[0]
+    assert len(admin_summary.assignments) == 1
+    assert admin_summary.assignments[0].submission_id == claimed.submission.id
+    assert admin_summary.assignments[0].annotator_id == annotator_a.id
+    assert admin_summary.assignments[0].annotator_email == annotator_a.email
+    assert admin_summary.assignments[0].state == "draft"
+
+    annotator_summary = service.list_tasks(annotator_b)[0]
+    assert annotator_summary.assignments == []
+
+    with pytest.raises(AnnotationForbiddenError):
+        service.release_draft(task.id, claimed.submission.id, annotator_b)
+
+    released = service.release_draft(task.id, claimed.submission.id, admin)
+    assert released.status == "open"
+    assert released.claimed_count == 0
+    assert released.available_slots == 2
+    assert released.assignments == []
+
+    replacement = service.claim_task(task.id, annotator_b)
+    assert replacement.submission.slot_no == 1
+    submitted = service.submit(
+        task.id,
+        annotator_b,
+        replacement.submission.revision,
+        _person_label(passage.context),
+    )
+    with pytest.raises(AnnotationConflictError):
+        service.release_draft(task.id, submitted.submission.id, admin)
 
 
 def test_draft_rejects_evidence_that_cannot_replay(annotation_db):
