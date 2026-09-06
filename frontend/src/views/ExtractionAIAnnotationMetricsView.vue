@@ -216,9 +216,9 @@ onMounted(() => {
             <small>{{ formatNumber(summary?.submitted_count) }} 次已提交</small>
           </article>
           <article>
-            <span>首轮通过率</span>
-            <strong>{{ formatPercent(summary?.first_pass_valid_rate) }}</strong>
-            <small>{{ formatNumber(summary?.total_first_round_errors) }} 条首轮错误</small>
+            <span>人工首轮正确率</span>
+            <strong>{{ formatPercent(summary?.average_human_accuracy) }}</strong>
+            <small>{{ formatNumber(summary?.human_reviewed_count) }} 次已质检 · 规则通过 {{ formatPercent(summary?.first_pass_valid_rate) }}</small>
           </article>
           <article>
             <span>点击 → 提交</span>
@@ -397,7 +397,10 @@ onMounted(() => {
                       <b class="quality" :data-status="record.first_round_validation_status">
                         {{ firstRoundLabel(record.first_round_validation_status) }}
                       </b>
-                      <span>{{ record.first_round_errors.length }} 错误 · {{ record.final_difference_count }} 修改</span>
+                      <span v-if="record.human_review_status === 'submitted'">
+                        人工 {{ formatPercent(record.human_review_accuracy) }} · 错 {{ record.human_review_incorrect_count }} / 漏 {{ record.human_review_omission_count }}
+                      </span>
+                      <span v-else>{{ record.first_round_errors.length }} 规则错误 · {{ record.final_difference_count }} 修改</span>
                     </td>
                     <td>
                       <strong>{{ formatDuration(record.end_to_end_ms) }}</strong>
@@ -456,6 +459,12 @@ onMounted(() => {
                           </section>
                           <section>
                             <span>FIRST-ROUND ISSUES</span>
+                            <p v-if="record.human_review_status === 'submitted'" class="human-review-summary">
+                              人工首轮正确率 {{ formatPercent(record.human_review_accuracy) }}：
+                              {{ record.human_review_correct_count }} 项正确，
+                              {{ record.human_review_incorrect_count }} 项错误，
+                              {{ record.human_review_omission_count }} 项缺漏。
+                            </p>
                             <ul v-if="record.first_round_errors.length">
                               <li v-for="issue in record.first_round_errors" :key="`${issue.path}:${issue.code}`">
                                 <code>{{ issue.code }}</code>
@@ -652,6 +661,7 @@ onMounted(() => {
 .detail-columns li code { color: var(--red); }
 .detail-columns li strong { overflow: hidden; color: #566680; text-overflow: ellipsis; white-space: nowrap; }
 .detail-columns li p { grid-column: 1 / -1; margin: 0; color: var(--muted); }
+.human-review-summary { margin: 10px 0 0; padding: 7px 8px; border-left: 2px solid #3a9b70; background: #eef9f4; color: #3c705a; font-size: 9px; line-height: 1.55; }
 .detail-empty { margin: 10px 0 0; color: var(--muted); font-size: 9px; }
 .table-state { min-height: 160px; display: grid; place-content: center; color: var(--muted); font-size: 10px; }
 

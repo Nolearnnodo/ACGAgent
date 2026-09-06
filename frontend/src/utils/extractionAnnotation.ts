@@ -28,6 +28,31 @@ export interface ClientCheck {
   message: string
 }
 
+export type EvidenceGranularityKind = 'entity' | 'fact'
+
+export function evidenceGranularityIssue(
+  evidence: EvidenceSpan | null,
+  kind: EvidenceGranularityKind,
+) {
+  if (!evidence) return ''
+  const quote = evidence.quote
+  if (quote !== quote.trim()) return '选区首尾含空白，请重新划选。'
+  if (kind === 'entity') {
+    if (quote.length > 24 || /[，。！？；：、,.!?;:\n\r]/.test(quote)) {
+      return '实体范围过大：只选择姓名、称谓或稳定指代本身，不要选择完整句子。'
+    }
+    return ''
+  }
+  if (
+    quote.length > 64
+    || /[。！？；\n\r]/.test(quote)
+    || (quote.length > 32 && /[，：]/.test(quote))
+  ) {
+    return '事实范围过大：请选择最小充分短语，跨句事实拆成多条短证据。'
+  }
+  return ''
+}
+
 export function uid(prefix: string) {
   const suffix = typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID()
@@ -248,6 +273,38 @@ export function collectHighlights(label: ExtractionAnnotationLabel | null): Anno
 export function runClientChecks(label: ExtractionAnnotationLabel | null): ClientCheck[] {
   if (!label) return []
   const checks: ClientCheck[] = []
+
+  const checkEvidence = (evidence: EvidenceSpan, kind: EvidenceGranularityKind, owner: string) => {
+    const message = evidenceGranularityIssue(evidence, kind)
+    if (message) checks.push({ level: 'error', message: `${owner}：${message}` })
+  }
+  for (const person of label.persons) {
+    for (const evidence of person.mentions) {
+      checkEvidence(evidence, 'entity', `${person.name_surface || person.key} 的人物证据`)
+    }
+    for (const event of person.life_events) {
+      for (const evidence of event.evidence) {
+        checkEvidence(evidence, 'fact', `${person.name_surface || person.key} 的${event.event_type}证据`)
+      }
+    }
+    for (const event of person.historical_events) {
+      for (const evidence of event.evidence) {
+        checkEvidence(evidence, 'fact', `${event.event_name || '历史事件'}证据`)
+      }
+    }
+  }
+  for (const relation of label.person_relations) {
+    for (const evidence of relation.evidence) checkEvidence(evidence, 'fact', '人物关系证据')
+  }
+  for (const excluded of label.excluded_mentions) {
+    for (const evidence of excluded.evidence) checkEvidence(evidence, 'entity', '排除称谓证据')
+  }
+  for (const unresolved of label.unresolved_items) {
+    for (const evidence of unresolved.evidence) checkEvidence(evidence, 'fact', '待判断项证据')
+  }
+  for (const conflict of label.schema_conflicts) {
+    for (const evidence of conflict.evidence) checkEvidence(evidence, 'fact', 'Schema 冲突证据')
+  }
   if (!label.persons.length) {
     checks.push({ level: 'error', message: '至少需要建立一位人物。' })
     return checks

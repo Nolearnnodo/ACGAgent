@@ -5,7 +5,7 @@
 便于和简略提示词的产出进行对照。
 """
 
-AI_ANNOTATION_PROMPT_VERSION = "2026-08-25-v0.3.0"
+AI_ANNOTATION_PROMPT_VERSION = "2026-09-07-v0.4.0"
 
 
 AI_ANNOTATION_FORMAT_REQUIREMENTS = """输出必须满足下面的当前 ExtractionAnnotationLabel 格式契约。
@@ -96,6 +96,9 @@ passage 必须包含且只能包含：
 十、EvidenceSpan 的硬约束
 mentions、life_events、historical_events、person_relations、excluded_mentions、unresolved_items、schema_conflicts 中使用 evidence 时，每条证据必须包含 id、source、quote、start、end、start_utf16、end_utf16；当前接口 source 只能是 "context"。
 - quote 必须是 context 中原样连续子串，保留繁简、异体、OCR 符号、空格和换行，不能现代化改写，不能使用 title 文字冒充 context。
+- 划线粒度必须集中于实体或最小充分事实短语，禁止为了“证据看起来完整”而复制整句或整段。人物 mentions 和 excluded_mentions 只取姓名、称谓或稳定指代本身，例如只取“李白”或“太白”，不能取“李白字太白，少有逸才”。
+- 时间、地点、官职分别取原文实体短语；事件证据取人物指代、事件触发词及必要宾语构成的最小短语；人物关系取两端指代和关系触发词构成的最小短语。一个事实需要跨句支持时，使用多条短 evidence，不要扩大成一整句或一整段。
+- quote 首尾不得带空白或无关标点。人物/称谓证据不得包含句内标点且通常不超过 24 字；其他事实证据不得包含句末标点且通常不超过 64 字。确有多个必要成分时优先拆成多条证据。
 - start/end 是 Python Unicode code point 偏移，end 开区间；必须满足 context[start:end] == quote。
 - start_utf16/end_utf16 是 JavaScript UTF-16 code unit 偏移，end 同样开区间；必须按 context[:start] 和 context[:end] 的 UTF-16 长度分别计算，不能直接复制 start/end。遇到𠮷、𠀀、emoji 等扩展字符尤其要重新计算。
 - 证据 id 在整份标签内保持唯一，建议按 p1-m1、p1-e1-x1、p1-h1-x1、r1-x1、u1-x1 等方式命名。重复短语出现多次时，扩大 quote 或选择准确的实际出现位置。
@@ -162,6 +165,7 @@ AI_ANNOTATION_FRAGMENT_COMMON_RULES = """你正在执行 ACGAgent 功能 A 的�
 证据只能来自 context。每条证据使用紧凑形式 {"quote":"原文连续片段","start":整数,"end":整数}；
 start/end 是 Python Unicode code point 的半开区间，若无法可靠计算可省略，服务端会依据 quote 回放并校验。
 quote 必须逐字复制 context，不能改繁简、标点、空格或换行；不能把 title 当作 context 证据。
+划线必须落在实体或最小充分事实短语上：人物 mention 只取姓名、称谓或稳定指代；时间、地点、官职只取对应实体；事件和关系只取必要的触发短语。禁止输出完整句子或段落，跨句支持请拆成多条短 evidence；quote 首尾不要带空白或无关标点。
 省略的数组由服务端补为空数组，省略的字符串由服务端补为空字符串，省略的枚举字段使用 Schema 默认值。
 不要输出本分片之外的字段，不要输出 metadata、task_id、passage_id、context、context_sha256。
 """

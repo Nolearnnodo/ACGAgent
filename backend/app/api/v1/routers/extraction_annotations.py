@@ -15,6 +15,8 @@ from app.schemas.extraction_annotation import (
     AIAnnotationPromptRequest,
     AIAnnotationPromptResponse,
     AIAnnotationRepairRequest,
+    AIAnnotationReviewResponse,
+    AIAnnotationReviewUpdateRequest,
     AIAnnotationResultResponse,
     AIAnnotationTaskContextResponse,
     AIAnnotationValidateRequest,
@@ -46,6 +48,9 @@ from app.services.extraction_ai_annotation_service import ExtractionAIAnnotation
 from app.services.extraction_ai_annotation_job_service import ExtractionAIAnnotationJobService
 from app.services.extraction_ai_annotation_metrics_service import (
     ExtractionAIAnnotationMetricsService,
+)
+from app.services.extraction_ai_annotation_review_service import (
+    ExtractionAIAnnotationReviewService,
 )
 
 
@@ -105,6 +110,55 @@ def get_ai_extraction_annotation_job(
     """返回一条持久化 AI 标注任务及其结果或错误。"""
 
     return _run_service(lambda: ExtractionAIAnnotationJobService(db).get_job(job_id, current_user))
+
+
+@router.get("/ai/jobs/{job_id}/review", response_model=AIAnnotationReviewResponse)
+def get_ai_extraction_annotation_review(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationReviewResponse:
+    """返回不可变首轮 AI 结果的完整规范与逐项人工质检草稿。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationReviewService(db).get_review(job_id, current_user)
+    )
+
+
+@router.put("/ai/jobs/{job_id}/review", response_model=AIAnnotationReviewResponse)
+def save_ai_extraction_annotation_review(
+    job_id: int,
+    payload: AIAnnotationReviewUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationReviewResponse:
+    """保存首轮 AI 人工质检草稿并重新计算正确率。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationReviewService(db).save_review(
+            job_id,
+            payload,
+            current_user,
+        )
+    )
+
+
+@router.post("/ai/jobs/{job_id}/review/submit", response_model=AIAnnotationReviewResponse)
+def submit_ai_extraction_annotation_review(
+    job_id: int,
+    payload: AIAnnotationReviewUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationReviewResponse:
+    """校验并锁定首轮 AI 人工质检结果。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationReviewService(db).submit_review(
+            job_id,
+            payload,
+            current_user,
+        )
+    )
 
 
 @router.get("/ai/tasks/{task_id}", response_model=AIAnnotationTaskContextResponse)

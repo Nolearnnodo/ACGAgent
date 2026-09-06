@@ -41,6 +41,27 @@ function utf16ToCodePointOffset(text: string, offset: number) {
   return Array.from(text.slice(0, offset)).length
 }
 
+function normalizeSelection(selector: { quote: string; start: number; end: number }) {
+  const outerMarks = /[\s，。；！？：、,.!?;:“”‘’（）()《》〈〉【】〔〕\[\]]/
+  let leadingLength = 0
+  let trailingLength = 0
+  while (
+    leadingLength < selector.quote.length
+    && outerMarks.test(selector.quote[leadingLength] ?? '')
+  ) leadingLength += 1
+  while (
+    trailingLength < selector.quote.length - leadingLength
+    && outerMarks.test(selector.quote[selector.quote.length - trailingLength - 1] ?? '')
+  ) trailingLength += 1
+  const start = selector.start + leadingLength
+  const end = selector.end - trailingLength
+  return {
+    quote: props.text.slice(start, end),
+    start,
+    end,
+  }
+}
+
 function toAnnotation(highlight: AnnotationHighlight): TextAnnotation {
   return {
     id: highlight.id,
@@ -93,16 +114,21 @@ function createAnnotator() {
       annotator?.removeAnnotation(annotation.id)
       return
     }
+    const normalized = normalizeSelection(selector)
+    if (normalized.end <= normalized.start || !normalized.quote) {
+      annotator?.removeAnnotation(annotation.id)
+      return
+    }
     const evidence: EvidenceSpan = {
       id: typeof crypto !== 'undefined' && 'randomUUID' in crypto
         ? `evidence-${crypto.randomUUID()}`
         : `evidence-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       source: 'context',
-      quote: selector.quote,
-      start: utf16ToCodePointOffset(props.text, selector.start),
-      end: utf16ToCodePointOffset(props.text, selector.end),
-      start_utf16: selector.start,
-      end_utf16: selector.end,
+      quote: normalized.quote,
+      start: utf16ToCodePointOffset(props.text, normalized.start),
+      end: utf16ToCodePointOffset(props.text, normalized.end),
+      start_utf16: normalized.start,
+      end_utf16: normalized.end,
     }
     annotator?.removeAnnotation(annotation.id)
     emit('selectionCreated', evidence)

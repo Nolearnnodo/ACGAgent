@@ -107,8 +107,16 @@ const canImport = computed(() => Boolean(
   && selectedTask.value.submission_state === 'draft'
   && selectedTask.value.revision !== null
   && result.value?.document
+  && selectedJob.value?.review_status === 'submitted'
   && !repairing.value
   && !importing.value,
+))
+
+const canReview = computed(() => Boolean(
+  selectedJob.value
+  && selectedJob.value.status === 'success'
+  && selectedJob.value.generation_job_id
+  && (selectedJob.value.result?.document || selectedJob.value.saved_result?.document),
 ))
 
 const canRepair = computed(() => Boolean(
@@ -367,7 +375,9 @@ function aiJobStatusHint(job?: AIAnnotationJob | null) {
   if (job.status === 'running') return `后台正在执行${aiJobOperationLabel(job)}；切换篇目不会影响这条任务。`
   if (job.status === 'failed') return job.error_message || '后台任务失败，请检查配置后重新发送。'
   return (job.saved_result ?? job.result)?.validation_status === 'valid'
-    ? '结果已保存到服务器的当前篇目记录，可继续编辑、下载或导入。'
+    ? job.review_status === 'submitted'
+      ? '结果与首轮质检均已保存，可继续编辑、下载或导入。'
+      : '结果已保存到服务器；请先完成首轮质检，再导入盲标草稿补改。'
     : '结果已保存到服务器的当前篇目记录，请先修订并重新校验 JSON。'
 }
 
@@ -388,9 +398,14 @@ function resultStatusLabel(status?: AIAnnotationResult['validation_status']) {
   return '等待生成'
 }
 
-function resultStatusHint(status?: AIAnnotationResult['validation_status']) {
-  if (status === 'valid') return '可以下载，也可以导入当前篇目的独立盲标草稿。'
-  if (status === 'invalid_rules') return '仍可导入独立盲标草稿；约束错误会保留，等待人工修改，也可以调用 API 修复问题。'
+function resultStatusHint(
+  status?: AIAnnotationResult['validation_status'],
+  reviewStatus?: AIAnnotationJob['review_status'],
+) {
+  if (status === 'valid') return reviewStatus === 'submitted'
+    ? '标注与首轮质检均已完成，可下载或导入当前篇目的独立盲标草稿。'
+    : '结果已生成；请先完成首轮质检，通过后即可导入当前篇目的独立盲标草稿。'
+  if (status === 'invalid_rules') return '可先在首轮质检中逐项记录问题；完成质检后再导入独立盲标草稿修改，也可以调用 API 修复。'
   if (status === 'invalid_format') return '只有无法解析为 JSON 时不能导入；请先修正 JSON 结构或调用 API 修复问题。'
   return '选择左侧篇目后填写调用配置。'
 }
@@ -730,7 +745,7 @@ onBeforeUnmount(() => {
                 <button class="prompt-viewer__toggle" type="button" @click="togglePrompt">
                   <span>
                     <strong>查看本次实际提示词</strong>
-                    <small>按照 2026-08-25 分片规范生成，默认使用完整详细规则</small>
+                    <small>按照 2026-09-07 实体级证据规范生成，默认使用完整详细规则</small>
                   </span>
                   <b>{{ promptOpen ? '收起' : '展开' }}</b>
                 </button>
@@ -778,7 +793,7 @@ onBeforeUnmount(() => {
                   {{ resultStatusLabel(result?.validation_status) }}
                 </b>
               </header>
-              <p class="result-hint">{{ resultStatusHint(result?.validation_status) }}</p>
+              <p class="result-hint">{{ resultStatusHint(result?.validation_status, selectedJob?.review_status) }}</p>
 
               <div
                 v-if="selectedJob"
@@ -807,6 +822,9 @@ onBeforeUnmount(() => {
                   {{ result.fragment_warnings?.length ?? 0 }} 个分片待人工复核
                 </span>
                 <span v-if="result.document">人物 {{ result.document.label.persons.length }} · 关系 {{ result.document.label.person_relations.length }}</span>
+                <span v-if="selectedJob?.review_status === 'submitted'" class="result-summary__reviewed">
+                  首轮质检 {{ ((selectedJob.review_accuracy ?? 0) * 100).toFixed(1) }}%
+                </span>
               </div>
 
               <div v-if="result?.validation_issues.length" class="issue-list">
@@ -835,6 +853,17 @@ onBeforeUnmount(() => {
                 />
               </label>
               <div class="result-actions">
+                <RouterLink
+                  v-if="canReview && selectedJob"
+                  class="button button--review"
+                  :to="`/annotations/extraction/ai/review/${selectedJob.id}`"
+                >
+                  {{ selectedJob.review_status === 'submitted'
+                    ? '查看首轮质检'
+                    : selectedJob.review_status === 'draft'
+                      ? '继续首轮质检'
+                      : '开始首轮质检' }}
+                </RouterLink>
                 <button
                   v-if="result && result.validation_status !== 'valid'"
                   class="button button--repair"
@@ -864,6 +893,8 @@ onBeforeUnmount(() => {
                   ? '当前输出无法解析为 JSON，修复或整理 JSON 后才能导入。'
                   : selectedTask.submission_state === 'submitted'
                   ? '当前篇目的盲标已提交，不能覆盖；可下载后另行处理。'
+                  : selectedJob?.review_status !== 'submitted'
+                  ? '请先完成首轮逐项质检，记录错误和缺漏后再导入盲标草稿补改。'
                   : '要一键导入，请先在独立盲标页面领取该篇目的草稿槽位。' }}
               </p>
             </section>
@@ -1028,6 +1059,7 @@ onBeforeUnmount(() => {
 .job-status[data-status='failed'] .job-status__heading strong, .job-status[data-status='failed'] p { color: #b44e55; }
 .result-summary { flex-wrap: wrap; gap: 5px 10px; color: #7183a8; font: 9px ui-monospace, monospace; }
 .result-summary__warning { color: #b06a00; }
+.result-summary__reviewed { color: #258660; font-weight: 700; }
 .issue-list { display: grid; gap: 7px; padding: 10px; border: 1px solid #f2d9d9; border-radius: 10px; background: #fff8f8; }
 .issue-list__heading { display: flex; justify-content: space-between; color: #b44e55; font-size: 10px; }
 .issue-list__heading span { color: #c9898d; }
@@ -1038,6 +1070,8 @@ onBeforeUnmount(() => {
 .json-editor { min-height: 280px; color: #344e7d !important; font: 10px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace !important; white-space: pre; tab-size: 2; }
 .result-actions { flex-wrap: wrap; gap: 7px; }
 .result-actions .button { flex: 1 1 auto; }
+.result-actions a { box-sizing: border-box; text-decoration: none; }
+.result-actions .button--review { border-color: #91ace1; background: #eaf1ff; color: #2f6fed; }
 .repair-note { margin: -3px 0 0; color: #8b7b62; font-size: 9px; line-height: 1.55; }
 .import-note { color: #8b7b62; }
 .inspector__footer { min-height: 39px; display: flex; align-items: center; padding: 9px 14px; border-top: 1px solid #e4ebf7; background: #f5f8ff; color: var(--muted); font-size: 9px; line-height: 1.4; }

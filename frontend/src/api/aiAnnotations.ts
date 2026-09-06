@@ -115,8 +115,77 @@ export interface AIAnnotationJob {
   first_round_truncated_count: number
   final_difference_count: number
   saved_result_source_job_id: number | null
+  generation_job_id: number | null
+  review_status: 'not_started' | 'draft' | 'submitted'
+  review_accuracy: number | null
   result: AIAnnotationResult | null
   saved_result: AIAnnotationResult | null
+}
+
+export type AIAnnotationReviewVerdict = 'unreviewed' | 'correct' | 'incorrect'
+
+export interface AIAnnotationReviewStandard {
+  id: string
+  group: string
+  title: string
+  instruction: string
+}
+
+export interface AIAnnotationReviewItem {
+  id: string
+  category: string
+  path: string
+  title: string
+  question: string
+  detail: string
+  standard_ids: string[]
+  evidence: import('./extractionAnnotations').EvidenceSpan[]
+  verdict: AIAnnotationReviewVerdict
+  reason: string
+}
+
+export interface AIAnnotationReviewOmission {
+  id: string
+  category: string
+  target_path: string
+  description: string
+  correction: string
+  evidence: import('./extractionAnnotations').EvidenceSpan[]
+  evidence_note: string
+}
+
+export interface AIAnnotationReviewSummary {
+  total_item_count: number
+  reviewed_item_count: number
+  correct_count: number
+  incorrect_count: number
+  unreviewed_count: number
+  omission_count: number
+  accuracy: number
+}
+
+export interface AIAnnotationReview {
+  id: number | null
+  generation_job_id: number
+  task_id: number
+  passage_id: number
+  passage_title: string
+  passage_context: string
+  status: 'draft' | 'submitted'
+  standard_version: string
+  standards: AIAnnotationReviewStandard[]
+  items: AIAnnotationReviewItem[]
+  omissions: AIAnnotationReviewOmission[]
+  summary: AIAnnotationReviewSummary
+  reviewer_id: number
+  created_at: string | null
+  updated_at: string | null
+  submitted_at: string | null
+}
+
+export interface AIAnnotationReviewUpdate {
+  decisions: Array<Pick<AIAnnotationReviewItem, 'id' | 'verdict' | 'reason'>>
+  omissions: AIAnnotationReviewOmission[]
 }
 
 export async function generateAIAnnotation(
@@ -153,6 +222,56 @@ export async function listAIAnnotationJobs() {
 export async function fetchAIAnnotationJob(jobId: number) {
   const { data } = await apiClient.get<AIAnnotationJob>(
     `/annotations/extraction/ai/jobs/${jobId}`,
+  )
+  return data
+}
+
+export async function fetchAIAnnotationReview(jobId: number) {
+  const { data } = await apiClient.get<AIAnnotationReview>(
+    `/annotations/extraction/ai/jobs/${jobId}/review`,
+  )
+  return data
+}
+
+function reviewPayload(review: AIAnnotationReview): AIAnnotationReviewUpdate {
+  return {
+    decisions: review.items.map((item) => ({
+      id: item.id,
+      verdict: item.verdict,
+      reason: item.reason,
+    })),
+    omissions: review.omissions,
+  }
+}
+
+export async function saveAIAnnotationReview(jobId: number, review: AIAnnotationReview) {
+  const payload = reviewPayload(review)
+  const { data } = await apiClient.put<AIAnnotationReview>(
+    `/annotations/extraction/ai/jobs/${jobId}/review`,
+    {
+      decisions: payload.decisions.map(({ id, verdict, reason }) => ({
+        item_id: id,
+        verdict,
+        reason,
+      })),
+      omissions: payload.omissions,
+    },
+  )
+  return data
+}
+
+export async function submitAIAnnotationReview(jobId: number, review: AIAnnotationReview) {
+  const payload = reviewPayload(review)
+  const { data } = await apiClient.post<AIAnnotationReview>(
+    `/annotations/extraction/ai/jobs/${jobId}/review/submit`,
+    {
+      decisions: payload.decisions.map(({ id, verdict, reason }) => ({
+        item_id: id,
+        verdict,
+        reason,
+      })),
+      omissions: payload.omissions,
+    },
   )
   return data
 }
@@ -244,6 +363,11 @@ export interface AIAnnotationMetricsSummary {
   total_repair_rounds: number
   total_first_round_errors: number
   total_final_differences: number
+  human_reviewed_count: number
+  average_human_accuracy: number
+  total_human_correct: number
+  total_human_incorrect: number
+  total_human_omissions: number
 }
 
 export interface AIAnnotationMetricsRecord {
@@ -272,6 +396,12 @@ export interface AIAnnotationMetricsRecord {
   first_round_truncated_count: number
   final_difference_count: number
   final_difference_categories: Record<string, number>
+  human_review_status: string
+  human_review_accuracy: number | null
+  human_review_correct_count: number
+  human_review_incorrect_count: number
+  human_review_omission_count: number
+  human_review_submitted_at: string | null
   submission_id: number | null
 }
 

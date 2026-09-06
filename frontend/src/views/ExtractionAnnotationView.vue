@@ -46,6 +46,7 @@ import {
   createLifeEvent,
   createPerson,
   createPersonRelation,
+  evidenceGranularityIssue,
   parseRelationCodes,
   relationReverseSuggestions,
   runClientChecks,
@@ -143,6 +144,8 @@ const reverseSuggestions = computed(() =>
   currentRelation.value ? relationReverseSuggestions(currentRelation.value.codes) : [],
 )
 const relationPersons = computed(() => label.value?.persons.filter((person) => person.level !== 3) ?? [])
+const pendingEntityIssue = computed(() => evidenceGranularityIssue(pendingEvidence.value, 'entity'))
+const pendingFactIssue = computed(() => evidenceGranularityIssue(pendingEvidence.value, 'fact'))
 
 watch(currentPerson, (person) => {
   titlesDraft.value = person?.titles.join('\n') ?? ''
@@ -609,7 +612,7 @@ function handleSelectionCreated(evidence: EvidenceSpan) {
 }
 
 function createPersonFromSelection() {
-  if (!label.value || !pendingEvidence.value) return
+  if (!label.value || !pendingEvidence.value || pendingEntityIssue.value) return
   const person = createPerson(pendingEvidence.value)
   label.value.persons.push(person)
   activePersonKey.value = person.key
@@ -627,14 +630,14 @@ function addBlankPerson() {
 }
 
 function addMentionToCurrentPerson() {
-  if (!currentPerson.value || !pendingEvidence.value) return
+  if (!currentPerson.value || !pendingEvidence.value || pendingEntityIssue.value) return
   currentPerson.value.mentions.push(pendingEvidence.value)
   activeEvidenceId.value = pendingEvidence.value.id
   pendingEvidence.value = null
 }
 
 function addEvidenceToCurrentFact() {
-  if (!pendingEvidence.value) return
+  if (!pendingEvidence.value || pendingFactIssue.value) return
   if (activeStep.value === 'events' && currentEvent.value) {
     currentEvent.value.evidence.push(pendingEvidence.value)
   } else if (activeStep.value === 'events' && currentHistoricalEvent.value) {
@@ -649,7 +652,7 @@ function addEvidenceToCurrentFact() {
 }
 
 function excludePendingSelection() {
-  if (!label.value || !pendingEvidence.value) return
+  if (!label.value || !pendingEvidence.value || pendingEntityIssue.value) return
   label.value.excluded_mentions.push({
     key: uid('excluded'),
     reason: '匿名泛称（待核对）',
@@ -660,7 +663,7 @@ function excludePendingSelection() {
 }
 
 function markPendingUnresolved() {
-  if (!label.value || !pendingEvidence.value) return
+  if (!label.value || !pendingEvidence.value || pendingFactIssue.value) return
   label.value.unresolved_items.push({
     key: uid('unresolved'),
     category: '人物或事实',
@@ -1108,21 +1111,28 @@ onBeforeUnmount(() => {
                 <div>
                   <span>已选择 {{ pendingEvidence.end - pendingEvidence.start }} 字</span>
                   <strong>“{{ pendingEvidence.quote }}”</strong>
+                  <small v-if="pendingEntityIssue" class="selection-dock__warning">
+                    人物/称谓：{{ pendingEntityIssue }}
+                  </small>
+                  <small v-if="pendingFactIssue" class="selection-dock__warning">
+                    事实/待定：{{ pendingFactIssue }}
+                  </small>
                 </div>
                 <div class="selection-dock__actions">
-                  <button type="button" @click="createPersonFromSelection">新建人物</button>
+                  <button type="button" :disabled="Boolean(pendingEntityIssue)" @click="createPersonFromSelection">新建人物</button>
                   <button
                     type="button"
-                    :disabled="!currentPerson"
+                    :disabled="!currentPerson || Boolean(pendingEntityIssue)"
                     @click="addMentionToCurrentPerson"
                   >添加为人物指代</button>
                   <button
                     v-if="pendingTargetLabel"
                     type="button"
+                    :disabled="Boolean(pendingFactIssue)"
                     @click="addEvidenceToCurrentFact"
                   >作为{{ pendingTargetLabel }}证据</button>
-                  <button type="button" @click="excludePendingSelection">排除称谓</button>
-                  <button type="button" @click="markPendingUnresolved">暂不能判断</button>
+                  <button type="button" :disabled="Boolean(pendingEntityIssue)" @click="excludePendingSelection">排除称谓</button>
+                  <button type="button" :disabled="Boolean(pendingFactIssue)" @click="markPendingUnresolved">暂不能判断</button>
                 </div>
               </div>
             </Transition>
@@ -1983,6 +1993,7 @@ onBeforeUnmount(() => {
 .selection-dock > div:first-of-type { min-width: 0; display: grid; gap: 2px; }
 .selection-dock span { color: #bdb4a8; font-size: 9px; text-transform: uppercase; }
 .selection-dock strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 13px 'Noto Serif SC', serif; }
+.selection-dock__warning { color: #ffb8aa; font-size: 10px; line-height: 1.35; }
 .selection-dock__actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .selection-dock__actions button { border: 1px solid #6b655d; padding: 6px 8px; background: transparent; color: #f7efe5; font-size: 10px; cursor: pointer; }
 .selection-dock__actions button:first-child { border-color: #cf6a56; background: var(--vermilion); }

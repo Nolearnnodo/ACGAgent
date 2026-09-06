@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models.extraction_ai_annotation import (
     ExtractionAIAnnotationJob,
+    ExtractionAIAnnotationReview,
     ExtractionAIAnnotationSavedResult,
 )
 from app.models.passage import Passage
@@ -400,6 +401,27 @@ class ExtractionAIAnnotationJobService:
         # 下次生成或重新校验时会补写新表。
         if saved_result is None and job.status == "success":
             saved_result = job_result
+        generation_job: ExtractionAIAnnotationJob | None = job
+        visited: set[int] = set()
+        while generation_job is not None and generation_job.operation != "generate":
+            if generation_job.id in visited or generation_job.source_job_id is None:
+                generation_job = None
+                break
+            visited.add(generation_job.id)
+            generation_job = self.db.get(
+                ExtractionAIAnnotationJob,
+                generation_job.source_job_id,
+            )
+        review = (
+            self.db.query(ExtractionAIAnnotationReview)
+            .filter(
+                ExtractionAIAnnotationReview.generation_job_id == generation_job.id,
+                ExtractionAIAnnotationReview.reviewer_id == job.requested_by,
+            )
+            .first()
+            if generation_job is not None
+            else None
+        )
         return AIAnnotationJobResponse(
             id=job.id,
             task_id=job.task_id,
@@ -431,6 +453,11 @@ class ExtractionAIAnnotationJobService:
             final_difference_count=job.final_difference_count,
             saved_result_source_job_id=(
                 saved_row.source_job_id if saved_row is not None else None
+            ),
+            generation_job_id=generation_job.id if generation_job is not None else None,
+            review_status=(review.status if review is not None else "not_started"),
+            review_accuracy=(
+                review.accuracy_basis_points / 10_000 if review is not None else None
             ),
             result=job_result,
             saved_result=saved_result,

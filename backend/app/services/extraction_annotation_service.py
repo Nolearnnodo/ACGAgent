@@ -7,7 +7,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from itertools import product
-from typing import Iterable
+from typing import Iterable, Literal
 
 import yaml
 from pydantic import ValidationError
@@ -180,6 +180,58 @@ def validate_evidence_offsets(
     return issues
 
 
+def evidence_granularity_issue(
+    evidence: EvidenceSpan,
+    kind: Literal["entity", "fact"],
+) -> tuple[str, str] | None:
+    """返回单条证据的粒度错误代码和说明。"""
+
+    sentence_endings = "。！？；\n\r"
+    clause_marks = "，："
+    entity_punctuation = "，。！？；：、,.!?;:\n\r"
+    quote = evidence.quote
+    if quote != quote.strip():
+        return (
+            "evidence_outer_whitespace",
+            "证据首尾不能包含空白，请只保留实体或最小事实短语。",
+        )
+    if kind == "entity":
+        if len(quote) > 24 or any(mark in quote for mark in entity_punctuation):
+            return (
+                "entity_evidence_too_broad",
+                "人物或称谓证据范围过大；请只划选姓名、称谓或稳定指代本身，不要选择完整句子。",
+            )
+        return None
+    if (
+        len(quote) > 64
+        or any(mark in quote for mark in sentence_endings)
+        or (len(quote) > 32 and any(mark in quote for mark in clause_marks))
+    ):
+        return (
+            "fact_evidence_too_broad",
+            "事实证据范围过大；请改为最小充分短语，跨句事实使用多条短证据。",
+        )
+    return None
+
+
+def validate_evidence_granularity(
+    label: ExtractionAnnotationLabel,
+) -> list[dict[str, str]]:
+    """阻止用完整句段替代实体或最小充分事实短语。"""
+
+    issues: list[dict[str, str]] = []
+    for path, evidence in _iter_evidence(label):
+        is_entity = ".mentions." in path or path.startswith("excluded_mentions.")
+        granularity_issue = evidence_granularity_issue(
+            evidence,
+            "entity" if is_entity else "fact",
+        )
+        if granularity_issue is not None:
+            code, message = granularity_issue
+            issues.append(_issue(path, message, code))
+    return issues
+
+
 def discard_out_of_range_evidence(
     label: ExtractionAnnotationLabel,
     context: str,
@@ -225,7 +277,10 @@ def validate_for_submission(
 ) -> list[dict[str, str]]:
     """执行提交级阻断校验；草稿只校验证据可回放。"""
 
-    issues = validate_evidence_offsets(label, context)
+    issues = [
+        *validate_evidence_offsets(label, context),
+        *validate_evidence_granularity(label),
+    ]
     if label.schema_version != spec_version:
         issues.append(
             _issue("schema_version", "标签规范版本与任务版本不一致。", "schema_version_mismatch")

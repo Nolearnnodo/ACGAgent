@@ -9,7 +9,10 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.models.extraction_ai_annotation import ExtractionAIAnnotationJob
+from app.models.extraction_ai_annotation import (
+    ExtractionAIAnnotationJob,
+    ExtractionAIAnnotationReview,
+)
 from app.models.extraction_annotation import ExtractionAnnotationSubmission
 from app.models.passage import Passage
 from app.models.user import User
@@ -227,6 +230,16 @@ class ExtractionAIAnnotationMetricsService:
             .filter(User.id.in_({root.requested_by for root in roots}))
             .all()
         } if roots else {}
+        reviews_by_root = {
+            review.generation_job_id: review
+            for review in self.db.query(ExtractionAIAnnotationReview)
+            .filter(
+                ExtractionAIAnnotationReview.generation_job_id.in_(
+                    {root.id for root in roots}
+                )
+            )
+            .all()
+        } if roots else {}
 
         submitted_by_root: dict[int, ExtractionAnnotationSubmission] = {}
         submissions = (
@@ -307,6 +320,7 @@ class ExtractionAIAnnotationMetricsService:
                 first_round_elapsed = result_elapsed
             passage = passages.get(root.passage_id)
             user = users.get(root.requested_by)
+            human_review = reviews_by_root.get(root.id)
             record = AIAnnotationMetricsRecord(
                 session_id=root.id,
                 task_id=root.task_id,
@@ -333,6 +347,26 @@ class ExtractionAIAnnotationMetricsService:
                 first_round_truncated_count=truncated_count,
                 final_difference_count=final_count,
                 final_difference_categories=final_categories,
+                human_review_status=(
+                    human_review.status if human_review is not None else "not_started"
+                ),
+                human_review_accuracy=(
+                    human_review.accuracy_basis_points / 10_000
+                    if human_review is not None
+                    else None
+                ),
+                human_review_correct_count=(
+                    human_review.correct_count if human_review is not None else 0
+                ),
+                human_review_incorrect_count=(
+                    human_review.incorrect_count if human_review is not None else 0
+                ),
+                human_review_omission_count=(
+                    human_review.omission_count if human_review is not None else 0
+                ),
+                human_review_submitted_at=(
+                    _utc(human_review.submitted_at) if human_review is not None else None
+                ),
                 submission_id=submission.id if submission is not None else None,
             )
             records.append(record)
@@ -374,6 +408,9 @@ class ExtractionAIAnnotationMetricsService:
         )
         session_count = len(records)
         completed_count = len(completed)
+        submitted_human_reviews = [
+            item for item in records if item.human_review_status == "submitted"
+        ]
         summary = AIAnnotationMetricsSummary(
             session_count=session_count,
             completed_first_round_count=completed_count,
@@ -405,6 +442,22 @@ class ExtractionAIAnnotationMetricsService:
             total_repair_rounds=sum(item.repair_rounds for item in records),
             total_first_round_errors=sum(len(item.first_round_errors) for item in records),
             total_final_differences=sum(item.final_difference_count for item in records),
+            human_reviewed_count=len(submitted_human_reviews),
+            average_human_accuracy=(
+                sum(item.human_review_accuracy or 0 for item in submitted_human_reviews)
+                / len(submitted_human_reviews)
+                if submitted_human_reviews
+                else 0
+            ),
+            total_human_correct=sum(
+                item.human_review_correct_count for item in submitted_human_reviews
+            ),
+            total_human_incorrect=sum(
+                item.human_review_incorrect_count for item in submitted_human_reviews
+            ),
+            total_human_omissions=sum(
+                item.human_review_omission_count for item in submitted_human_reviews
+            ),
         )
         validation_errors = [
             AIAnnotationMetricError(

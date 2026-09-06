@@ -135,3 +135,64 @@ class ExtractionAIAnnotationSavedResult(Base):
         onupdate=lambda: datetime.now(timezone.utc),
         index=True,
     )
+
+
+class ExtractionAIAnnotationReview(Base):
+    """针对不可变首轮 AI 生成结果的人工语义质检记录。"""
+
+    __tablename__ = "extraction_ai_annotation_reviews"
+    __table_args__ = (
+        UniqueConstraint(
+            "generation_job_id",
+            name="uq_extraction_ai_annotation_reviews_generation_job",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    generation_job_id: Mapped[int] = mapped_column(
+        ForeignKey("extraction_ai_annotation_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("extraction_annotation_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    passage_id: Mapped[int] = mapped_column(
+        ForeignKey("passages.doc_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reviewer_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft", index=True)
+    standard_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    decisions_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    omissions_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    total_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reviewed_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    correct_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    incorrect_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unreviewed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    omission_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 0—10000 的整数，避免不同数据库浮点精度导致统计口径漂移。
+    accuracy_basis_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        index=True,
+    )

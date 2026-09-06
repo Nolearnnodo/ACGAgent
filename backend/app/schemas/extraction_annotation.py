@@ -373,8 +373,85 @@ class AIAnnotationJobResponse(BaseModel):
     first_round_truncated_count: int = Field(default=0, ge=0)
     final_difference_count: int = Field(default=0, ge=0)
     saved_result_source_job_id: int | None = None
+    generation_job_id: int | None = None
+    review_status: Literal["not_started", "draft", "submitted"] = "not_started"
+    review_accuracy: float | None = Field(default=None, ge=0, le=1)
     result: AIAnnotationResultResponse | None = None
     saved_result: AIAnnotationResultResponse | None = None
+
+
+AIAnnotationReviewVerdict = Literal["unreviewed", "correct", "incorrect"]
+AIAnnotationReviewStatus = Literal["draft", "submitted"]
+
+
+class AIAnnotationReviewStandard(BaseModel):
+    id: str
+    group: str
+    title: str
+    instruction: str
+
+
+class AIAnnotationReviewDecision(BaseModel):
+    item_id: str = Field(min_length=1, max_length=255)
+    verdict: AIAnnotationReviewVerdict = "unreviewed"
+    reason: str = Field(default="", max_length=2000)
+
+
+class AIAnnotationReviewOmission(BaseModel):
+    id: str = Field(min_length=1, max_length=128)
+    category: str = Field(default="人物", min_length=1, max_length=64)
+    target_path: str = Field(default="", max_length=255)
+    description: str = Field(default="", max_length=2000)
+    correction: str = Field(default="", max_length=4000)
+    evidence: list[EvidenceSpan] = Field(default_factory=list, max_length=8)
+    evidence_note: str = Field(default="", max_length=1000)
+
+
+class AIAnnotationReviewUpdateRequest(BaseModel):
+    decisions: list[AIAnnotationReviewDecision] = Field(default_factory=list, max_length=5000)
+    omissions: list[AIAnnotationReviewOmission] = Field(default_factory=list, max_length=1000)
+
+
+class AIAnnotationReviewItem(BaseModel):
+    id: str
+    category: str
+    path: str
+    title: str
+    question: str
+    detail: str = ""
+    standard_ids: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceSpan] = Field(default_factory=list)
+    verdict: AIAnnotationReviewVerdict = "unreviewed"
+    reason: str = ""
+
+
+class AIAnnotationReviewSummary(BaseModel):
+    total_item_count: int = Field(ge=0)
+    reviewed_item_count: int = Field(ge=0)
+    correct_count: int = Field(ge=0)
+    incorrect_count: int = Field(ge=0)
+    unreviewed_count: int = Field(ge=0)
+    omission_count: int = Field(ge=0)
+    accuracy: float = Field(ge=0, le=1)
+
+
+class AIAnnotationReviewResponse(BaseModel):
+    id: int | None = None
+    generation_job_id: int
+    task_id: int
+    passage_id: int
+    passage_title: str
+    passage_context: str
+    status: AIAnnotationReviewStatus = "draft"
+    standard_version: str
+    standards: list[AIAnnotationReviewStandard]
+    items: list[AIAnnotationReviewItem]
+    omissions: list[AIAnnotationReviewOmission]
+    summary: AIAnnotationReviewSummary
+    reviewer_id: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    submitted_at: datetime | None = None
 
 
 class AIAnnotationMetricError(BaseModel):
@@ -417,6 +494,11 @@ class AIAnnotationMetricsSummary(BaseModel):
     total_repair_rounds: int = Field(ge=0)
     total_first_round_errors: int = Field(ge=0)
     total_final_differences: int = Field(ge=0)
+    human_reviewed_count: int = Field(default=0, ge=0)
+    average_human_accuracy: float = Field(default=0, ge=0, le=1)
+    total_human_correct: int = Field(default=0, ge=0)
+    total_human_incorrect: int = Field(default=0, ge=0)
+    total_human_omissions: int = Field(default=0, ge=0)
 
 
 class AIAnnotationMetricsRecord(BaseModel):
@@ -445,6 +527,12 @@ class AIAnnotationMetricsRecord(BaseModel):
     first_round_truncated_count: int = Field(default=0, ge=0)
     final_difference_count: int = Field(default=0, ge=0)
     final_difference_categories: dict[str, int] = Field(default_factory=dict)
+    human_review_status: str = "not_started"
+    human_review_accuracy: float | None = Field(default=None, ge=0, le=1)
+    human_review_correct_count: int = Field(default=0, ge=0)
+    human_review_incorrect_count: int = Field(default=0, ge=0)
+    human_review_omission_count: int = Field(default=0, ge=0)
+    human_review_submitted_at: datetime | None = None
     submission_id: int | None = None
 
 
