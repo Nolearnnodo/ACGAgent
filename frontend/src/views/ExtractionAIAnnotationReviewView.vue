@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 
 import {
@@ -19,7 +19,7 @@ import {
 } from '../utils/extractionAnnotation'
 
 const route = useRoute()
-const jobId = Number(route.params.jobId)
+const jobId = computed(() => Number(route.params.jobId))
 const review = ref<AIAnnotationReview | null>(null)
 const loading = ref(true)
 const saving = ref(false)
@@ -172,9 +172,14 @@ function snapshot(value: AIAnnotationReview) {
 async function loadReview() {
   loading.value = true
   feedback.value = ''
+  review.value = null
+  activeItemId.value = null
+  activeOmissionId.value = null
+  activeEvidenceId.value = null
+  pendingEvidence.value = null
   try {
-    if (!Number.isInteger(jobId) || jobId <= 0) throw new Error('质检任务编号无效。')
-    review.value = await fetchAIAnnotationReview(jobId)
+    if (!Number.isInteger(jobId.value) || jobId.value <= 0) throw new Error('质检任务编号无效。')
+    review.value = await fetchAIAnnotationReview(jobId.value)
     activeItemId.value = review.value.items.find((item) => item.verdict === 'unreviewed')?.id
       ?? review.value.items[0]?.id
       ?? null
@@ -210,7 +215,7 @@ async function saveDraft() {
   const before = snapshot(current)
   dirty.value = false
   try {
-    const next = await saveAIAnnotationReview(jobId, current)
+    const next = await saveAIAnnotationReview(current.generation_job_id, current)
     if (review.value && snapshot(review.value) === before) {
       review.value = next
     } else {
@@ -323,7 +328,7 @@ async function submitReview() {
   submitting.value = true
   feedback.value = ''
   try {
-    review.value = await submitAIAnnotationReview(jobId, review.value)
+    review.value = await submitAIAnnotationReview(review.value.generation_job_id, review.value)
     dirty.value = false
     feedback.value = `首轮质检已提交，正确率 ${percent(review.value.summary.accuracy)}。`
   } catch (error) {
@@ -333,7 +338,13 @@ async function submitReview() {
   }
 }
 
-onMounted(() => void loadReview())
+watch(
+  () => route.params.jobId,
+  () => {
+    if (route.name === 'extraction-ai-annotation-review') void loadReview()
+  },
+  { immediate: true },
+)
 onBeforeUnmount(() => {
   if (saveTimer !== null) window.clearTimeout(saveTimer)
   if (dirty.value && !isReadOnly.value) void saveDraft()
