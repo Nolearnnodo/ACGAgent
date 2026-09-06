@@ -8,6 +8,7 @@ from app.api.v1.routers.review import router as review_router
 from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.skills.registry import SkillRegistry
+from app.services.extraction_ai_annotation_job_service import recover_pending_ai_annotation_jobs
 
 settings = get_settings()
 
@@ -44,6 +45,7 @@ def create_app() -> FastAPI:
 
         with SessionLocal() as db:
             SkillRegistry().register_builtin_metadata(db)
+        recover_pending_ai_annotation_jobs()
 
     return app
 

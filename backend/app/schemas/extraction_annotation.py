@@ -222,6 +222,242 @@ class ExtractionTaskDetailResponse(BaseModel):
     submission: ExtractionSubmissionResponse
 
 
+class AIAnnotationConfigRequest(BaseModel):
+    """单次 AI 标注调用的配置；API Key 不会写入数据库。"""
+
+    provider: Literal["", "mock", "deepseek", "openai_compatible"] = ""
+    api_key: str = Field(default="", max_length=500)
+    base_url: str = Field(default="", max_length=500)
+    model: str = Field(default="", max_length=200)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    extra_instruction: str = Field(default="", max_length=20000)
+
+
+class AIAnnotationPromptOverrides(BaseModel):
+    """仅本次调用使用的提示词覆盖值，不写入配置。"""
+
+    system_prompt: str = Field(min_length=1, max_length=100_000)
+    user_prompt: str = Field(min_length=1, max_length=10_000_000)
+
+
+class AIAnnotationGenerateRequest(BaseModel):
+    task_id: int = Field(gt=0)
+    config: AIAnnotationConfigRequest = Field(default_factory=AIAnnotationConfigRequest)
+    prompt_overrides: AIAnnotationPromptOverrides | None = None
+    client_started_at: datetime | None = None
+
+
+class AIAnnotationPromptRequest(BaseModel):
+    task_id: int = Field(gt=0)
+    config: AIAnnotationConfigRequest = Field(default_factory=AIAnnotationConfigRequest)
+
+
+class AIAnnotationPromptResponse(BaseModel):
+    task_id: int
+    prompt_version: str
+    system_prompt: str
+    user_prompt: str
+
+
+class AIAnnotationTaskContextResponse(BaseModel):
+    task_id: int
+    context_sha256: str
+    spec_version: str
+    status: str
+    passage: AnnotationPassageResponse
+
+
+class AIAnnotationValidateRequest(BaseModel):
+    task_id: int = Field(gt=0)
+    job_id: int | None = Field(default=None, gt=0)
+    content: str = Field(min_length=1, max_length=10_000_000)
+
+
+class AIAnnotationRepairRequest(BaseModel):
+    """根据当前结果触发分片修复/重新抽取，不让模型重写完整 JSON。"""
+
+    task_id: int = Field(gt=0)
+    job_id: int | None = Field(default=None, gt=0)
+    content: str = Field(min_length=1, max_length=10_000_000)
+    config: AIAnnotationConfigRequest = Field(default_factory=AIAnnotationConfigRequest)
+    client_started_at: datetime | None = None
+
+
+class AIAnnotationValidationIssue(BaseModel):
+    path: str
+    message: str
+    code: str
+
+
+class AIAnnotationExportMetadata(BaseModel):
+    task_id: int
+    spec_version: str
+    context_sha256: str
+
+
+class AIAnnotationExportPassage(BaseModel):
+    doc_id: int
+    title: str
+    context: str
+    context_sha256: str
+
+
+class AIAnnotationExportDocument(BaseModel):
+    """与独立盲标导入接口兼容的完整文件结构。"""
+
+    metadata: AIAnnotationExportMetadata
+    passage: AIAnnotationExportPassage
+    label: ExtractionAnnotationLabel
+
+
+AIAnnotationValidationStatus = Literal["valid", "invalid_format", "invalid_rules"]
+
+
+class AIAnnotationTokenUsage(BaseModel):
+    """一次生成或修复任务内全部 LLM 分片调用的累计用量。"""
+
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    prompt_cache_hit_tokens: int = Field(default=0, ge=0)
+    prompt_cache_miss_tokens: int = Field(default=0, ge=0)
+    cache_metrics_supported: bool = False
+    llm_call_count: int = Field(default=0, ge=0)
+
+
+class AIAnnotationResultResponse(BaseModel):
+    task_id: int
+    passage_id: int
+    passage_title: str
+    spec_version: str
+    context_sha256: str
+    source: Literal["generated", "validated"]
+    provider: str = ""
+    model: str = ""
+    raw_content: str
+    document: AIAnnotationExportDocument | None = None
+    label: ExtractionAnnotationLabel | None = None
+    validation_status: AIAnnotationValidationStatus
+    validation_issues: list[AIAnnotationValidationIssue] = Field(default_factory=list)
+    elapsed_ms: int = Field(ge=0)
+    # 分片调用诊断；旧任务结果没有这些字段时使用默认值，保持兼容。
+    fragment_count: int = Field(default=0, ge=0)
+    truncated_fragments: list[str] = Field(default_factory=list)
+    fragment_warnings: list[str] = Field(default_factory=list)
+    token_usage: AIAnnotationTokenUsage = Field(default_factory=AIAnnotationTokenUsage)
+
+
+AIAnnotationJobStatus = Literal["queued", "running", "success", "failed"]
+AIAnnotationJobOperation = Literal["generate", "repair"]
+
+
+class AIAnnotationJobResponse(BaseModel):
+    id: int
+    task_id: int
+    passage_id: int
+    passage_title: str
+    operation: AIAnnotationJobOperation = "generate"
+    status: AIAnnotationJobStatus
+    provider: str = ""
+    model: str = ""
+    error_message: str = ""
+    client_started_at: datetime | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    submitted_at: datetime | None = None
+    token_usage: AIAnnotationTokenUsage = Field(default_factory=AIAnnotationTokenUsage)
+    first_round_validation_status: str = ""
+    first_round_error_count: int = Field(default=0, ge=0)
+    first_round_warning_count: int = Field(default=0, ge=0)
+    first_round_truncated_count: int = Field(default=0, ge=0)
+    final_difference_count: int = Field(default=0, ge=0)
+    saved_result_source_job_id: int | None = None
+    result: AIAnnotationResultResponse | None = None
+    saved_result: AIAnnotationResultResponse | None = None
+
+
+class AIAnnotationMetricError(BaseModel):
+    code: str
+    example_message: str = ""
+    count: int = Field(ge=0)
+    session_count: int = Field(ge=0)
+
+
+class AIAnnotationMetricDifference(BaseModel):
+    category: str
+    label: str
+    count: int = Field(ge=0)
+
+
+class AIAnnotationDailyMetric(BaseModel):
+    date: str
+    session_count: int = Field(ge=0)
+    submitted_count: int = Field(ge=0)
+    total_tokens: int = Field(ge=0)
+    first_round_error_count: int = Field(ge=0)
+
+
+class AIAnnotationMetricsSummary(BaseModel):
+    session_count: int = Field(ge=0)
+    completed_first_round_count: int = Field(ge=0)
+    failed_first_round_count: int = Field(ge=0)
+    first_pass_valid_count: int = Field(ge=0)
+    first_pass_valid_rate: float = Field(ge=0, le=1)
+    submitted_count: int = Field(ge=0)
+    submission_rate: float = Field(ge=0, le=1)
+    average_first_round_ms: int = Field(ge=0)
+    average_end_to_end_ms: int = Field(ge=0)
+    total_prompt_tokens: int = Field(ge=0)
+    total_completion_tokens: int = Field(ge=0)
+    total_tokens: int = Field(ge=0)
+    total_cache_hit_tokens: int = Field(ge=0)
+    total_cache_miss_tokens: int = Field(ge=0)
+    total_llm_call_count: int = Field(ge=0)
+    total_repair_rounds: int = Field(ge=0)
+    total_first_round_errors: int = Field(ge=0)
+    total_final_differences: int = Field(ge=0)
+
+
+class AIAnnotationMetricsRecord(BaseModel):
+    session_id: int
+    task_id: int
+    passage_id: int
+    passage_title: str
+    requested_by: int
+    requested_by_email: str
+    provider: str
+    model: str
+    status: str
+    first_round_validation_status: str
+    client_started_at: datetime
+    queued_at: datetime
+    started_at: datetime | None = None
+    first_round_finished_at: datetime | None = None
+    submitted_at: datetime | None = None
+    queue_wait_ms: int | None = Field(default=None, ge=0)
+    first_round_elapsed_ms: int | None = Field(default=None, ge=0)
+    end_to_end_ms: int | None = Field(default=None, ge=0)
+    token_usage: AIAnnotationTokenUsage = Field(default_factory=AIAnnotationTokenUsage)
+    repair_rounds: int = Field(default=0, ge=0)
+    first_round_errors: list[AIAnnotationValidationIssue] = Field(default_factory=list)
+    first_round_warning_count: int = Field(default=0, ge=0)
+    first_round_truncated_count: int = Field(default=0, ge=0)
+    final_difference_count: int = Field(default=0, ge=0)
+    final_difference_categories: dict[str, int] = Field(default_factory=dict)
+    submission_id: int | None = None
+
+
+class AIAnnotationMetricsResponse(BaseModel):
+    generated_at: datetime
+    days: int = Field(ge=0)
+    summary: AIAnnotationMetricsSummary
+    validation_errors: list[AIAnnotationMetricError] = Field(default_factory=list)
+    final_differences: list[AIAnnotationMetricDifference] = Field(default_factory=list)
+    daily: list[AIAnnotationDailyMetric] = Field(default_factory=list)
+    records: list[AIAnnotationMetricsRecord] = Field(default_factory=list)
+
+
 class ExtractionDraftUpdateRequest(BaseModel):
     revision: int = Field(ge=0)
     label: ExtractionAnnotationLabel

@@ -81,6 +81,14 @@ class ExtractionAnnotationSubmission(Base):
     label_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 仅当草稿从 AI 标注工作台导入时写入，用来把后续人工修改与最终提交
+    # 归因到对应的 AI 生成/修复链路。
+    source_ai_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("extraction_ai_annotation_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    ai_imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

@@ -6,6 +6,7 @@ import {
   onBeforeUnmount,
   onMounted,
   ref,
+  toRaw,
   watch,
 } from 'vue'
 import { onBeforeRouteLeave, RouterLink } from 'vue-router'
@@ -24,10 +25,13 @@ import {
   type PersonRelationAnnotation,
   claimExtractionTask,
   createExtractionTask,
+  deleteExtractionTask,
   fetchAnnotationDictionaries,
   fetchExtractionTask,
+  importExtractionDraft,
   listExtractionTasks,
   releaseExtractionDraft,
+  resetExtractionTask,
   saveExtractionDraft,
   submitExtractionAnnotation,
 } from '../api/extractionAnnotations'
@@ -81,11 +85,12 @@ const authStore = useAuthStore()
 const tasks = ref<ExtractionTaskSummary[]>([])
 const passageOptions = ref<PassageSummary[]>([])
 const selectedPassageId = ref<number | null>(null)
-const taskFilter = ref<TaskFilter>('mine')
+const taskFilter = ref<TaskFilter>(authStore.isAdmin ? 'all' : 'mine')
 const loadingTasks = ref(false)
 const creatingTask = ref(false)
 const openingTaskId = ref<number | null>(null)
 const releasingSubmissionId = ref<number | null>(null)
+const managingTaskId = ref<number | null>(null)
 const activeDetail = ref<ExtractionTaskDetail | null>(null)
 const label = ref<ExtractionAnnotationLabel | null>(null)
 const activeStep = ref<StepId>('document')
@@ -100,6 +105,8 @@ const saveMessage = ref('')
 const dirty = ref(false)
 const serverIssues = ref<string[]>([])
 const submitting = ref(false)
+const importing = ref(false)
+const importFileInput = ref<HTMLInputElement | null>(null)
 const textCanvas = ref<InstanceType<typeof AnnotationTextCanvas> | null>(null)
 const dictionaries = ref<AnnotationDictionaries>({
   eras: [],
@@ -120,6 +127,7 @@ const blockingCheckCount = computed(
 const currentPerson = computed(() =>
   label.value?.persons.find((person) => person.key === activePersonKey.value) ?? null,
 )
+const titlesDraft = ref('')
 const currentEvent = computed(() =>
   currentPerson.value?.life_events.find((event) => event.key === activeEventKey.value) ?? null,
 )
@@ -135,6 +143,11 @@ const reverseSuggestions = computed(() =>
   currentRelation.value ? relationReverseSuggestions(currentRelation.value.codes) : [],
 )
 const relationPersons = computed(() => label.value?.persons.filter((person) => person.level !== 3) ?? [])
+
+watch(currentPerson, (person) => {
+  titlesDraft.value = person?.titles.join('\n') ?? ''
+}, { immediate: true })
+
 const filteredTasks = computed(() => {
   if (taskFilter.value === 'mine') return tasks.value.filter((task) => task.submission_id)
   if (taskFilter.value === 'available') {
@@ -232,15 +245,19 @@ function saveStateLabel() {
 }
 
 function cloneLabel(value: ExtractionAnnotationLabel) {
-  return structuredClone(value)
+  // label 由深层 Vue ref 持有，传入值可能是响应式 Proxy；先还原为普通对象，
+  // 避免 structuredClone 在请求发出前因无法复制 Proxy 而中断保存。
+  return structuredClone(toRaw(value))
 }
 
-async function loadTasks() {
+async function loadTasks(): Promise<boolean> {
   loadingTasks.value = true
   try {
     tasks.value = await listExtractionTasks()
+    return true
   } catch (error) {
     saveMessage.value = getApiErrorMessage(error, '任务队列加载失败。')
+    return false
   } finally {
     loadingTasks.value = false
   }
@@ -292,7 +309,11 @@ function canLeaveCurrentTask() {
 }
 
 async function openTask(task: ExtractionTaskSummary) {
-  if (openingTaskId.value || (activeDetail.value?.id !== task.id && !canLeaveCurrentTask())) return
+  if (
+    openingTaskId.value
+    || managingTaskId.value !== null
+    || (activeDetail.value?.id !== task.id && !canLeaveCurrentTask())
+  ) return
   if (!task.submission_id) {
     const warning = authStore.isAdmin
       ? '管理员领取也会占用一个双人盲标槽位。确定要以当前管理员账号领取吗？'
@@ -319,7 +340,11 @@ async function handleReleaseDraft(
   task: ExtractionTaskSummary,
   assignment: ExtractionTaskSummary['assignments'][number],
 ) {
-  if (releasingSubmissionId.value !== null || assignment.state === 'submitted') return
+  if (
+    releasingSubmissionId.value !== null
+    || managingTaskId.value !== null
+    || assignment.state === 'submitted'
+  ) return
   const isActiveSubmission = activeDetail.value?.submission.id === assignment.submission_id
   if (isActiveSubmission && !canLeaveCurrentTask()) return
   if (!window.confirm(
@@ -346,6 +371,91 @@ async function handleReleaseDraft(
     saveMessage.value = getApiErrorMessage(error, '释放标注槽位失败。')
   } finally {
     releasingSubmissionId.value = null
+  }
+}
+
+async function settleBeforeTaskManagement(taskId: number) {
+  if (activeDetail.value?.id !== taskId) return
+  clearSaveTimer()
+  if (activeSavePromise) await activeSavePromise
+  clearSaveTimer()
+}
+
+function clearActiveTask(taskId: number) {
+  if (activeDetail.value?.id !== taskId) return
+  activeDetail.value = null
+  label.value = null
+  activeStep.value = 'document'
+  activePersonKey.value = null
+  activeEventKey.value = null
+  activeHistoricalEventKey.value = null
+  activeRelationKey.value = null
+  activeEvidenceId.value = null
+  pendingEvidence.value = null
+  dirty.value = false
+  saveState.value = 'idle'
+  serverIssues.value = []
+}
+
+async function handleResetTask(task: ExtractionTaskSummary) {
+  if (
+    !authStore.isAdmin
+    || managingTaskId.value !== null
+    || releasingSubmissionId.value !== null
+  ) return
+  const isActiveTask = activeDetail.value?.id === task.id
+  if (isActiveTask && !canLeaveCurrentTask()) return
+  if (!window.confirm(
+    `确定重置任务 #${task.id} 吗？这会删除全部草稿、已提交盲标、裁定草稿和金标版本，但保留古籍和任务配置。`,
+  )) return
+
+  managingTaskId.value = task.id
+  try {
+    await settleBeforeTaskManagement(task.id)
+    const resetTask = await resetExtractionTask(task.id)
+    clearActiveTask(task.id)
+    taskFilter.value = 'all'
+    tasks.value = tasks.value.some((item) => item.id === task.id)
+      ? tasks.value.map((item) => item.id === task.id ? resetTask : item)
+      : [...tasks.value, resetTask]
+    const refreshed = await loadTasks()
+    tasks.value = tasks.value.some((item) => item.id === task.id)
+      ? tasks.value.map((item) => item.id === task.id ? resetTask : item)
+      : [...tasks.value, resetTask]
+    if (refreshed) saveMessage.value = `任务 #${task.id} 已重置，可重新领取。`
+  } catch (error) {
+    saveMessage.value = getApiErrorMessage(error, '重置标注任务失败。')
+  } finally {
+    managingTaskId.value = null
+  }
+}
+
+async function handleDeleteTask(task: ExtractionTaskSummary) {
+  if (
+    !authStore.isAdmin
+    || managingTaskId.value !== null
+    || releasingSubmissionId.value !== null
+  ) return
+  const isActiveTask = activeDetail.value?.id === task.id
+  if (isActiveTask && !canLeaveCurrentTask()) return
+  if (!window.confirm(
+    `确定删除任务 #${task.id}（${task.passage_title}）吗？任务及其全部标注、裁定数据都会永久删除，但不会删除古籍正文。`,
+  )) return
+
+  managingTaskId.value = task.id
+  try {
+    await settleBeforeTaskManagement(task.id)
+    await deleteExtractionTask(task.id)
+    clearActiveTask(task.id)
+    tasks.value = tasks.value.filter((item) => item.id !== task.id)
+    const refreshed = await loadTasks()
+    // DELETE 已成功时，本地队列以删除结果为准，避免刷新请求短暂返回旧列表。
+    tasks.value = tasks.value.filter((item) => item.id !== task.id)
+    if (refreshed) saveMessage.value = `任务 #${task.id} 已删除。`
+  } catch (error) {
+    saveMessage.value = getApiErrorMessage(error, '删除标注任务失败。')
+  } finally {
+    managingTaskId.value = null
   }
 }
 
@@ -415,6 +525,41 @@ async function saveDraft(showFeedback = true) {
     }
   })()
   return activeSavePromise
+}
+
+function openImportPicker() {
+  if (!activeDetail.value || isReadOnly.value || importing.value) return
+  importFileInput.value?.click()
+}
+
+async function handleImportFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file || !activeDetail.value || isReadOnly.value || importing.value) return
+
+  const warning = dirty.value
+    ? '导入会覆盖当前尚未保存的标注修改，确定继续吗？'
+    : '导入会覆盖当前任务草稿，确定继续吗？'
+  if (!window.confirm(warning)) return
+
+  clearSaveTimer()
+  if (activeSavePromise) await activeSavePromise
+  const taskId = activeDetail.value.id
+  const revision = activeDetail.value.submission.revision
+  importing.value = true
+  serverIssues.value = []
+  try {
+    const next = await importExtractionDraft(taskId, revision, file)
+    await hydrateTask(next)
+    saveMessage.value = `已导入“${file.name}”，请检查后继续标注或提交。`
+  } catch (error) {
+    saveState.value = 'error'
+    serverIssues.value = extractServerIssues(error)
+    saveMessage.value = getApiErrorMessage(error, '标注结果导入失败。')
+  } finally {
+    importing.value = false
+  }
 }
 
 function extractServerIssues(error: unknown) {
@@ -578,8 +723,10 @@ function removeCurrentPerson() {
 
 function setTitles(event: Event) {
   if (!currentPerson.value) return
-  currentPerson.value.titles = (event.target as HTMLTextAreaElement).value
-    .split('\n')
+  const value = (event.target as HTMLTextAreaElement).value
+  titlesDraft.value = value
+  currentPerson.value.titles = value
+    .split(/\r?\n/)
     .map((item) => item.trim())
     .filter(Boolean)
 }
@@ -770,13 +917,26 @@ onBeforeUnmount(() => {
           <button
             class="button button--quiet"
             type="button"
-            :disabled="!activeDetail || isReadOnly || saveState === 'saving'"
+            :disabled="!activeDetail || isReadOnly || saveState === 'saving' || managingTaskId === activeDetail?.id"
             @click="saveDraft(true)"
           >保存草稿</button>
+          <input
+            ref="importFileInput"
+            class="file-input-hidden"
+            type="file"
+            accept=".yaml,.yml,.json,application/json,text/yaml"
+            @change="handleImportFile"
+          >
+          <button
+            class="button button--import"
+            type="button"
+            :disabled="!activeDetail || isReadOnly || importing || saveState === 'saving' || managingTaskId === activeDetail?.id"
+            @click="openImportPicker"
+          >{{ importing ? '导入中…' : '上传标注结果' }}</button>
           <button
             class="button button--primary"
             type="button"
-            :disabled="!activeDetail || isReadOnly || submitting"
+            :disabled="!activeDetail || isReadOnly || submitting || managingTaskId === activeDetail?.id"
             @click="handleSubmit"
           >{{ submitting ? '提交中…' : isReadOnly ? '已锁定' : '提交标注' }}</button>
         </div>
@@ -858,7 +1018,7 @@ onBeforeUnmount(() => {
                 class="task-item"
                 :class="{ active: activeDetail?.id === task.id }"
                 type="button"
-                :disabled="openingTaskId === task.id || (!task.submission_id && task.available_slots === 0)"
+                :disabled="openingTaskId === task.id || managingTaskId !== null || (!task.submission_id && task.available_slots === 0)"
                 @click="openTask(task)"
               >
                 <span class="task-item__index">#{{ String(task.id).padStart(3, '0') }}</span>
@@ -892,12 +1052,26 @@ onBeforeUnmount(() => {
                   <button
                     v-if="assignment.state !== 'submitted'"
                     type="button"
-                    :disabled="releasingSubmissionId !== null"
+                    :disabled="releasingSubmissionId !== null || managingTaskId !== null"
                     @click="handleReleaseDraft(task, assignment)"
                   >
                     {{ releasingSubmissionId === assignment.submission_id ? '释放中…' : '释放' }}
                   </button>
                 </div>
+              </div>
+              <div v-if="authStore.isAdmin" class="task-management" aria-label="任务管理">
+                <span>管理员操作</span>
+                <button
+                  type="button"
+                  :disabled="managingTaskId !== null || releasingSubmissionId !== null"
+                  @click="handleResetTask(task)"
+                >{{ managingTaskId === task.id ? '处理中…' : '重置' }}</button>
+                <button
+                  type="button"
+                  class="task-management__delete"
+                  :disabled="managingTaskId !== null || releasingSubmissionId !== null"
+                  @click="handleDeleteTask(task)"
+                >{{ managingTaskId === task.id ? '处理中…' : '删除' }}</button>
               </div>
             </div>
           </div>
@@ -923,7 +1097,7 @@ onBeforeUnmount(() => {
                 :text="activeDetail.passage.context"
                 :highlights="highlights"
                 :active-evidence-id="activeEvidenceId"
-                :disabled="isReadOnly"
+                :disabled="isReadOnly || managingTaskId === activeDetail.id"
                 @selection-created="handleSelectionCreated"
                 @highlight-activated="activateHighlight"
               />
@@ -975,7 +1149,7 @@ onBeforeUnmount(() => {
           </nav>
 
           <div v-if="label && activeDetail" class="inspector__scroll">
-            <fieldset :disabled="isReadOnly">
+            <fieldset :disabled="isReadOnly || managingTaskId === activeDetail.id">
               <section v-if="activeStep === 'document'" class="inspector-section">
                 <header>
                   <span>01 / DOCUMENT</span>
@@ -1091,7 +1265,7 @@ onBeforeUnmount(() => {
                     </label>
                     <label class="field">
                       <span>称号（每行一个）</span>
-                      <textarea :value="currentPerson.titles.join('\n')" rows="2" @input="setTitles" />
+                      <textarea :value="titlesDraft" rows="2" @input="setTitles" />
                     </label>
                   </div>
 
@@ -1596,6 +1770,16 @@ onBeforeUnmount(() => {
 .save-indicator[data-state='saved'] i { background: #4f765d; }
 .save-indicator[data-state='error'] i { background: #aa3d31; }
 
+.file-input-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .button {
   border: 1px solid var(--line);
   padding: 8px 12px;
@@ -1703,6 +1887,27 @@ onBeforeUnmount(() => {
 .task-assignment > em { color: var(--muted); font-style: normal; }
 .task-assignment > button { border: 0; padding: 2px 5px; background: transparent; color: var(--vermilion); cursor: pointer; font-size: 9px; }
 .task-assignment > button:disabled { opacity: 0.5; cursor: wait; }
+
+.task-management {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 14px 9px 60px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.task-management button {
+  border: 0;
+  padding: 2px 0;
+  background: transparent;
+  color: var(--vermilion);
+  cursor: pointer;
+  font-size: 9px;
+}
+
+.task-management button:disabled { opacity: 0.5; cursor: wait; }
+.task-management__delete { color: #9d4035 !important; }
 
 .text-workspace {
   position: relative;

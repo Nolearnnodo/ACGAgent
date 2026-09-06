@@ -36,4 +36,8 @@ from app.models.extraction_annotation import (  # noqa: E402,F401
     ExtractionAnnotationTask,
     ExtractionGoldVersion,
 )
+from app.models.extraction_ai_annotation import (  # noqa: E402,F401
+    ExtractionAIAnnotationJob,
+    ExtractionAIAnnotationSavedResult,
+)
 from app.models.user import User  # noqa: E402,F401

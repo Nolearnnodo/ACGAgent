@@ -49,6 +49,18 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      path: '/annotations/extraction/ai',
+      name: 'extraction-ai-annotation',
+      component: () => import('../views/ExtractionAIAnnotationView.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/annotations/extraction/ai/metrics',
+      name: 'extraction-ai-annotation-metrics',
+      component: () => import('../views/ExtractionAIAnnotationMetricsView.vue'),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
       path: '/annotations/extraction/adjudication',
       name: 'extraction-adjudication',
       component: () => import('../views/ExtractionAdjudicationView.vue'),

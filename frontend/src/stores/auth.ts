@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
+import { startTokenRefresh, stopTokenRefresh } from '../api/client'
 import {
   fetchCurrentUser,
   login,
@@ -43,6 +44,7 @@ export const useAuthStore = defineStore('auth', () => {
       const response = await login(payload)
       persistTokens(response.tokens.access_token, response.tokens.refresh_token)
       user.value = response.user
+      startTokenRefresh()
     } finally {
       loading.value = false
     }
@@ -54,6 +56,7 @@ export const useAuthStore = defineStore('auth', () => {
       const response = await register(payload)
       persistTokens(response.tokens.access_token, response.tokens.refresh_token)
       user.value = response.user
+      startTokenRefresh()
     } finally {
       loading.value = false
     }
@@ -66,6 +69,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
     try {
       user.value = await fetchCurrentUser()
+      startTokenRefresh()
     } catch {
       clearSession()
     }
@@ -84,9 +88,14 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   function clearSession() {
+    stopTokenRefresh()
     localStorage.removeItem('access_token')
     localStorage.removeItem('refresh_token')
     user.value = null
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('acgagent:auth-expired', clearSession)
   }
 
   return {

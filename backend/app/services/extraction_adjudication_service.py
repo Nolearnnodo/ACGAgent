@@ -39,6 +39,7 @@ from app.services.extraction_annotation_service import (
     AnnotationNotFoundError,
     AnnotationValidationError,
     context_sha256,
+    parse_imported_label,
     validate_for_submission,
 )
 
@@ -345,6 +346,89 @@ class ExtractionAdjudicationService:
     def __init__(self, db: Session):
         self.db = db
 
+    def get_gold(
+        self,
+        task_id: int,
+        version: int | None = None,
+    ) -> ExtractionGoldVersionResponse:
+        """返回指定任务的最新（或指定版本）金标，供下游批量任务读取。"""
+
+        task, passage = self._get_task_and_passage(task_id)
+        self._assert_current_context(task, passage)
+        gold = self._find_gold(task_id, version)
+        if gold is None:
+            raise AnnotationNotFoundError("该任务尚无可读取的锁定金标。")
+        return self._build_gold_response(gold)
+
+    def import_gold_yaml(
+        self,
+        task_id: int,
+        content: bytes | str,
+        reviewer: User,
+        source_name: str = "",
+        change_reason: str = "",
+    ) -> ExtractionGoldVersionResponse:
+        """导入导出的 YAML/JSON 标注结果，并保存为新的不可变金标版本。
+
+        导入文件可以是 ``export_gold_yaml`` 生成的完整文档，也可以只包含
+        ``{"label": ...}``。如果文件携带正文摘要或正文，会严格校验其仍对应
+        当前任务，避免把旧正文上的证据位置误用于新文本。
+        """
+
+        task, passage = self._get_task_and_passage(task_id)
+        self._assert_current_context(task, passage)
+        label = parse_imported_label(
+            content,
+            task,
+            passage,
+            self.db,
+            require_submission=True,
+        )
+
+        label_json = _json_dump(label.model_dump(mode="json"))
+        latest = self._latest_gold(task_id)
+        if latest is not None and latest.gold_json == label_json:
+            # 重试上传同一文件时保持幂等，不额外制造版本。
+            return self._build_gold_response(latest)
+
+        now = datetime.now(timezone.utc)
+        next_version = (latest.version if latest else 0) + 1
+        source_submission_ids = self._import_source_submission_ids(
+            metadata.get("source_submission_ids"), task.id
+        )
+        reason = str(
+            change_reason or metadata.get("change_reason") or "从标注结果文件导入"
+        ).strip()
+        log = {
+            "operation": "import",
+            "task_id": task.id,
+            "version": next_version,
+            "reviewer_id": reviewer.id,
+            "imported_at": now.isoformat(),
+            "source_name": str(source_name or "")[:255],
+            "change_reason": reason,
+            "source_gold_version": metadata.get("gold_version"),
+        }
+        gold = ExtractionGoldVersion(
+            task_id=task.id,
+            version=next_version,
+            gold_json=label_json,
+            source_submission_ids_json=_json_dump(source_submission_ids),
+            adjudication_log_json=_json_dump(log),
+            reviewer_id=reviewer.id,
+            locked_at=now,
+        )
+        task.status = "completed"
+        task.updated_at = now
+        self.db.add_all([task, gold])
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise AnnotationConflictError("金标版本刚刚被其他复核员更新，请刷新后重试。") from exc
+        self.db.refresh(gold)
+        return self._build_gold_response(gold)
+
     def list_adjudications(self) -> list[ExtractionAdjudicationSummaryResponse]:
         tasks = (
             self.db.query(ExtractionAnnotationTask)
@@ -469,18 +553,9 @@ class ExtractionAdjudicationService:
         return self._build_detail(task, passage, submissions)
 
     def export_gold_yaml(self, task_id: int, version: int | None = None) -> tuple[str, str]:
-        task = self.db.get(ExtractionAnnotationTask, task_id)
-        if task is None:
-            raise AnnotationNotFoundError("未找到标注任务。")
-        passage = self.db.get(Passage, task.passage_id)
-        if passage is None:
-            raise AnnotationNotFoundError("标注任务对应的古籍不存在。")
-        query = self.db.query(ExtractionGoldVersion).filter(
-            ExtractionGoldVersion.task_id == task_id
-        )
-        if version is not None:
-            query = query.filter(ExtractionGoldVersion.version == version)
-        gold = query.order_by(ExtractionGoldVersion.version.desc()).first()
+        task, passage = self._get_task_and_passage(task_id)
+        self._assert_current_context(task, passage)
+        gold = self._find_gold(task_id, version)
         if gold is None:
             raise AnnotationNotFoundError("该任务尚无可导出的锁定金标。")
         label = _load_label_json(gold.gold_json)
@@ -509,6 +584,45 @@ class ExtractionAdjudicationService:
             default_flow_style=False,
         )
         return f"extraction-gold-task-{task.id}-v{gold.version}.yaml", content
+
+    def _find_gold(
+        self,
+        task_id: int,
+        version: int | None = None,
+    ) -> ExtractionGoldVersion | None:
+        query = self.db.query(ExtractionGoldVersion).filter(
+            ExtractionGoldVersion.task_id == task_id
+        )
+        if version is not None:
+            query = query.filter(ExtractionGoldVersion.version == version)
+        return query.order_by(ExtractionGoldVersion.version.desc()).first()
+
+    def _import_source_submission_ids(
+        self,
+        raw_ids: Any,
+        task_id: int,
+    ) -> list[int]:
+        if not isinstance(raw_ids, list):
+            return []
+        result: list[int] = []
+        for raw_id in raw_ids:
+            try:
+                submission_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            submission = self.db.get(ExtractionAnnotationSubmission, submission_id)
+            if submission is not None and submission.task_id == task_id:
+                result.append(submission_id)
+        return sorted(set(result))
+
+    def _get_task_and_passage(self, task_id: int) -> tuple[ExtractionAnnotationTask, Passage]:
+        task = self.db.get(ExtractionAnnotationTask, task_id)
+        if task is None:
+            raise AnnotationNotFoundError("未找到标注任务。")
+        passage = self.db.get(Passage, task.passage_id)
+        if passage is None:
+            raise AnnotationNotFoundError("标注任务对应的古籍不存在。")
+        return task, passage
 
     def _require_adjudicable(
         self, task_id: int

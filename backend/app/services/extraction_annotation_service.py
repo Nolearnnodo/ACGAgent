@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from itertools import product
 from typing import Iterable
 
+import yaml
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.extraction_annotation import (
+    ExtractionAdjudicationDraft,
     ExtractionAnnotationSubmission,
     ExtractionAnnotationTask,
+    ExtractionGoldVersion,
 )
+from app.models.extraction_ai_annotation import ExtractionAIAnnotationJob
 from app.models.dictionary import EraDictionary, HistoricalEventDictionary
 from app.models.passage import Passage
 from app.models.user import User
@@ -29,6 +35,9 @@ from app.schemas.extraction_annotation import (
     ExtractionTaskDetailResponse,
     ExtractionTaskSummaryResponse,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExtractionAnnotationServiceError(Exception):
@@ -169,6 +178,43 @@ def validate_evidence_offsets(
                 )
             )
     return issues
+
+
+def discard_out_of_range_evidence(
+    label: ExtractionAnnotationLabel,
+    context: str,
+) -> int:
+    """丢弃超出正文字符范围的证据片段，保留对应的其他标注和约束问题。"""
+
+    context_length = len(context)
+    discarded = 0
+
+    def filter_evidence(owner: object, field_name: str = "evidence") -> None:
+        nonlocal discarded
+        evidence = list(getattr(owner, field_name))
+        kept = [
+            item
+            for item in evidence
+            if 0 <= item.start < item.end <= context_length
+        ]
+        discarded += len(evidence) - len(kept)
+        setattr(owner, field_name, kept)
+
+    for person in label.persons:
+        filter_evidence(person, "mentions")
+        for event in person.life_events:
+            filter_evidence(event)
+        for event in person.historical_events:
+            filter_evidence(event)
+    for relation in label.person_relations:
+        filter_evidence(relation)
+    for item in (
+        *label.excluded_mentions,
+        *label.unresolved_items,
+        *label.schema_conflicts,
+    ):
+        filter_evidence(item)
+    return discarded
 
 
 def validate_for_submission(
@@ -382,6 +428,112 @@ def validate_for_submission(
     return issues
 
 
+def parse_imported_label(
+    content: bytes | str,
+    task: ExtractionAnnotationTask,
+    passage: Passage,
+    db: Session,
+    *,
+    require_submission: bool,
+    allow_validation_issues: bool = False,
+) -> ExtractionAnnotationLabel:
+    """解析并校验上传的人工标注文件。
+
+    文件可以是金标导出的完整 wrapper，也可以是直接的 ``label`` 对象。
+    草稿导入只阻断正文证据和版本问题；金标导入还会执行完整提交校验。
+    """
+
+    try:
+        text = content.decode("utf-8-sig") if isinstance(content, bytes) else content
+    except UnicodeDecodeError as exc:
+        raise AnnotationValidationError("标注结果文件必须使用 UTF-8 编码。") from exc
+
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise AnnotationValidationError("标注结果文件不是合法的 YAML/JSON。") from exc
+
+    if not isinstance(document, dict):
+        raise AnnotationValidationError("标注结果文件的根节点必须是对象。")
+
+    metadata = document.get("metadata", {})
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise AnnotationValidationError("标注结果 metadata 必须是对象。")
+
+    declared_task_id = metadata.get("task_id")
+    if declared_task_id is not None:
+        try:
+            declared_task_id = int(declared_task_id)
+        except (TypeError, ValueError) as exc:
+            raise AnnotationValidationError("标注结果 metadata.task_id 必须是整数。") from exc
+        if declared_task_id != task.id:
+            raise AnnotationValidationError("标注结果不属于当前标注任务。")
+
+    declared_spec = metadata.get("spec_version")
+    if declared_spec is not None and declared_spec != task.spec_version:
+        raise AnnotationValidationError("标注结果规范版本与当前任务不一致。")
+
+    declared_digest = metadata.get("context_sha256")
+    if declared_digest is not None and declared_digest != context_sha256(passage.context):
+        raise AnnotationConflictError("标注结果对应的正文版本已变化，不能导入当前任务。")
+
+    passage_payload = document.get("passage")
+    if passage_payload is not None:
+        if not isinstance(passage_payload, dict):
+            raise AnnotationValidationError("标注结果 passage 必须是对象。")
+        doc_id = passage_payload.get("doc_id")
+        if doc_id is not None:
+            try:
+                doc_id = int(doc_id)
+            except (TypeError, ValueError) as exc:
+                raise AnnotationValidationError("标注结果 passage.doc_id 必须是整数。") from exc
+            if doc_id != passage.doc_id:
+                raise AnnotationValidationError("标注结果不属于当前古籍。")
+        source_context = passage_payload.get("context")
+        if source_context is not None and source_context != passage.context:
+            raise AnnotationConflictError("标注结果对应的正文与当前古籍不一致。")
+        if passage_payload.get("context_sha256") not in (None, context_sha256(passage.context)):
+            raise AnnotationConflictError("标注结果对应的正文摘要与当前古籍不一致。")
+
+    label_payload = document.get("label")
+    if label_payload is None and "schema_version" in document:
+        label_payload = document
+    if not isinstance(label_payload, dict):
+        raise AnnotationValidationError("标注结果必须包含 label 对象。")
+
+    try:
+        label = ExtractionAnnotationLabel.model_validate(label_payload)
+    except ValidationError as exc:
+        details = [
+            {
+                "path": ".".join(str(part) for part in issue["loc"]),
+                "message": issue["msg"],
+                "code": "invalid_import_label",
+            }
+            for issue in exc.errors()
+        ]
+        raise AnnotationValidationError(details) from exc
+
+    if allow_validation_issues:
+        discard_out_of_range_evidence(label, passage.context)
+        issues: list[dict[str, str]] = []
+    else:
+        issues = (
+            validate_for_submission(label, passage.context, task.spec_version, db)
+            if require_submission
+            else validate_evidence_offsets(label, passage.context)
+        )
+        if label.schema_version != task.spec_version:
+            issues.append(
+                _issue("schema_version", "标签规范版本与任务版本不一致。", "schema_version_mismatch")
+            )
+    if issues:
+        raise AnnotationValidationError(issues)
+    return label
+
+
 class ExtractionAnnotationService:
     def __init__(self, db: Session):
         self.db = db
@@ -516,6 +668,32 @@ class ExtractionAnnotationService:
         self.db.refresh(task)
         return self._build_summary(task, passage, current_user)
 
+    def reset_task(
+        self,
+        task_id: int,
+        current_user: User,
+    ) -> ExtractionTaskSummaryResponse:
+        """管理员清空任务全部标注数据，并保留任务配置重新开放。"""
+
+        self._assert_admin(current_user, "仅管理员可以重置标注任务。")
+        task, passage = self._get_task_and_passage(task_id)
+        self._clear_task_data(task.id)
+        task.status = "open"
+        task.updated_at = datetime.now(timezone.utc)
+        self.db.add(task)
+        self.db.commit()
+        self.db.refresh(task)
+        return self._build_summary(task, passage, current_user)
+
+    def delete_task(self, task_id: int, current_user: User) -> None:
+        """管理员删除任务及其全部标注/裁定数据，但不删除对应古籍。"""
+
+        self._assert_admin(current_user, "仅管理员可以删除标注任务。")
+        task, _ = self._get_task_and_passage(task_id)
+        self._clear_task_data(task.id)
+        self.db.delete(task)
+        self.db.commit()
+
     def get_task_detail(
         self,
         task_id: int,
@@ -553,6 +731,54 @@ class ExtractionAnnotationService:
         self.db.refresh(submission)
         return self._build_detail(task, passage, submission)
 
+    def import_draft(
+        self,
+        task_id: int,
+        current_user: User,
+        revision: int,
+        content: bytes | str,
+        *,
+        allow_validation_issues: bool = False,
+        source_ai_job_id: int | None = None,
+    ) -> ExtractionTaskDetailResponse:
+        """把外部 YAML/JSON 标注结果导入当前用户的独立盲标草稿。"""
+
+        task, passage = self._get_task_and_passage(task_id)
+        submission = self._require_editable_submission(task_id, current_user.id)
+        self._assert_revision(submission, revision)
+        self._assert_current_context(task, passage)
+        label = parse_imported_label(
+            content,
+            task,
+            passage,
+            self.db,
+            require_submission=False,
+            allow_validation_issues=allow_validation_issues,
+        )
+
+        submission.label_json = _dump_label(label)
+        if source_ai_job_id is not None:
+            source_job = self.db.get(ExtractionAIAnnotationJob, source_ai_job_id)
+            if (
+                source_job is None
+                or source_job.task_id != task_id
+                or source_job.requested_by != current_user.id
+            ):
+                raise AnnotationNotFoundError("未找到可关联的 AI 标注任务。")
+            if source_job.status != "success":
+                raise AnnotationConflictError("只有已完成的 AI 标注结果才能关联到盲标草稿。")
+            submission.source_ai_job_id = source_job.id
+            submission.ai_imported_at = datetime.now(timezone.utc)
+        else:
+            # 人工导入新文件代表来源发生变化，不能继续把结果归因给旧 AI 任务。
+            submission.source_ai_job_id = None
+            submission.ai_imported_at = None
+        submission.revision += 1
+        self.db.add(submission)
+        self.db.commit()
+        self.db.refresh(submission)
+        return self._build_detail(task, passage, submission)
+
     def submit(
         self,
         task_id: int,
@@ -573,6 +799,7 @@ class ExtractionAnnotationService:
         submission.submitted_at = datetime.now(timezone.utc)
         submission.revision += 1
         self.db.add(submission)
+        self._record_ai_submission_metrics(submission, label)
         self.db.flush()
         self._refresh_task_status(task)
         self.db.add(task)
@@ -580,6 +807,81 @@ class ExtractionAnnotationService:
         self.db.refresh(task)
         self.db.refresh(submission)
         return self._build_detail(task, passage, submission)
+
+    def _record_ai_submission_metrics(
+        self,
+        submission: ExtractionAnnotationSubmission,
+        final_label: ExtractionAnnotationLabel,
+    ) -> None:
+        """封口 AI 标注会话的总耗时与首轮到最终提交差异。
+
+        统计失败不能阻断人工标注提交，因此所有兼容旧数据的异常都只写日志。
+        """
+
+        if submission.source_ai_job_id is None or submission.submitted_at is None:
+            return
+        try:
+            source_job = self.db.get(
+                ExtractionAIAnnotationJob,
+                submission.source_ai_job_id,
+            )
+            if source_job is None:
+                return
+            root_job = self._find_ai_generation_root(source_job)
+            if root_job.operation != "generate":
+                return
+
+            result_payload = json.loads(root_job.result_json or "{}")
+            first_label_payload = result_payload.get("label")
+            if not isinstance(first_label_payload, dict):
+                document = result_payload.get("document")
+                first_label_payload = (
+                    document.get("label") if isinstance(document, dict) else None
+                )
+
+            category_counts: dict[str, int] = {}
+            difference_count = 0
+            if isinstance(first_label_payload, dict):
+                first_label = ExtractionAnnotationLabel.model_validate(first_label_payload)
+                # 延迟导入以避免标注服务与裁定服务的模块初始化互相依赖。
+                from app.services.extraction_adjudication_service import (
+                    build_adjudication_differences,
+                )
+
+                differences = build_adjudication_differences(first_label, final_label)
+                difference_count = len(differences)
+                for difference in differences:
+                    category_counts[difference.category] = (
+                        category_counts.get(difference.category, 0) + 1
+                    )
+
+            root_job.submitted_at = submission.submitted_at
+            root_job.final_difference_count = difference_count
+            root_job.final_differences_json = json.dumps(
+                category_counts,
+                ensure_ascii=False,
+            )
+            self.db.add(root_job)
+        except Exception:
+            logger.exception(
+                "Failed to finalize AI annotation metrics submission_id=%s source_job_id=%s",
+                submission.id,
+                submission.source_ai_job_id,
+            )
+
+    def _find_ai_generation_root(
+        self,
+        job: ExtractionAIAnnotationJob,
+    ) -> ExtractionAIAnnotationJob:
+        current = job
+        visited = {current.id}
+        while current.operation == "repair" and current.source_job_id is not None:
+            parent = self.db.get(ExtractionAIAnnotationJob, current.source_job_id)
+            if parent is None or parent.id in visited:
+                break
+            visited.add(parent.id)
+            current = parent
+        return current
 
     def _get_task_and_passage(self, task_id: int) -> tuple[ExtractionAnnotationTask, Passage]:
         task = self.db.get(ExtractionAnnotationTask, task_id)
@@ -589,6 +891,24 @@ class ExtractionAnnotationService:
         if passage is None:
             raise AnnotationNotFoundError("标注任务对应的古籍不存在。")
         return task, passage
+
+    @staticmethod
+    def _assert_admin(current_user: User, message: str) -> None:
+        if current_user.role != "admin":
+            raise AnnotationForbiddenError(message)
+
+    def _clear_task_data(self, task_id: int) -> None:
+        """显式删除任务子表，兼容 SQLite 未开启 foreign_keys 的部署/测试环境。"""
+
+        self.db.query(ExtractionAdjudicationDraft).filter(
+            ExtractionAdjudicationDraft.task_id == task_id
+        ).delete(synchronize_session=False)
+        self.db.query(ExtractionGoldVersion).filter(
+            ExtractionGoldVersion.task_id == task_id
+        ).delete(synchronize_session=False)
+        self.db.query(ExtractionAnnotationSubmission).filter(
+            ExtractionAnnotationSubmission.task_id == task_id
+        ).delete(synchronize_session=False)
 
     def _get_own_submission(
         self,

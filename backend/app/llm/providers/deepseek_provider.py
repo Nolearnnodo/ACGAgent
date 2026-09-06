@@ -29,17 +29,17 @@ def _messages_tokens(messages: list[dict[str, str]]) -> int:
 
 def _trim_messages(
     messages: list[dict[str, str]],
-    max_tokens: int,
+    max_input_tokens: int,
 ) -> list[dict[str, str]]:
     if len(messages) <= 2:
         return messages
-    if _messages_tokens(messages) <= max_tokens:
+    if _messages_tokens(messages) <= max_input_tokens:
         return messages
 
     head = messages[0]
     tail = messages[-1]
     middle = list(messages[1:-1])
-    while middle and _messages_tokens([head] + middle + [tail]) > max_tokens:
+    while middle and _messages_tokens([head] + middle + [tail]) > max_input_tokens:
         middle.pop(0)
     return [head] + middle + [tail]
 
@@ -84,47 +84,107 @@ def _parse_usage(raw_usage: dict[str, Any] | None) -> LLMUsage:
 class DeepSeekProvider(BaseLLMProvider):
     """Provider backed by the DeepSeek chat completions API."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_base_url: str | None = None,
+        model_name: str | None = None,
+        temperature: float | None = None,
+        include_temperature: bool = True,
+        timeout_seconds: int | None = None,
+        disable_timeout: bool = False,
+    ) -> None:
         self.settings = get_settings()
         self.mock_provider = MockLLMProvider()
+        # None 表示沿用 settings 的动态值；保留这一点可以兼容测试和运行时配置刷新。
+        self.api_key = api_key
+        self.api_base_url = api_base_url
+        self.model_name = model_name
+        self.temperature = (
+            0.1 if temperature is None else temperature
+        )
+        self.include_temperature = include_temperature
+        self.disable_timeout = disable_timeout
+        self.timeout_seconds = (
+            None
+            if disable_timeout
+            else (
+                self.settings.llm_timeout_seconds
+                if timeout_seconds is None
+                else timeout_seconds
+            )
+        )
 
     def _build_headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.settings.llm_api_key}",
+            "Authorization": f"Bearer {self._effective_api_key}",
             "Content-Type": "application/json",
         }
+
+    @property
+    def _effective_api_key(self) -> str:
+        return self.settings.llm_api_key if self.api_key is None else self.api_key
+
+    @property
+    def _effective_api_base_url(self) -> str:
+        return self.settings.llm_api_base_url if self.api_base_url is None else self.api_base_url
+
+    @property
+    def _effective_model_name(self) -> str:
+        return self.settings.llm_model_name if self.model_name is None else self.model_name
+
+    @property
+    def _effective_timeout_seconds(self) -> int | None:
+        if self.disable_timeout:
+            return None
+        return self.settings.llm_timeout_seconds if self.timeout_seconds is None else self.timeout_seconds
 
     def _post_chat_completion_result(
         self,
         messages: list[dict[str, str]],
         metadata: dict[str, Any] | None = None,
     ) -> LLMCallResult:
-        if not self.settings.llm_api_base_url or not self.settings.llm_api_key:
+        api_base_url = self._effective_api_base_url
+        api_key = self._effective_api_key
+        model_name = self._effective_model_name
+        if not api_base_url or not api_key or not model_name:
             raise ValueError("DeepSeek API configuration is incomplete.")
 
         trimmed = _trim_messages(messages, MAX_INPUT_TOKENS)
         payload: dict[str, Any] = {
-            "model": self.settings.llm_model_name,
+            "model": model_name,
             "messages": trimmed,
-            "temperature": 0.1,
         }
+        if self.include_temperature:
+            payload["temperature"] = self.temperature
         if (metadata or {}).get("response_format") != "text":
             payload["response_format"] = {"type": "json_object"}
         started = time.perf_counter()
-        response = httpx.post(
-            f"{self.settings.llm_api_base_url.rstrip('/')}/chat/completions",
-            headers=self._build_headers(),
-            json=payload,
-            timeout=self.settings.llm_timeout_seconds,
+        response_body = bytearray()
+        client_timeout = (
+            None
+            if self.disable_timeout
+            else httpx.Timeout(max(float(self._effective_timeout_seconds or 0), 1.0))
         )
+        # 以 stream 读取响应，兼容响应体较大的模型输出；标注调用的 client_timeout 为 None。
+        with httpx.Client(timeout=client_timeout) as client:
+            with client.stream(
+                "POST",
+                f"{api_base_url.rstrip('/')}/chat/completions",
+                headers=self._build_headers(),
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                for chunk in response.iter_bytes():
+                    response_body.extend(chunk)
         latency_ms = int((time.perf_counter() - started) * 1000)
-        response.raise_for_status()
-        data = response.json()
+        data = json.loads(bytes(response_body))
         return LLMCallResult(
             content=data["choices"][0]["message"]["content"],
             usage=_parse_usage(data.get("usage")),
             provider="deepseek",
-            model=str(data.get("model") or self.settings.llm_model_name),
+            model=str(data.get("model") or model_name),
             raw_response=data,
             latency_ms=latency_ms,
         )
@@ -143,7 +203,9 @@ class DeepSeekProvider(BaseLLMProvider):
     ) -> LLMCallResult:
         last_exc: Exception | None = None
         started = time.perf_counter()
-        for attempt, delay in enumerate([0] + list(_RETRY_DELAYS)):
+        retry_enabled = (metadata or {}).get("retry", True) is not False
+        retry_delays = [0] + list(_RETRY_DELAYS) if retry_enabled else [0]
+        for attempt, delay in enumerate(retry_delays):
             if delay:
                 time.sleep(delay)
             try:

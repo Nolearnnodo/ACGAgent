@@ -328,6 +328,17 @@ export async function releaseExtractionDraft(taskId: number, submissionId: numbe
   return data
 }
 
+export async function resetExtractionTask(taskId: number) {
+  const { data } = await apiClient.post<ExtractionTaskSummary>(
+    `/annotations/extraction/tasks/${taskId}/reset`,
+  )
+  return data
+}
+
+export async function deleteExtractionTask(taskId: number) {
+  await apiClient.delete(`/annotations/extraction/tasks/${taskId}`)
+}
+
 export async function fetchExtractionTask(taskId: number) {
   const { data } = await apiClient.get<ExtractionTaskDetail>(
     `/annotations/extraction/tasks/${taskId}`,
@@ -343,6 +354,29 @@ export async function saveExtractionDraft(
   const { data } = await apiClient.put<ExtractionTaskDetail>(
     `/annotations/extraction/tasks/${taskId}/draft`,
     { revision, label },
+  )
+  return data
+}
+
+export async function importExtractionDraft(
+  taskId: number,
+  revision: number,
+  file: File,
+  allowValidationIssues = false,
+  aiJobId?: number,
+) {
+  const formData = new FormData()
+  formData.append('file', file)
+  const { data } = await apiClient.post<ExtractionTaskDetail>(
+    `/annotations/extraction/tasks/${taskId}/import`,
+    formData,
+    {
+      params: {
+        revision,
+        allow_validation_issues: allowValidationIssues,
+        ...(aiJobId ? { ai_job_id: aiJobId } : {}),
+      },
+    },
   )
   return data
 }
@@ -412,4 +446,27 @@ export async function downloadExtractionGold(taskId: number, version?: number) {
   const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1]
     ?? `extraction-gold-task-${taskId}.yaml`
   return { blob: response.data, filename }
+}
+
+export async function fetchExtractionGold(taskId: number, version?: number) {
+  const { data } = await apiClient.get<ExtractionGoldVersion>(
+    `/annotations/extraction/adjudications/${taskId}/gold`,
+    { params: version ? { version } : undefined },
+  )
+  return data
+}
+
+export async function importExtractionGold(
+  taskId: number,
+  file: File,
+  changeReason = '',
+) {
+  const formData = new FormData()
+  formData.append('file', file)
+  const { data } = await apiClient.post<ExtractionGoldVersion>(
+    `/annotations/extraction/adjudications/${taskId}/import`,
+    formData,
+    { params: changeReason ? { change_reason: changeReason } : undefined },
+  )
+  return data
 }

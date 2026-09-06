@@ -2,13 +2,22 @@
 
 from typing import Callable, TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_admin_user, get_current_user
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.extraction_annotation import (
+    AIAnnotationGenerateRequest,
+    AIAnnotationJobResponse,
+    AIAnnotationMetricsResponse,
+    AIAnnotationPromptRequest,
+    AIAnnotationPromptResponse,
+    AIAnnotationRepairRequest,
+    AIAnnotationResultResponse,
+    AIAnnotationTaskContextResponse,
+    AIAnnotationValidateRequest,
     AnnotationDictionariesResponse,
     AnnotationEraEntry,
     AnnotationHistoricalEventEntry,
@@ -16,6 +25,7 @@ from app.schemas.extraction_annotation import (
     ExtractionAdjudicationDetailResponse,
     ExtractionAdjudicationSummaryResponse,
     ExtractionAdjudicationUpdateRequest,
+    ExtractionGoldVersionResponse,
     ExtractionDraftUpdateRequest,
     ExtractionSubmitRequest,
     ExtractionTaskCreateRequest,
@@ -32,6 +42,11 @@ from app.services.extraction_annotation_service import (
     ExtractionAnnotationService,
     ExtractionAnnotationServiceError,
 )
+from app.services.extraction_ai_annotation_service import ExtractionAIAnnotationService
+from app.services.extraction_ai_annotation_job_service import ExtractionAIAnnotationJobService
+from app.services.extraction_ai_annotation_metrics_service import (
+    ExtractionAIAnnotationMetricsService,
+)
 
 
 router = APIRouter(prefix="/annotations/extraction", tags=["功能 A 人工标注"])
@@ -43,6 +58,118 @@ def _run_service(action: Callable[[], T]) -> T:
         return action()
     except ExtractionAnnotationServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@router.post("/ai/generate", response_model=AIAnnotationJobResponse, status_code=202)
+def generate_ai_extraction_annotation(
+    payload: AIAnnotationGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationJobResponse:
+    """将一次 AI 标注请求写入持久化队列并立即返回任务状态。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationJobService(db).enqueue(payload, current_user)
+    )
+
+
+@router.post("/ai/jobs", response_model=AIAnnotationJobResponse, status_code=202)
+def enqueue_ai_extraction_annotation(
+    payload: AIAnnotationGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationJobResponse:
+    """AI 标注队列的显式入队入口。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationJobService(db).enqueue(payload, current_user)
+    )
+
+
+@router.get("/ai/jobs", response_model=list[AIAnnotationJobResponse])
+def list_ai_extraction_annotation_jobs(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AIAnnotationJobResponse]:
+    """返回当前用户每个篇目的最新 AI 标注任务状态。"""
+
+    return ExtractionAIAnnotationJobService(db).list_latest_jobs(current_user)
+
+
+@router.get("/ai/jobs/{job_id}", response_model=AIAnnotationJobResponse)
+def get_ai_extraction_annotation_job(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationJobResponse:
+    """返回一条持久化 AI 标注任务及其结果或错误。"""
+
+    return _run_service(lambda: ExtractionAIAnnotationJobService(db).get_job(job_id, current_user))
+
+
+@router.get("/ai/tasks/{task_id}", response_model=AIAnnotationTaskContextResponse)
+def get_ai_extraction_task_context(
+    task_id: int,
+    _current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationTaskContextResponse:
+    """提供 AI 工作台预览篇目所需的正文，不会自动领取盲标槽位。"""
+
+    return _run_service(lambda: ExtractionAIAnnotationService(db).get_task_context(task_id))
+
+
+@router.post("/ai/prompt", response_model=AIAnnotationPromptResponse)
+def preview_ai_extraction_annotation_prompt(
+    payload: AIAnnotationPromptRequest,
+    _current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationPromptResponse:
+    """返回当前篇目实际发送给模型的系统提示词和篇目载荷。"""
+
+    return _run_service(lambda: ExtractionAIAnnotationService(db).preview_prompt(payload))
+
+
+@router.post("/ai/validate", response_model=AIAnnotationResultResponse)
+def validate_ai_extraction_annotation(
+    payload: AIAnnotationValidateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationResultResponse:
+    """校验并保存页面编辑后的 JSON，供当前篇目后续恢复。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationService(db).validate(
+            payload.task_id,
+            payload.content,
+            requested_by=current_user.id,
+            job_id=payload.job_id,
+        )
+    )
+
+
+@router.post("/ai/repair", response_model=AIAnnotationJobResponse, status_code=202)
+def repair_ai_extraction_annotation(
+    payload: AIAnnotationRepairRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationJobResponse:
+    """把当前页面 JSON 加入 API 修复问题队列并保存结果。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationJobService(db).enqueue_repair(payload, current_user)
+    )
+
+
+@router.get("/ai/metrics", response_model=AIAnnotationMetricsResponse)
+def get_ai_extraction_annotation_metrics(
+    days: int = Query(default=30, ge=0, le=3650),
+    limit: int = Query(default=500, ge=1, le=2000),
+    _current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationMetricsResponse:
+    """返回 AI 标注首轮质量、Token、修复与最终提交耗时统计。"""
+
+    return ExtractionAIAnnotationMetricsService(db).get_metrics(days=days, limit=limit)
 
 
 @router.get("/tasks", response_model=list[ExtractionTaskSummaryResponse])
@@ -100,6 +227,34 @@ def release_extraction_draft(
     )
 
 
+@router.post(
+    "/tasks/{task_id}/reset",
+    response_model=ExtractionTaskSummaryResponse,
+)
+def reset_extraction_task(
+    task_id: int,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+) -> ExtractionTaskSummaryResponse:
+    """管理员清空任务的所有标注与裁定数据，并保留任务重新开放。"""
+
+    return _run_service(
+        lambda: ExtractionAnnotationService(db).reset_task(task_id, current_user)
+    )
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+def delete_extraction_task(
+    task_id: int,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """管理员删除任务及其标注数据，不删除对应古籍正文。"""
+
+    _run_service(lambda: ExtractionAnnotationService(db).delete_task(task_id, current_user))
+    return Response(status_code=204)
+
+
 @router.get("/tasks/{task_id}", response_model=ExtractionTaskDetailResponse)
 def get_extraction_task(
     task_id: int,
@@ -126,6 +281,39 @@ def save_extraction_draft(
             current_user,
             payload.revision,
             payload.label,
+        )
+    )
+
+
+@router.post("/tasks/{task_id}/import", response_model=ExtractionTaskDetailResponse)
+async def import_extraction_draft(
+    task_id: int,
+    revision: int = Query(..., ge=0),
+    allow_validation_issues: bool = Query(default=False),
+    ai_job_id: int | None = Query(default=None, gt=0),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ExtractionTaskDetailResponse:
+    """把 YAML/JSON 标注结果导入当前用户的独立盲标草稿。"""
+
+    filename = file.filename or ""
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if suffix not in {"yaml", "yml", "json"}:
+        raise HTTPException(status_code=400, detail="仅支持 YAML、YML 或 JSON 标注结果文件。")
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="标注结果文件不能超过 10 MB。")
+
+    return _run_service(
+        lambda: ExtractionAnnotationService(db).import_draft(
+            task_id,
+            current_user,
+            revision,
+            content,
+            allow_validation_issues=allow_validation_issues,
+            source_ai_job_id=ai_job_id,
         )
     )
 
@@ -224,6 +412,54 @@ def get_extraction_adjudication(
     db: Session = Depends(get_db),
 ) -> ExtractionAdjudicationDetailResponse:
     return _run_service(lambda: ExtractionAdjudicationService(db).get_adjudication(task_id))
+
+
+@router.get(
+    "/adjudications/{task_id}/gold",
+    response_model=ExtractionGoldVersionResponse,
+)
+def get_extraction_gold(
+    task_id: int,
+    version: int | None = Query(default=None, ge=1),
+    _current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+) -> ExtractionGoldVersionResponse:
+    """返回指定任务的最新或指定版本金标，供下游批量抽取读取。"""
+
+    return _run_service(lambda: ExtractionAdjudicationService(db).get_gold(task_id, version))
+
+
+@router.post(
+    "/adjudications/{task_id}/import",
+    response_model=ExtractionGoldVersionResponse,
+)
+async def import_extraction_gold(
+    task_id: int,
+    file: UploadFile = File(...),
+    change_reason: str = Query(default="", max_length=2000),
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+) -> ExtractionGoldVersionResponse:
+    """导入上次导出的 YAML/JSON 标注结果，保存为新的不可变金标版本。"""
+
+    filename = file.filename or ""
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if suffix not in {"yaml", "yml", "json"}:
+        raise HTTPException(status_code=400, detail="仅支持 YAML、YML 或 JSON 标注结果文件。")
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="标注结果文件不能超过 10 MB。")
+
+    return _run_service(
+        lambda: ExtractionAdjudicationService(db).import_gold_yaml(
+            task_id,
+            content,
+            current_user,
+            source_name=filename,
+            change_reason=change_reason,
+        )
+    )
 
 
 @router.put(

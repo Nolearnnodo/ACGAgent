@@ -22,6 +22,7 @@ from app.schemas.extraction_annotation import (
 )
 from app.services.extraction_adjudication_service import ExtractionAdjudicationService
 from app.services.extraction_annotation_service import (
+    AnnotationConflictError,
     AnnotationValidationError,
     ExtractionAnnotationService,
     codepoint_to_utf16_offset,
@@ -171,6 +172,51 @@ def test_adjudication_draft_lock_version_and_yaml_export(adjudication_db):
     db.refresh(first_gold)
     assert first_gold.gold_json == first_json
     assert json.loads(first_gold.adjudication_log_json)["version"] == 1
+
+
+def test_gold_import_is_idempotent_and_available_to_downstream(adjudication_db):
+    db, admin, annotator_a, annotator_b, passage = adjudication_db
+    task = _submitted_task(db, admin, annotator_a, annotator_b, passage)
+    service = ExtractionAdjudicationService(db)
+    detail = service.get_adjudication(task.id)
+    resolutions = [
+        AdjudicationResolution(difference_id=item.id, decision="a")
+        for item in detail.differences
+    ]
+    service.lock_gold(
+        task.id,
+        ExtractionAdjudicationUpdateRequest(revision=0, resolutions=resolutions),
+        admin,
+    )
+    _, exported = service.export_gold_yaml(task.id)
+
+    imported = service.import_gold_yaml(task.id, exported, admin, source_name="previous.yaml")
+    assert imported.version == 1
+    assert imported.label.persons[0].name_surface == "李𠮷"
+    assert service.get_gold(task.id).version == 1
+    assert db.query(ExtractionGoldVersion).filter_by(task_id=task.id).count() == 1
+
+
+def test_gold_import_rejects_a_changed_context(adjudication_db):
+    db, admin, annotator_a, annotator_b, passage = adjudication_db
+    task = _submitted_task(db, admin, annotator_a, annotator_b, passage)
+    service = ExtractionAdjudicationService(db)
+    detail = service.get_adjudication(task.id)
+    resolutions = [
+        AdjudicationResolution(difference_id=item.id, decision="a")
+        for item in detail.differences
+    ]
+    service.lock_gold(
+        task.id,
+        ExtractionAdjudicationUpdateRequest(revision=0, resolutions=resolutions),
+        admin,
+    )
+    _, exported = service.export_gold_yaml(task.id)
+    document = yaml.safe_load(exported)
+    document["metadata"]["context_sha256"] = "0" * 64
+
+    with pytest.raises(AnnotationConflictError):
+        service.import_gold_yaml(task.id, yaml.safe_dump(document, allow_unicode=True), admin)
 
 
 def test_relation_reverse_suggestions_and_submission_validation():

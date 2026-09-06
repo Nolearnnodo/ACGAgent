@@ -28,6 +28,17 @@ const navItems = computed(() => {
       active: route.path === '/annotations/extraction',
     },
     {
+      label: 'AI 标注',
+      to: '/annotations/extraction/ai',
+      active: route.path === '/annotations/extraction/ai',
+    },
+    {
+      label: 'AI 标注统计',
+      to: '/annotations/extraction/ai/metrics',
+      active: route.path.startsWith('/annotations/extraction/ai/metrics'),
+      adminOnly: true,
+    },
+    {
       label: '抽取裁定',
       to: '/annotations/extraction/adjudication',
       active: route.path.startsWith('/annotations/extraction/adjudication'),

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
+from app.models.extraction_annotation import (
+    ExtractionAdjudicationDraft,
+    ExtractionAnnotationSubmission,
+    ExtractionGoldVersion,
+)
 from app.models.passage import Passage
 from app.models.user import User
 from app.schemas.extraction_annotation import (
@@ -173,6 +180,68 @@ def test_admin_can_see_assignees_and_release_only_unsubmitted_drafts(annotation_
         service.release_draft(task.id, submitted.submission.id, admin)
 
 
+def test_admin_can_reset_task_and_clear_all_annotation_data(annotation_db):
+    db, admin, annotator_a, annotator_b, passage = annotation_db
+    service = ExtractionAnnotationService(db)
+    task = service.create_task(
+        ExtractionTaskCreateRequest(passage_id=passage.doc_id),
+        admin,
+    )
+    detail_a = service.claim_task(task.id, annotator_a)
+    service.submit(task.id, annotator_a, detail_a.submission.revision, _person_label(passage.context))
+    service.claim_task(task.id, annotator_b)
+    db.add(
+        ExtractionAdjudicationDraft(
+            task_id=task.id,
+            reviewer_id=admin.id,
+            resolutions_json="[]",
+            gold_json="{}",
+        )
+    )
+    db.add(
+        ExtractionGoldVersion(
+            task_id=task.id,
+            version=1,
+            gold_json="{}",
+            source_submission_ids_json="[]",
+            adjudication_log_json="[]",
+            reviewer_id=admin.id,
+        )
+    )
+    db.commit()
+
+    with pytest.raises(AnnotationForbiddenError):
+        service.reset_task(task.id, annotator_a)
+
+    reset = service.reset_task(task.id, admin)
+    assert reset.status == "open"
+    assert reset.claimed_count == 0
+    assert reset.submitted_count == 0
+    assert reset.available_slots == 2
+    assert db.query(ExtractionAnnotationSubmission).filter_by(task_id=task.id).count() == 0
+    assert db.query(ExtractionAdjudicationDraft).filter_by(task_id=task.id).count() == 0
+    assert db.query(ExtractionGoldVersion).filter_by(task_id=task.id).count() == 0
+    assert db.get(Passage, passage.doc_id) is not None
+
+
+def test_admin_can_delete_task_without_deleting_passage(annotation_db):
+    db, admin, annotator_a, _, passage = annotation_db
+    service = ExtractionAnnotationService(db)
+    task = service.create_task(
+        ExtractionTaskCreateRequest(passage_id=passage.doc_id),
+        admin,
+    )
+    service.claim_task(task.id, annotator_a)
+
+    with pytest.raises(AnnotationForbiddenError):
+        service.delete_task(task.id, annotator_a)
+
+    service.delete_task(task.id, admin)
+    assert db.query(ExtractionAnnotationSubmission).filter_by(task_id=task.id).count() == 0
+    assert db.get(Passage, passage.doc_id) is not None
+    assert service.list_tasks(admin) == []
+
+
 def test_draft_rejects_evidence_that_cannot_replay(annotation_db):
     db, admin, annotator_a, _, passage = annotation_db
     service = ExtractionAnnotationService(db)
@@ -193,3 +262,74 @@ def test_draft_rejects_evidence_that_cannot_replay(annotation_db):
         )
 
     assert error.value.detail[0]["code"] == "evidence_quote_mismatch"
+
+
+def test_import_result_into_current_draft(annotation_db):
+    db, admin, annotator_a, _, passage = annotation_db
+    service = ExtractionAnnotationService(db)
+    task = service.create_task(ExtractionTaskCreateRequest(passage_id=passage.doc_id), admin)
+    detail = service.claim_task(task.id, annotator_a)
+    label = _person_label(passage.context)
+    payload = {
+        "metadata": {
+            "task_id": task.id,
+            "spec_version": task.spec_version,
+            "context_sha256": task.context_sha256,
+        },
+        "passage": {
+            "doc_id": passage.doc_id,
+            "context": passage.context,
+        },
+        "label": label.model_dump(mode="json"),
+    }
+
+    imported = service.import_draft(
+        task.id,
+        annotator_a,
+        detail.submission.revision,
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+    assert imported.submission.revision == 1
+    assert imported.submission.state == "draft"
+    assert imported.submission.label.persons[0].name_surface == "李𠮷"
+
+
+def test_ai_import_keeps_rule_errors_and_discards_out_of_range_evidence(annotation_db):
+    db, admin, annotator_a, _, passage = annotation_db
+    service = ExtractionAnnotationService(db)
+    task = service.create_task(ExtractionTaskCreateRequest(passage_id=passage.doc_id), admin)
+    detail = service.claim_task(task.id, annotator_a)
+    label = _person_label(passage.context)
+    label.persons[0].event_checks["出生"] = "has_fact"
+    label.persons[0].mentions[0].end = len(passage.context) + 10
+    label.persons[0].mentions[0].end_utf16 = len(passage.context) + 10
+    payload = {
+        "metadata": {
+            "task_id": task.id,
+            "spec_version": task.spec_version,
+            "context_sha256": task.context_sha256,
+        },
+        "passage": {"doc_id": passage.doc_id, "context": passage.context},
+        "label": label.model_dump(mode="json"),
+    }
+
+    imported = service.import_draft(
+        task.id,
+        annotator_a,
+        detail.submission.revision,
+        json.dumps(payload, ensure_ascii=False),
+        allow_validation_issues=True,
+    )
+
+    assert imported.submission.label.persons[0].mentions == []
+    assert imported.submission.label.persons[0].event_checks["出生"] == "has_fact"
+
+    with pytest.raises(AnnotationValidationError):
+        service.import_draft(
+            task.id,
+            annotator_a,
+            imported.submission.revision,
+            "not-json",
+            allow_validation_issues=True,
+        )
