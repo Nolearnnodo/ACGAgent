@@ -71,7 +71,13 @@ const filteredItems = computed(() => {
   const keyword = itemSearch.value.trim().toLowerCase()
   return (review.value?.items ?? []).filter((item) => (
     (categoryFilter.value === '全部' || item.category === categoryFilter.value)
-    && (!keyword || `${item.title} ${item.question} ${item.detail}`.toLowerCase().includes(keyword))
+    && (!keyword || [
+      item.title,
+      item.question,
+      item.detail,
+      item.path,
+      ...item.evidence.map((evidence) => evidence.quote),
+    ].join(' ').toLowerCase().includes(keyword))
   ))
 })
 
@@ -149,6 +155,10 @@ function uid(prefix: string) {
 
 function percent(value: number) {
   return `${(value * 100).toFixed(1)}%`
+}
+
+function isCoverageItem(item: AIAnnotationReviewItem) {
+  return item.id.startsWith('coverage:')
 }
 
 function timeLabel(value: string | null) {
@@ -251,6 +261,10 @@ async function focusItem(item: AIAnnotationReviewItem) {
   activeItemId.value = item.id
   const evidence = item.evidence[0]
   if (!evidence) return
+  await focusEvidence(evidence)
+}
+
+async function focusEvidence(evidence: EvidenceSpan) {
   activeEvidenceId.value = evidence.id
   await nextTick()
   textCanvas.value?.focusEvidence(evidence.id)
@@ -464,6 +478,10 @@ onBeforeUnmount(() => {
                 @click="categoryFilter = category"
               >{{ category }}</button>
             </nav>
+            <p class="offset-guide">
+              <b>位置已自动计算</b>
+              字符索引从 0 开始，区间采用左闭右开 [起点, 终点)；例如 70—72 覆盖索引 70、71。点击证据行即可定位原文。
+            </p>
           </div>
           <div class="check-scroll">
             <p v-if="!filteredItems.length" class="empty">没有匹配的检查项。</p>
@@ -487,18 +505,38 @@ onBeforeUnmount(() => {
                   </button>
                 </header>
                 <p>{{ item.question }}</p>
-                <details v-if="item.detail">
-                  <summary>查看 AI 填写内容</summary>
-                  <pre>{{ item.detail }}</pre>
-                </details>
-                <div v-if="item.evidence.length" class="evidence-chips">
+                <section class="ai-output" aria-label="AI 标注内容">
+                  <header>
+                    <span>AI 标注内容</span>
+                    <code :title="item.path">字段：{{ item.path }}</code>
+                  </header>
+                  <p v-if="item.detail">{{ item.detail }}</p>
+                  <p v-else-if="isCoverageItem(item)" class="ai-output__coverage">
+                    此项检查首轮结果的全文覆盖情况，不对应单一字段值；请结合左侧原文判断是否存在漏标或误标。
+                  </p>
+                  <p v-else class="ai-output__coverage">AI 未填写额外属性；已提取的实体值与证据见下方。</p>
+                </section>
+                <div v-if="item.evidence.length" class="evidence-list" aria-label="AI 标注证据">
                   <button
                     v-for="evidence in item.evidence"
                     :key="evidence.id"
                     type="button"
-                    @click.stop="activeEvidenceId = evidence.id; textCanvas?.focusEvidence(evidence.id)"
-                  >“{{ evidence.quote }}”</button>
+                    :class="{ active: activeEvidenceId === evidence.id }"
+                    :aria-label="`定位证据“${evidence.quote}”，字符区间 ${evidence.start} 到 ${evidence.end}`"
+                    @click.stop="focusEvidence(evidence)"
+                  >
+                    <span class="evidence-list__quote">
+                      <small>证据原文</small>
+                      <strong>“{{ evidence.quote }}”</strong>
+                    </span>
+                    <span class="evidence-list__range">
+                      <b>字符 {{ evidence.start }}—{{ evidence.end }}</b>
+                      <small>{{ evidence.end - evidence.start }} 字 · UTF-16 {{ evidence.start_utf16 }}—{{ evidence.end_utf16 }}</small>
+                    </span>
+                    <span class="evidence-list__action">定位原文 →</span>
+                  </button>
                 </div>
+                <p v-else-if="!isCoverageItem(item)" class="no-evidence">AI 未提供可直接定位的正文证据，请结合字段值与左侧全文核对。</p>
                 <div class="verdict-buttons" role="group" :aria-label="`${item.title}判定`">
                   <button
                     type="button"
@@ -737,6 +775,8 @@ onBeforeUnmount(() => {
 .check-tools nav { display: flex; gap: 4px; overflow-x: auto; }
 .check-tools nav button { flex: 0 0 auto; border: 0; border-radius: 7px; padding: 5px 8px; background: #f1f5fb; color: var(--muted); font-size: 9px; cursor: pointer; }
 .check-tools nav button.active { background: #e4edff; color: var(--blue); font-weight: 700; }
+.offset-guide { margin: 0; padding: 8px 9px; border-left: 2px solid #9bb8ee; background: #f6f9ff; color: #60708c; font-size: 9px; line-height: 1.55; }
+.offset-guide b { margin-right: 5px; color: #365f9f; }
 .check-scroll, .review-rail__scroll { min-height: 0; overflow: auto; }
 .check-scroll { padding: 12px; }
 .check-item { display: grid; grid-template-columns: 27px 1fr; margin-bottom: 9px; border: 1px solid var(--line); border-left: 3px solid #c8d3e4; border-radius: 10px; background: #fff; transition: border-color 140ms ease, box-shadow 140ms ease; }
@@ -750,11 +790,25 @@ onBeforeUnmount(() => {
 .check-item__body h4 { margin: 3px 0 0; color: var(--ink); font-size: 12px; }
 .check-item__body header > button { border: 0; background: none; color: var(--blue); font-size: 9px; cursor: pointer; }
 .check-item__body > p { margin: 9px 0; color: #536482; font-size: 10px; line-height: 1.6; }
-.check-item details { margin: 7px 0; }
-.check-item summary { color: var(--muted); font-size: 9px; cursor: pointer; }
-.check-item pre { margin: 6px 0 0; padding: 8px; border-radius: 7px; background: #f6f8fc; color: #536482; font: 9px/1.55 ui-monospace, monospace; white-space: pre-wrap; }
-.evidence-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 7px 0; }
-.evidence-chips button, .omission-evidence > button { max-width: 100%; overflow: hidden; border: 1px solid #d8e3f5; border-radius: 6px; padding: 4px 6px; background: #f4f8ff; color: #526c9c; font-family: 'Noto Serif SC', serif; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.ai-output { margin: 9px 0; padding: 9px 10px; border-left: 2px solid #8fafe9; background: #f6f8fc; }
+.ai-output > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.ai-output > header span { color: #365f9f; font-size: 9px; font-weight: 700; }
+.ai-output code { min-width: 0; overflow-wrap: anywhere; color: #7a89a3; font: 8px/1.4 ui-monospace, monospace; text-align: right; }
+.ai-output > p { margin: 6px 0 0; color: #394b69; font-size: 10px; line-height: 1.65; white-space: pre-wrap; }
+.ai-output > p.ai-output__coverage { color: #6d7b92; }
+.evidence-list { display: grid; gap: 5px; margin: 8px 0; }
+.evidence-list > button { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; border: 1px solid #d8e3f5; border-radius: 8px; padding: 8px 9px; background: #fbfdff; color: #526c9c; text-align: left; cursor: pointer; transition: border-color 130ms ease, background 130ms ease, transform 130ms ease; }
+.evidence-list > button:hover, .evidence-list > button.active { border-color: #8eb0ed; background: #f0f5ff; }
+.evidence-list > button:hover { transform: translateY(-1px); }
+.evidence-list__quote { min-width: 0; display: grid; gap: 3px; }
+.evidence-list__quote small { color: #8190aa; font-size: 8px; }
+.evidence-list__quote strong { overflow-wrap: anywhere; color: #263e66; font: 600 11px/1.45 'Noto Serif SC', serif; }
+.evidence-list__range { display: grid; gap: 2px; padding-left: 10px; border-left: 1px solid #dbe5f5; white-space: nowrap; }
+.evidence-list__range b { color: #315f9f; font: 700 10px/1.3 ui-monospace, monospace; }
+.evidence-list__range small { color: #7a89a3; font: 8px/1.3 ui-monospace, monospace; }
+.evidence-list__action { color: var(--blue); font-size: 8px; white-space: nowrap; }
+.no-evidence { margin: 7px 0 0; color: #8a7753; font-size: 9px; line-height: 1.5; }
+.omission-evidence > button { max-width: 100%; overflow: hidden; border: 1px solid #d8e3f5; border-radius: 6px; padding: 4px 6px; background: #f4f8ff; color: #526c9c; font-family: 'Noto Serif SC', serif; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .verdict-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
 .verdict-buttons button { border: 1px solid var(--line); border-radius: 8px; padding: 7px; background: #fff; color: var(--muted); font-size: 10px; cursor: pointer; }
 .verdict-buttons button:first-child.selected { border-color: #82c6a8; background: #eef9f4; color: #267653; }
