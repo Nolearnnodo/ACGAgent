@@ -109,6 +109,25 @@ def test_review_returns_complete_standard_and_generated_items(review_db):
     assert review.summary.unreviewed_count == len(review.items)
 
 
+def test_start_review_records_server_start_once(review_db):
+    db, owner, _stranger, job = review_db
+    service = ExtractionAIAnnotationReviewService(db)
+
+    started = service.start_review(job.id, owner)
+    assert started.id is not None
+    assert started.started_at is not None
+    assert started.created_at is not None
+    assert started.summary.unreviewed_count == len(started.items)
+
+    row = db.query(ExtractionAIAnnotationReview).one()
+    first_started_at = row.started_at
+    repeated = service.start_review(job.id, owner)
+
+    assert repeated.id == started.id
+    assert repeated.started_at == first_started_at
+    assert db.query(ExtractionAIAnnotationReview).count() == 1
+
+
 def test_review_resolves_repair_job_to_immutable_generation(review_db):
     db, owner, _stranger, generation = review_db
     repair = ExtractionAIAnnotationJob(

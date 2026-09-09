@@ -435,6 +435,29 @@ class ExtractionAIAnnotationReviewService:
         row = self._get_row(job.id)
         return self._to_response(job, result, passage, current_user.id, row)
 
+    def start_review(self, job_id: int, current_user: User) -> AIAnnotationReviewResponse:
+        """在用户实际进入质检页时幂等记录人工质检开始时间。"""
+
+        job, result, passage = self._review_context(job_id, current_user)
+        row = self._get_row(job.id)
+        if row is None:
+            items = build_ai_annotation_review_items(result.document.label)  # type: ignore[union-attr]
+            decisions = [AIAnnotationReviewDecision(item_id=item.id) for item in items]
+            row = self._write_row(
+                job,
+                current_user.id,
+                row,
+                decisions,
+                [],
+                self._summary(decisions, []),
+            )
+        elif row.started_at is None:
+            row.started_at = row.created_at or _now()
+            self.db.add(row)
+            self.db.commit()
+            self.db.refresh(row)
+        return self._to_response(job, result, passage, current_user.id, row)
+
     def save_review(
         self,
         job_id: int,
@@ -648,9 +671,12 @@ class ExtractionAIAnnotationReviewService:
                 reviewer_id=reviewer_id,
                 status="draft",
                 standard_version=AI_ANNOTATION_REVIEW_STANDARD_VERSION,
+                started_at=timestamp,
                 created_at=timestamp,
                 updated_at=timestamp,
             )
+        elif row.started_at is None:
+            row.started_at = row.created_at or timestamp
         row.decisions_json = json.dumps(
             [item.model_dump(mode="json") for item in decisions],
             ensure_ascii=False,
@@ -727,6 +753,7 @@ class ExtractionAIAnnotationReviewService:
             omissions=omissions,
             summary=summary,
             reviewer_id=reviewer_id,
+            started_at=row.started_at if row is not None else None,
             created_at=row.created_at if row is not None else None,
             updated_at=row.updated_at if row is not None else None,
             submitted_at=row.submitted_at if row is not None else None,

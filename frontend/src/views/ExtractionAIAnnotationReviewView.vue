@@ -5,8 +5,8 @@ import { RouterLink, useRoute } from 'vue-router'
 import {
   type AIAnnotationReview,
   type AIAnnotationReviewItem,
-  fetchAIAnnotationReview,
   saveAIAnnotationReview,
+  startAIAnnotationReview,
   submitAIAnnotationReview,
 } from '../api/aiAnnotations'
 import { getApiErrorMessage } from '../api/client'
@@ -189,7 +189,7 @@ async function loadReview() {
   pendingEvidence.value = null
   try {
     if (!Number.isInteger(jobId.value) || jobId.value <= 0) throw new Error('质检任务编号无效。')
-    review.value = await fetchAIAnnotationReview(jobId.value)
+    review.value = await startAIAnnotationReview(jobId.value)
     activeItemId.value = review.value.items.find((item) => item.verdict === 'unreviewed')?.id
       ?? review.value.items[0]?.id
       ?? null

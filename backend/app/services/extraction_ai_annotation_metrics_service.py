@@ -214,9 +214,9 @@ class ExtractionAIAnnotationMetricsService:
             job
             for job in jobs
             if job.operation == "generate"
-            and (cutoff is None or (_utc(job.client_started_at or job.created_at) or now) >= cutoff)
+            and (cutoff is None or (_utc(job.created_at) or now) >= cutoff)
         ]
-        roots.sort(key=lambda item: (_utc(item.client_started_at or item.created_at) or now), reverse=True)
+        roots.sort(key=lambda item: (_utc(item.created_at) or now), reverse=True)
 
         passages = {
             passage.doc_id: passage
@@ -315,12 +315,33 @@ class ExtractionAIAnnotationMetricsService:
             final_count, final_categories = _final_differences(root, submission)
             difference_counts.update(final_categories)
             clicked_at = _utc(root.client_started_at or root.created_at) or now
+            queued_at = _utc(root.created_at) or clicked_at
             first_round_elapsed = _duration_ms(root.started_at, root.finished_at)
             if first_round_elapsed is None:
                 first_round_elapsed = result_elapsed
             passage = passages.get(root.passage_id)
             user = users.get(root.requested_by)
             human_review = reviews_by_root.get(root.id)
+            human_review_started_at = (
+                _utc(human_review.started_at or human_review.created_at)
+                if human_review is not None
+                else None
+            )
+            human_review_submitted_at = (
+                _utc(human_review.submitted_at) if human_review is not None else None
+            )
+            ai_imported_at = (
+                _utc(submission.ai_imported_at) if submission is not None else None
+            )
+            human_start_candidates = [
+                value
+                for value in (human_review_started_at, ai_imported_at)
+                if value is not None
+            ]
+            human_processing_started_at = (
+                min(human_start_candidates) if human_start_candidates else None
+            )
+            turnaround_elapsed = _duration_ms(queued_at, submitted_at)
             record = AIAnnotationMetricsRecord(
                 session_id=root.id,
                 task_id=root.task_id,
@@ -333,13 +354,27 @@ class ExtractionAIAnnotationMetricsService:
                 status=latest.status,
                 first_round_validation_status=validation_status,
                 client_started_at=clicked_at,
-                queued_at=_utc(root.created_at) or clicked_at,
+                queued_at=queued_at,
                 started_at=_utc(root.started_at),
                 first_round_finished_at=_utc(root.finished_at),
                 submitted_at=_utc(submitted_at),
-                queue_wait_ms=_duration_ms(clicked_at, root.started_at),
+                queue_wait_ms=_duration_ms(queued_at, root.started_at),
                 first_round_elapsed_ms=first_round_elapsed,
-                end_to_end_ms=_duration_ms(clicked_at, submitted_at),
+                # 保留旧字段供已有客户端兼容；新页面使用语义更明确的周转耗时字段。
+                end_to_end_ms=turnaround_elapsed,
+                turnaround_elapsed_ms=turnaround_elapsed,
+                human_processing_started_at=human_processing_started_at,
+                human_processing_elapsed_ms=_duration_ms(
+                    human_processing_started_at,
+                    submitted_at,
+                ),
+                human_review_started_at=human_review_started_at,
+                human_review_elapsed_ms=_duration_ms(
+                    human_review_started_at,
+                    human_review_submitted_at,
+                ),
+                ai_imported_at=ai_imported_at,
+                post_import_edit_elapsed_ms=_duration_ms(ai_imported_at, submitted_at),
                 token_usage=usage,
                 repair_rounds=sum(item.operation == "repair" for item in measured_jobs),
                 first_round_errors=errors,
@@ -365,13 +400,13 @@ class ExtractionAIAnnotationMetricsService:
                     human_review.omission_count if human_review is not None else 0
                 ),
                 human_review_submitted_at=(
-                    _utc(human_review.submitted_at) if human_review is not None else None
+                    human_review_submitted_at
                 ),
                 submission_id=submission.id if submission is not None else None,
             )
             records.append(record)
 
-            day = clicked_at.date().isoformat()
+            day = queued_at.date().isoformat()
             daily_values[day]["session_count"] += 1
             daily_values[day]["submitted_count"] += int(record.submitted_at is not None)
             daily_values[day]["total_tokens"] += usage.total_tokens
@@ -402,6 +437,21 @@ class ExtractionAIAnnotationMetricsService:
         end_to_end_durations = [
             item.end_to_end_ms for item in records if item.end_to_end_ms is not None
         ]
+        human_processing_durations = [
+            item.human_processing_elapsed_ms
+            for item in records
+            if item.human_processing_elapsed_ms is not None
+        ]
+        human_review_durations = [
+            item.human_review_elapsed_ms
+            for item in records
+            if item.human_review_elapsed_ms is not None
+        ]
+        post_import_edit_durations = [
+            item.post_import_edit_elapsed_ms
+            for item in records
+            if item.post_import_edit_elapsed_ms is not None
+        ]
         submitted_count = sum(item.submitted_at is not None for item in records)
         first_pass_valid_count = sum(
             item.first_round_validation_status == "valid" for item in records
@@ -427,6 +477,23 @@ class ExtractionAIAnnotationMetricsService:
             average_end_to_end_ms=(
                 round(sum(end_to_end_durations) / len(end_to_end_durations))
                 if end_to_end_durations
+                else 0
+            ),
+            human_processing_count=len(human_processing_durations),
+            average_human_processing_ms=(
+                round(sum(human_processing_durations) / len(human_processing_durations))
+                if human_processing_durations
+                else 0
+            ),
+            average_human_review_ms=(
+                round(sum(human_review_durations) / len(human_review_durations))
+                if human_review_durations
+                else 0
+            ),
+            post_import_edit_count=len(post_import_edit_durations),
+            average_post_import_edit_ms=(
+                round(sum(post_import_edit_durations) / len(post_import_edit_durations))
+                if post_import_edit_durations
                 else 0
             ),
             total_prompt_tokens=sum(item.token_usage.prompt_tokens for item in records),

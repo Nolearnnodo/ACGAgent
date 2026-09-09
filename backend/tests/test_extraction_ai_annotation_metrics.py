@@ -8,7 +8,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
-from app.models.extraction_ai_annotation import ExtractionAIAnnotationJob
+from app.models.extraction_ai_annotation import (
+    ExtractionAIAnnotationJob,
+    ExtractionAIAnnotationReview,
+)
 from app.models.extraction_annotation import ExtractionAnnotationSubmission
 from app.models.passage import Passage
 from app.models.user import User
@@ -134,6 +137,21 @@ def test_ai_metrics_track_click_tokens_errors_repairs_and_final_submission(metri
     db.commit()
     db.refresh(repair)
 
+    review = ExtractionAIAnnotationReview(
+        generation_job_id=root.id,
+        task_id=task_id,
+        passage_id=generated.passage_id,
+        reviewer_id=annotator.id,
+        status="submitted",
+        standard_version="2026-09-07-v1",
+        started_at=now - timedelta(minutes=7),
+        submitted_at=now - timedelta(minutes=6),
+        created_at=now - timedelta(minutes=7),
+        updated_at=now - timedelta(minutes=6),
+    )
+    db.add(review)
+    db.commit()
+
     imported = task_service.import_draft(
         task_id,
         annotator,
@@ -141,12 +159,30 @@ def test_ai_metrics_track_click_tokens_errors_repairs_and_final_submission(metri
         json.dumps(generated.document.model_dump(mode="json"), ensure_ascii=False),
         source_ai_job_id=repair.id,
     )
-    final_label = imported.submission.label.model_copy(deep=True)
+    first_imported_at = db.get(
+        ExtractionAnnotationSubmission,
+        imported.submission.id,
+    ).ai_imported_at
+    reimported = task_service.import_draft(
+        task_id,
+        annotator,
+        imported.submission.revision,
+        json.dumps(generated.document.model_dump(mode="json"), ensure_ascii=False),
+        source_ai_job_id=repair.id,
+    )
+    submission = db.get(ExtractionAnnotationSubmission, reimported.submission.id)
+    assert submission is not None
+    assert submission.ai_imported_at == first_imported_at
+    submission.ai_imported_at = now - timedelta(minutes=5)
+    db.add(submission)
+    db.commit()
+
+    final_label = reimported.submission.label.model_copy(deep=True)
     final_label.passage.note = "人工核对后补充"
     submitted = task_service.submit(
         task_id,
         annotator,
-        imported.submission.revision,
+        reimported.submission.revision,
         final_label,
     )
 
@@ -175,10 +211,24 @@ def test_ai_metrics_track_click_tokens_errors_repairs_and_final_submission(metri
     assert record.session_id == root.id
     assert record.submission_id == submission.id
     assert record.end_to_end_ms is not None and record.end_to_end_ms >= 9 * 60 * 1000
-    assert record.queue_wait_ms == 60 * 1000
+    assert record.turnaround_elapsed_ms == record.end_to_end_ms
+    assert record.queue_wait_ms == 59_880
     assert record.first_round_elapsed_ms == 60 * 1000
+    assert record.human_processing_elapsed_ms is not None
+    assert record.human_processing_elapsed_ms >= 7 * 60 * 1000
+    assert record.human_review_elapsed_ms == 60 * 1000
+    assert record.post_import_edit_elapsed_ms is not None
+    assert record.post_import_edit_elapsed_ms >= 5 * 60 * 1000
+    assert record.human_processing_started_at is not None
+    assert record.human_review_started_at is not None
+    assert record.ai_imported_at is not None
     assert record.repair_rounds == 1
     assert record.token_usage.total_tokens == 200
+    assert metrics.summary.human_processing_count == 1
+    assert metrics.summary.average_human_processing_ms == record.human_processing_elapsed_ms
+    assert metrics.summary.average_human_review_ms == 60 * 1000
+    assert metrics.summary.post_import_edit_count == 1
+    assert metrics.summary.average_post_import_edit_ms == record.post_import_edit_elapsed_ms
 
 
 def test_background_job_persists_usage_and_first_round_snapshot(metrics_db, monkeypatch):

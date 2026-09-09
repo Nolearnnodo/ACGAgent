@@ -449,6 +449,7 @@ class AIAnnotationReviewResponse(BaseModel):
     omissions: list[AIAnnotationReviewOmission]
     summary: AIAnnotationReviewSummary
     reviewer_id: int
+    started_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     submitted_at: datetime | None = None
@@ -485,6 +486,11 @@ class AIAnnotationMetricsSummary(BaseModel):
     submission_rate: float = Field(ge=0, le=1)
     average_first_round_ms: int = Field(ge=0)
     average_end_to_end_ms: int = Field(ge=0)
+    human_processing_count: int = Field(default=0, ge=0)
+    average_human_processing_ms: int = Field(default=0, ge=0)
+    average_human_review_ms: int = Field(default=0, ge=0)
+    post_import_edit_count: int = Field(default=0, ge=0)
+    average_post_import_edit_ms: int = Field(default=0, ge=0)
     total_prompt_tokens: int = Field(ge=0)
     total_completion_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
@@ -520,6 +526,13 @@ class AIAnnotationMetricsRecord(BaseModel):
     queue_wait_ms: int | None = Field(default=None, ge=0)
     first_round_elapsed_ms: int | None = Field(default=None, ge=0)
     end_to_end_ms: int | None = Field(default=None, ge=0)
+    turnaround_elapsed_ms: int | None = Field(default=None, ge=0)
+    human_processing_started_at: datetime | None = None
+    human_processing_elapsed_ms: int | None = Field(default=None, ge=0)
+    human_review_started_at: datetime | None = None
+    human_review_elapsed_ms: int | None = Field(default=None, ge=0)
+    ai_imported_at: datetime | None = None
+    post_import_edit_elapsed_ms: int | None = Field(default=None, ge=0)
     token_usage: AIAnnotationTokenUsage = Field(default_factory=AIAnnotationTokenUsage)
     repair_rounds: int = Field(default=0, ge=0)
     first_round_errors: list[AIAnnotationValidationIssue] = Field(default_factory=list)

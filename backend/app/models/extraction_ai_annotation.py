@@ -181,6 +181,11 @@ class ExtractionAIAnnotationReview(Base):
     omission_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # 0—10000 的整数，避免不同数据库浮点精度导致统计口径漂移。
     accuracy_basis_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
     submitted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

@@ -822,8 +822,20 @@ class ExtractionAnnotationService:
                 raise AnnotationNotFoundError("未找到可关联的 AI 标注任务。")
             if source_job.status != "success":
                 raise AnnotationConflictError("只有已完成的 AI 标注结果才能关联到盲标草稿。")
+            previous_root_id: int | None = None
+            if submission.source_ai_job_id is not None:
+                previous_source = self.db.get(
+                    ExtractionAIAnnotationJob,
+                    submission.source_ai_job_id,
+                )
+                if previous_source is not None:
+                    previous_root_id = self._find_ai_generation_root(previous_source).id
+            source_root_id = self._find_ai_generation_root(source_job).id
             submission.source_ai_job_id = source_job.id
-            submission.ai_imported_at = datetime.now(timezone.utc)
+            # 同一轮生成及其修复结果可以多次导入；人工编辑应从该轮首次成功
+            # 导入开始计时。切换到另一轮生成时才重置起点。
+            if submission.ai_imported_at is None or previous_root_id != source_root_id:
+                submission.ai_imported_at = datetime.now(timezone.utc)
         else:
             # 人工导入新文件代表来源发生变化，不能继续把结果归因给旧 AI 任务。
             submission.source_ai_job_id = None

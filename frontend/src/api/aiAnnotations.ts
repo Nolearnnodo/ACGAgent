@@ -178,6 +178,7 @@ export interface AIAnnotationReview {
   omissions: AIAnnotationReviewOmission[]
   summary: AIAnnotationReviewSummary
   reviewer_id: number
+  started_at: string | null
   created_at: string | null
   updated_at: string | null
   submitted_at: string | null
@@ -229,6 +230,13 @@ export async function fetchAIAnnotationJob(jobId: number) {
 export async function fetchAIAnnotationReview(jobId: number) {
   const { data } = await apiClient.get<AIAnnotationReview>(
     `/annotations/extraction/ai/jobs/${jobId}/review`,
+  )
+  return data
+}
+
+export async function startAIAnnotationReview(jobId: number) {
+  const { data } = await apiClient.post<AIAnnotationReview>(
+    `/annotations/extraction/ai/jobs/${jobId}/review/start`,
   )
   return data
 }
@@ -354,6 +362,11 @@ export interface AIAnnotationMetricsSummary {
   submission_rate: number
   average_first_round_ms: number
   average_end_to_end_ms: number
+  human_processing_count: number
+  average_human_processing_ms: number
+  average_human_review_ms: number
+  post_import_edit_count: number
+  average_post_import_edit_ms: number
   total_prompt_tokens: number
   total_completion_tokens: number
   total_tokens: number
@@ -389,6 +402,13 @@ export interface AIAnnotationMetricsRecord {
   queue_wait_ms: number | null
   first_round_elapsed_ms: number | null
   end_to_end_ms: number | null
+  turnaround_elapsed_ms: number | null
+  human_processing_started_at: string | null
+  human_processing_elapsed_ms: number | null
+  human_review_started_at: string | null
+  human_review_elapsed_ms: number | null
+  ai_imported_at: string | null
+  post_import_edit_elapsed_ms: number | null
   token_usage: AIAnnotationTokenUsage
   repair_rounds: number
   first_round_errors: AIAnnotationIssue[]

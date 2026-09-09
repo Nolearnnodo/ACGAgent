@@ -101,6 +101,10 @@ function formatDuration(value: number | null | undefined) {
   return `${(value / 3_600_000).toFixed(1)} 小时`
 }
 
+function formatAverageDuration(value: number | null | undefined, count: number | null | undefined) {
+  return count ? formatDuration(value) : '—'
+}
+
 function formatDate(value: string | null | undefined) {
   if (!value) return '—'
   const date = new Date(value)
@@ -180,7 +184,7 @@ onMounted(() => {
           <span class="eyebrow">A · OBSERVATORY</span>
           <div>
             <h2>AI 标注统计</h2>
-            <p>一次生成请求为一个实验会话，汇总其修复轮次直到最终人工提交。</p>
+            <p>按篇目拆分 AI 执行与人工处理，适配后续批量生成任务。</p>
           </div>
         </div>
         <nav class="mode-switch" aria-label="抽取标注模式">
@@ -221,14 +225,17 @@ onMounted(() => {
             <small>{{ formatNumber(summary?.human_reviewed_count) }} 次已质检 · 规则通过 {{ formatPercent(summary?.first_pass_valid_rate) }}</small>
           </article>
           <article>
-            <span>点击 → 提交</span>
-            <strong>{{ formatDuration(summary?.average_end_to_end_ms) }}</strong>
-            <small>仅统计已正式提交会话</small>
+            <span>人工处理耗时</span>
+            <strong>{{ formatAverageDuration(summary?.average_human_processing_ms, summary?.human_processing_count) }}</strong>
+            <small class="metric-note">
+              质检 {{ formatAverageDuration(summary?.average_human_review_ms, summary?.human_reviewed_count) }} ·
+              导入后 {{ formatAverageDuration(summary?.average_post_import_edit_ms, summary?.post_import_edit_count) }}
+            </small>
           </article>
           <article>
             <span>首轮执行耗时</span>
             <strong>{{ formatDuration(summary?.average_first_round_ms) }}</strong>
-            <small>含全部语义分片</small>
+            <small>{{ formatNumber(summary?.total_llm_call_count) }} 次模型调用 · {{ formatNumber(summary?.total_repair_rounds) }} 轮修复</small>
           </article>
           <article>
             <span>累计 Token</span>
@@ -236,9 +243,9 @@ onMounted(() => {
             <small>输入 {{ formatNumber(summary?.total_prompt_tokens) }} · 输出 {{ formatNumber(summary?.total_completion_tokens) }}</small>
           </article>
           <article>
-            <span>模型调用</span>
-            <strong>{{ formatNumber(summary?.total_llm_call_count) }}</strong>
-            <small>{{ formatNumber(summary?.total_repair_rounds) }} 轮修复 · 缓存 {{ formatPercent(cacheHitRate) }}</small>
+            <span>全流程周转</span>
+            <strong>{{ formatAverageDuration(summary?.average_end_to_end_ms, summary?.submitted_count) }}</strong>
+            <small>AI 入队 → 最终提交 · 缓存 {{ formatPercent(cacheHitRate) }}</small>
           </article>
         </section>
 
@@ -328,7 +335,7 @@ onMounted(() => {
             <div>
               <span>SESSION LOG</span>
               <h3>逐次标注记录</h3>
-              <p>首轮生成、后续修复与最终提交按来源任务串成同一条记录。</p>
+              <p>人工处理从首次质检或 AI 成功导入中较早的时间开始，计至最终提交。</p>
             </div>
             <div class="record-tools">
               <div class="filter-tabs" aria-label="提交状态筛选">
@@ -369,7 +376,7 @@ onMounted(() => {
                   <th>会话 / 篇目</th>
                   <th>标注人</th>
                   <th>首轮质量</th>
-                  <th>点击 → 提交</th>
+                  <th>人工处理</th>
                   <th>Token</th>
                   <th>修复</th>
                   <th>状态</th>
@@ -387,7 +394,7 @@ onMounted(() => {
                   >
                     <td>
                       <strong>{{ record.passage_title }}</strong>
-                      <span>#{{ record.session_id }} · 任务 {{ record.task_id }} · {{ formatDate(record.client_started_at) }}</span>
+                      <span>#{{ record.session_id }} · 任务 {{ record.task_id }} · 入队 {{ formatDate(record.queued_at) }}</span>
                     </td>
                     <td>
                       <strong>{{ record.requested_by_email }}</strong>
@@ -403,8 +410,8 @@ onMounted(() => {
                       <span v-else>{{ record.first_round_errors.length }} 规则错误 · {{ record.final_difference_count }} 修改</span>
                     </td>
                     <td>
-                      <strong>{{ formatDuration(record.end_to_end_ms) }}</strong>
-                      <span>首轮 {{ formatDuration(record.first_round_elapsed_ms) }}</span>
+                      <strong>{{ formatDuration(record.human_processing_elapsed_ms) }}</strong>
+                      <span>导入后 {{ formatDuration(record.post_import_edit_elapsed_ms) }}</span>
                     </td>
                     <td>
                       <strong>{{ formatNumber(record.token_usage.total_tokens) }}</strong>
@@ -424,8 +431,9 @@ onMounted(() => {
                       <div class="record-detail">
                         <div class="lifecycle">
                           <div>
-                            <span>点击生成</span>
-                            <strong>{{ formatDate(record.client_started_at) }}</strong>
+                            <span>AI 入队</span>
+                            <strong>{{ formatDate(record.queued_at) }}</strong>
+                            <small>客户端发起 {{ formatDate(record.client_started_at) }}</small>
                           </div>
                           <i />
                           <div>
@@ -443,8 +451,31 @@ onMounted(() => {
                           <div>
                             <span>正式提交</span>
                             <strong>{{ formatDate(record.submitted_at) }}</strong>
-                            <small v-if="record.submitted_at">总计 {{ formatDuration(record.end_to_end_ms) }}</small>
+                            <small v-if="record.submitted_at">周转 {{ formatDuration(record.turnaround_elapsed_ms) }}</small>
                             <small v-else>尚未提交盲标</small>
+                          </div>
+                        </div>
+                        <p class="timing-rule">以下均为自然经过时间；人工处理包括质检、等待、导入后修改，未扣除页面闲置时间。</p>
+                        <div class="timing-breakdown" aria-label="耗时分段">
+                          <div>
+                            <span>人工处理</span>
+                            <strong>{{ formatDuration(record.human_processing_elapsed_ms) }}</strong>
+                            <small>{{ formatDate(record.human_processing_started_at) }} → 最终提交</small>
+                          </div>
+                          <div>
+                            <span>首轮质检</span>
+                            <strong>{{ formatDuration(record.human_review_elapsed_ms) }}</strong>
+                            <small>{{ formatDate(record.human_review_started_at) }} → {{ formatDate(record.human_review_submitted_at) }}</small>
+                          </div>
+                          <div>
+                            <span>导入后编辑</span>
+                            <strong>{{ formatDuration(record.post_import_edit_elapsed_ms) }}</strong>
+                            <small>{{ formatDate(record.ai_imported_at) }} → 最终提交</small>
+                          </div>
+                          <div>
+                            <span>AI / 全流程</span>
+                            <strong>{{ formatDuration(record.first_round_elapsed_ms) }} / {{ formatDuration(record.turnaround_elapsed_ms) }}</strong>
+                            <small>首轮执行 / 入队至最终提交</small>
                           </div>
                         </div>
                         <div class="detail-columns">
@@ -562,6 +593,7 @@ onMounted(() => {
 .metric-strip span { display: block; color: var(--muted); font-size: 9px; letter-spacing: .05em; }
 .metric-strip strong { display: block; margin-top: 8px; color: var(--ink); font-size: clamp(19px, 2vw, 27px); line-height: 1; letter-spacing: -.04em; white-space: nowrap; }
 .metric-strip small { display: block; margin-top: 8px; overflow: hidden; color: #8a96ad; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.metric-strip small.metric-note { min-height: 24px; overflow: visible; line-height: 1.45; text-overflow: clip; white-space: normal; }
 
 .analysis-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(330px, .75fr); gap: 1px; margin-top: 22px; background: var(--line); border-block: 1px solid var(--line); }
 .trend-panel, .error-panel { min-width: 0; padding: 20px 22px; background: #fff; }
@@ -650,6 +682,14 @@ onMounted(() => {
 .lifecycle strong { font-size: 10px; }
 .lifecycle small { color: #8490a6; font-size: 8px; }
 .lifecycle > i { height: 1px; margin: 0 7px; background: #cdd7e8; }
+.timing-rule { margin: 15px 0 0; color: #7f8ba1; font-size: 8px; line-height: 1.5; }
+.timing-breakdown { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 8px; border-block: 1px solid #dfe6f1; }
+.timing-breakdown > div { min-width: 0; display: grid; gap: 4px; padding: 11px 14px; border-right: 1px solid #dfe6f1; }
+.timing-breakdown > div:first-child { padding-left: 0; }
+.timing-breakdown > div:last-child { padding-right: 0; border-right: 0; }
+.timing-breakdown span { color: var(--muted); font-size: 8px; }
+.timing-breakdown strong { overflow: hidden; color: #344563; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.timing-breakdown small { overflow: hidden; color: #8a96ad; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .detail-columns { display: grid; grid-template-columns: .7fr 1.35fr .8fr; gap: 22px; margin-top: 19px; padding-top: 16px; border-top: 1px solid #dfe6f1; }
 .detail-columns section { min-width: 0; }
 .detail-columns dl { display: grid; gap: 5px; margin: 10px 0 0; }
@@ -689,6 +729,10 @@ onMounted(() => {
   .record-tools { flex-wrap: wrap; }
   .lifecycle { grid-template-columns: 1fr; gap: 9px; }
   .lifecycle > i { width: 1px; height: 12px; margin: 0 0 0 3px; }
+  .timing-breakdown { grid-template-columns: 1fr 1fr; }
+  .timing-breakdown > div:nth-child(2) { border-right: 0; }
+  .timing-breakdown > div:nth-child(-n+2) { border-bottom: 1px solid #dfe6f1; }
+  .timing-breakdown > div:first-child, .timing-breakdown > div:last-child { padding: 11px 14px; }
   .detail-columns { grid-template-columns: 1fr; }
 }
 

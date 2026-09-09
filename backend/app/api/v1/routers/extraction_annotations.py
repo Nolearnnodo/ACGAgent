@@ -125,6 +125,19 @@ def get_ai_extraction_annotation_review(
     )
 
 
+@router.post("/ai/jobs/{job_id}/review/start", response_model=AIAnnotationReviewResponse)
+def start_ai_extraction_annotation_review(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationReviewResponse:
+    """幂等记录用户首次进入首轮质检的服务端时间。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationReviewService(db).start_review(job_id, current_user)
+    )
+
+
 @router.put("/ai/jobs/{job_id}/review", response_model=AIAnnotationReviewResponse)
 def save_ai_extraction_annotation_review(
     job_id: int,
