@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timezone
-from itertools import product
 from typing import Iterable, Literal
 
 import yaml
@@ -20,11 +19,15 @@ from app.models.extraction_annotation import (
     ExtractionAnnotationTask,
     ExtractionGoldVersion,
 )
-from app.models.extraction_ai_annotation import ExtractionAIAnnotationJob
+from app.models.extraction_ai_annotation import (
+    ExtractionAIAnnotationJob,
+    ExtractionAIAnnotationReview,
+)
 from app.models.dictionary import EraDictionary, HistoricalEventDictionary
 from app.models.passage import Passage
 from app.models.user import User
 from app.schemas.extraction_annotation import (
+    ANNOTATION_STEPS,
     EVENT_TYPES,
     AnnotationPassageResponse,
     EvidenceSpan,
@@ -85,42 +88,32 @@ def _dump_label(label: ExtractionAnnotationLabel) -> str:
 def _load_label(submission: ExtractionAnnotationSubmission) -> ExtractionAnnotationLabel:
     try:
         raw = json.loads(submission.label_json or "{}")
-        return ExtractionAnnotationLabel.model_validate(raw)
+        label = ExtractionAnnotationLabel.model_validate(raw)
+        drop_meaningless_excluded_mentions(label)
+        return label
     except (json.JSONDecodeError, ValueError):
         return ExtractionAnnotationLabel()
 
 
+def drop_meaningless_excluded_mentions(label: ExtractionAnnotationLabel) -> int:
+    """删除没有理由且没有正文证据的无意义排除项。
+
+    这类记录无法表达任何可复核的排除结论，属于模型输出的空占位项，
+    不应进入人工质检或盲标草稿。只要存在实际理由或至少一条证据，就保留
+    给后续规则校验和人工确认。
+    """
+
+    original_count = len(label.excluded_mentions)
+    label.excluded_mentions = [
+        item
+        for item in label.excluded_mentions
+        if item.reason.strip() or bool(item.evidence)
+    ]
+    return original_count - len(label.excluded_mentions)
+
+
 def _issue(path: str, message: str, code: str) -> dict[str, str]:
     return {"path": path, "message": message, "code": code}
-
-
-ALLOWED_RELATION_INVERSES: dict[str, tuple[str, ...]] = {
-    "F": ("S", "D"),
-    "M": ("S", "D"),
-    "S": ("F", "M"),
-    "D": ("F", "M"),
-    "H": ("W", "Z"),
-    "W": ("H",),
-    "Z": ("H",),
-    "C": ("C",),
-    "B": ("B",),
-    "O": ("O",),
-}
-
-
-def relation_reverse_suggestions(codes: Iterable[str]) -> list[list[str]]:
-    """按路径反转规则给出所有合法反向代码链，不猜测子女性别。"""
-
-    chain = list(codes)
-    if not chain or len(chain) > 3 or any(code not in ALLOWED_RELATION_INVERSES for code in chain):
-        return []
-    choices = [ALLOWED_RELATION_INVERSES[code] for code in reversed(chain)]
-    return [list(candidate) for candidate in product(*choices)]
-
-
-def are_inverse_relation_chains(codes: Iterable[str], reverse_codes: Iterable[str]) -> bool:
-    reverse = list(reverse_codes)
-    return reverse in relation_reverse_suggestions(codes)
 
 
 def _iter_evidence(
@@ -144,7 +137,7 @@ def _iter_evidence(
     for relation_index, relation in enumerate(label.person_relations):
         for evidence_index, evidence in enumerate(relation.evidence):
             yield f"person_relations.{relation_index}.evidence.{evidence_index}", evidence
-    for item_name in ("excluded_mentions", "unresolved_items", "schema_conflicts"):
+    for item_name in ("excluded_mentions", "unresolved_items", "schema_conflicts", "omissions"):
         for item_index, item in enumerate(getattr(label, item_name)):
             for evidence_index, evidence in enumerate(item.evidence):
                 yield f"{item_name}.{item_index}.evidence.{evidence_index}", evidence
@@ -264,6 +257,7 @@ def discard_out_of_range_evidence(
         *label.excluded_mentions,
         *label.unresolved_items,
         *label.schema_conflicts,
+        *label.omissions,
     ):
         filter_evidence(item)
     return discarded
@@ -274,6 +268,8 @@ def validate_for_submission(
     context: str,
     spec_version: str,
     db: Session | None = None,
+    *,
+    require_step_reviews: bool = True,
 ) -> list[dict[str, str]]:
     """执行提交级阻断校验；草稿只校验证据可回放。"""
 
@@ -285,6 +281,22 @@ def validate_for_submission(
         issues.append(
             _issue("schema_version", "标签规范版本与任务版本不一致。", "schema_version_mismatch")
         )
+    if require_step_reviews:
+        step_labels = {
+            "material": "材料",
+            "persons": "人物基本信息",
+            "relations": "人物关系",
+            "checks": "差缺补漏",
+        }
+        for step in ANNOTATION_STEPS:
+            if label.step_reviews.get(step) is not True:
+                issues.append(
+                    _issue(
+                        f"step_reviews.{step}",
+                        f"请完成并确认“{step_labels[step]}”步骤。",
+                        "annotation_step_incomplete",
+                    )
+                )
 
     era_names: set[str] = set()
     historical_event_names: set[str] = set()
@@ -327,7 +339,6 @@ def validate_for_submission(
 
     event_keys: set[str] = set()
     historical_event_keys: set[str] = set()
-    person_by_key = {person.key: person for person in label.persons}
     for person_index, person in enumerate(label.persons):
         prefix = f"persons.{person_index}"
         if not person.name_surface.strip():
@@ -443,20 +454,14 @@ def validate_for_submission(
         ):
             if endpoint not in person_key_set:
                 issues.append(_issue(f"{path}.{endpoint_name}", "人物关系引用了不存在的人物。", "unknown_person"))
-            elif person_by_key[endpoint].level == 3:
-                issues.append(_issue(f"{path}.{endpoint_name}", "主任务的人物关系不能使用三级人物。", "level_three_relation"))
-        if not relation.codes or not relation.reverse_codes:
-            issues.append(_issue(path, "人物关系必须填写正向和反向代码。", "relation_codes_required"))
-        elif not are_inverse_relation_chains(relation.codes, relation.reverse_codes):
-            issues.append(_issue(path, "正向与反向关系链不互逆。", "relation_inverse_mismatch"))
-        if "O" in relation.codes and len(relation.codes) != 1:
-            issues.append(_issue(f"{path}.codes", "O 不能与其他关系代码混用。", "invalid_other_relation"))
-        if "O" in relation.reverse_codes and len(relation.reverse_codes) != 1:
-            issues.append(_issue(f"{path}.reverse_codes", "O 不能与其他反向代码混用。", "invalid_other_relation"))
-        if "O" in relation.codes and not relation.note.strip():
-            issues.append(_issue(f"{path}.note", "其他关系必须说明正向含义。", "relation_note_required"))
-        if "O" in relation.reverse_codes and not relation.reverse_note.strip():
-            issues.append(_issue(f"{path}.reverse_note", "其他关系必须说明反向含义。", "relation_note_required"))
+        if not relation.relation_category:
+            issues.append(
+                _issue(f"{path}.relation_category", "人物关系必须选择七类关系之一。", "relation_category_required")
+            )
+        if not relation.relation_summary.strip():
+            issues.append(
+                _issue(f"{path}.relation_summary", "人物关系必须填写不超过 10 字的具体表现。", "relation_summary_required")
+            )
         if not relation.evidence:
             issues.append(_issue(f"{path}.evidence", "人物关系必须有原文证据。", "evidence_required"))
 
@@ -480,6 +485,24 @@ def validate_for_submission(
                     "schema_conflict_incomplete",
                 )
             )
+    omission_keys: set[str] = set()
+    for item_index, omission in enumerate(label.omissions):
+        path = f"omissions.{item_index}"
+        if omission.key in omission_keys:
+            issues.append(_issue(f"{path}.key", "缺漏稳定键不能重复。", "duplicate_omission_key"))
+        omission_keys.add(omission.key)
+        if not omission.category:
+            issues.append(_issue(f"{path}.category", "请选择缺漏类型。", "omission_category_required"))
+        if not omission.description.strip():
+            issues.append(_issue(f"{path}.description", "请写明对象和具体缺漏。", "omission_description_required"))
+        if not omission.target_path.strip():
+            issues.append(_issue(f"{path}.target_path", "请写明应补的步骤和位置。", "omission_target_required"))
+        if not omission.evidence and not omission.evidence_note.strip():
+            issues.append(_issue(f"{path}.evidence", "请划选原文证据或填写证据说明。", "omission_evidence_required"))
+        if omission.resolution == "open":
+            issues.append(_issue(f"{path}.resolution", "缺漏尚未处理。", "omission_unresolved"))
+        if omission.resolution == "unsupported" and not omission.resolution_note.strip():
+            issues.append(_issue(f"{path}.resolution_note", "工具暂不支持时请说明原因。", "omission_resolution_note_required"))
     return issues
 
 
@@ -571,8 +594,11 @@ def parse_imported_label(
         ]
         raise AnnotationValidationError(details) from exc
 
+    drop_meaningless_excluded_mentions(label)
     if allow_validation_issues:
         discard_out_of_range_evidence(label, passage.context)
+        # 证据被丢弃后可能变成“无理由且无证据”的空占位项，再清理一次。
+        drop_meaningless_excluded_mentions(label)
         issues: list[dict[str, str]] = []
     else:
         issues = (
@@ -822,6 +848,25 @@ class ExtractionAnnotationService:
                 raise AnnotationNotFoundError("未找到可关联的 AI 标注任务。")
             if source_job.status != "success":
                 raise AnnotationConflictError("只有已完成的 AI 标注结果才能关联到盲标草稿。")
+            source_root = self._find_ai_generation_root(source_job)
+            if (
+                source_root.operation != "generate"
+                or source_root.status != "success"
+                or source_root.requested_by != current_user.id
+                or source_root.task_id != task_id
+            ):
+                raise AnnotationConflictError("只有已完成的 AI 标注结果才能关联到盲标草稿。")
+            submitted_review = (
+                self.db.query(ExtractionAIAnnotationReview)
+                .filter(
+                    ExtractionAIAnnotationReview.generation_job_id == source_root.id,
+                    ExtractionAIAnnotationReview.reviewer_id == current_user.id,
+                    ExtractionAIAnnotationReview.status == "submitted",
+                )
+                .first()
+            )
+            if submitted_review is None:
+                raise AnnotationConflictError("只有已提交首轮质检的生成才能导入盲标草稿。")
             previous_root_id: int | None = None
             if submission.source_ai_job_id is not None:
                 previous_source = self.db.get(
@@ -830,7 +875,7 @@ class ExtractionAnnotationService:
                 )
                 if previous_source is not None:
                     previous_root_id = self._find_ai_generation_root(previous_source).id
-            source_root_id = self._find_ai_generation_root(source_job).id
+            source_root_id = source_root.id
             submission.source_ai_job_id = source_job.id
             # 同一轮生成及其修复结果可以多次导入；人工编辑应从该轮首次成功
             # 导入开始计时。切换到另一轮生成时才重置起点。
@@ -909,7 +954,15 @@ class ExtractionAnnotationService:
             category_counts: dict[str, int] = {}
             difference_count = 0
             if isinstance(first_label_payload, dict):
-                first_label = ExtractionAnnotationLabel.model_validate(first_label_payload)
+                from app.services.extraction_ai_annotation_service import (
+                    load_model_keeping_original,
+                )
+
+                first_label, _schema_issues = load_model_keeping_original(
+                    ExtractionAnnotationLabel,
+                    first_label_payload,
+                )
+                drop_meaningless_excluded_mentions(first_label)
                 # 延迟导入以避免标注服务与裁定服务的模块初始化互相依赖。
                 from app.services.extraction_adjudication_service import (
                     build_adjudication_differences,

@@ -69,9 +69,21 @@ class Settings(BaseSettings):
     llm_model_name: str = Field(default="mock-planner", alias="LLM_MODEL_NAME")
     llm_api_base_url: str = Field(default="", alias="LLM_API_BASE_URL")
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
-    llm_timeout_seconds: int = Field(default=120, alias="LLM_TIMEOUT_SECONDS")
+    llm_timeout_seconds: int = Field(default=3600, alias="LLM_TIMEOUT_SECONDS")
     passage_upload_concurrency: int = Field(default=10, alias="PASSAGE_UPLOAD_CONCURRENCY")
     ai_annotation_concurrency: int = Field(default=1, ge=1, alias="AI_ANNOTATION_CONCURRENCY")
+    ai_annotation_max_generations_per_task: int = Field(
+        default=12,
+        ge=1,
+        le=50,
+        alias="AI_ANNOTATION_MAX_GENERATIONS_PER_TASK",
+    )
+    ai_annotation_max_repairs_per_generation: int = Field(
+        default=30,
+        ge=1,
+        le=200,
+        alias="AI_ANNOTATION_MAX_REPAIRS_PER_GENERATION",
+    )
     identity_merge_disabled: bool = Field(default=False, alias="IDENTITY_MERGE_DISABLED")
 
     @property

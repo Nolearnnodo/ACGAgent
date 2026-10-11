@@ -36,6 +36,8 @@ const colorByKind: Record<AnnotationHighlight['kind'], string> = {
   excluded: '#7d7b73',
   unresolved: '#b56b2d',
 }
+const locatedFill = '#ffcd2e'
+const locatedUnderline = '#b45309'
 
 function utf16ToCodePointOffset(text: string, offset: number) {
   return Array.from(text.slice(0, offset)).length
@@ -82,10 +84,36 @@ function toAnnotation(highlight: AnnotationHighlight): TextAnnotation {
   }
 }
 
+function tagLocatedHighlights() {
+  const root = textElement.value
+  if (!root) return
+  const id = props.activeEvidenceId
+  for (const el of root.querySelectorAll<HTMLElement>('.r6o-annotation')) {
+    const located = Boolean(id) && el.dataset.annotation === id
+    el.classList.toggle('is-located', located)
+    if (located) {
+      el.classList.remove('is-located-flash')
+      void el.offsetWidth
+      el.classList.add('is-located-flash')
+    } else {
+      el.classList.remove('is-located-flash')
+    }
+  }
+}
+
+function scheduleTagLocatedHighlights() {
+  void nextTick(() => {
+    tagLocatedHighlights()
+    requestAnimationFrame(tagLocatedHighlights)
+  })
+}
+
 function syncAnnotations() {
   if (!annotator) return
   annotator.setAnnotations(props.highlights.map(toAnnotation), true)
   if (props.activeEvidenceId) annotator.setSelected(props.activeEvidenceId)
+  else annotator.setSelected(undefined)
+  scheduleTagLocatedHighlights()
 }
 
 function createAnnotator() {
@@ -99,11 +127,20 @@ function createAnnotator() {
     style: (annotation, state) => {
       const kind = annotation.bodies[0]?.value as AnnotationHighlight['kind'] | undefined
       const color = kind ? colorByKind[kind] : colorByKind.person
+      if (state.selected) {
+        return {
+          fill: locatedFill,
+          fillOpacity: 0.78,
+          underlineColor: locatedUnderline,
+          underlineThickness: 3,
+          underlineOffset: 1,
+        }
+      }
       return {
         fill: color,
-        fillOpacity: state.selected ? 0.34 : 0.2,
+        fillOpacity: props.activeEvidenceId ? 0.1 : 0.18,
         underlineColor: color,
-        underlineThickness: state.selected ? 2 : 1,
+        underlineThickness: 1,
         underlineOffset: 2,
       }
     },
@@ -143,6 +180,7 @@ function focusEvidence(evidenceId: string) {
   if (!annotator) return
   annotator.setSelected(evidenceId)
   annotator.scrollIntoView(evidenceId, textElement.value?.parentElement ?? undefined)
+  scheduleTagLocatedHighlights()
 }
 
 defineExpose({ focusEvidence })
@@ -155,6 +193,7 @@ watch(() => props.highlights, syncAnnotations, { deep: true })
 watch(() => props.activeEvidenceId, (id) => {
   if (!annotator) return
   annotator.setSelected(id ?? undefined)
+  scheduleTagLocatedHighlights()
 })
 watch(() => props.disabled, (disabled) => annotator?.setAnnotatingEnabled(!disabled))
 
@@ -191,7 +230,26 @@ onBeforeUnmount(() => annotator?.destroy())
 
 .annotation-text :deep(.r6o-annotation) {
   border-radius: 2px;
-  transition: background-color 140ms ease, box-shadow 140ms ease;
+  box-sizing: border-box;
+  transition: background-color 140ms ease, box-shadow 140ms ease, outline-color 140ms ease;
+}
+
+.annotation-text :deep(.r6o-annotation.is-located) {
+  z-index: 5;
+  background-color: rgb(255 205 46 / 0.86) !important;
+  outline: 2px solid #b45309;
+  outline-offset: 1px;
+  box-shadow: 0 0 0 3px rgb(255 205 46 / 55%);
+  mix-blend-mode: multiply;
+}
+
+.annotation-text :deep(.r6o-annotation.is-located-flash) {
+  animation: locate-flash 0.7s ease-out;
+}
+
+@keyframes locate-flash {
+  0% { box-shadow: 0 0 0 0 rgb(255 205 46 / 80%); }
+  100% { box-shadow: 0 0 0 10px rgb(255 205 46 / 0%); }
 }
 
 @media (max-width: 900px) {

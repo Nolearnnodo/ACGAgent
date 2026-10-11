@@ -3,6 +3,7 @@
 import json
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -81,6 +82,63 @@ def _parse_usage(raw_usage: dict[str, Any] | None) -> LLMUsage:
     )
 
 
+_HIAGENT_USER_ID = "acg-annotate"
+
+
+def _is_hiagent_base_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return (parsed.hostname or "") == "agent.tongji.edu.cn" or "/api/proxy/api/v1" in url
+
+
+def _hiagent_query(messages: list[dict[str, str]]) -> str:
+    """把分片的 system/user 消息拼成同济 HiAgent 的单条 Query。"""
+
+    system = "\n\n".join(
+        message.get("content", "")
+        for message in messages
+        if message.get("role") == "system" and message.get("content")
+    )
+    user = "\n\n".join(
+        message.get("content", "")
+        for message in messages
+        if message.get("role") == "user" and message.get("content")
+    )
+    if system and user:
+        return system + "\n\n用户消息 JSON：\n" + user
+    return system or user
+
+
+def _find_conversation_id(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for name in ("AppConversationID", "app_conversation_id"):
+            value = payload.get(name)
+            if isinstance(value, str) and value:
+                return value
+        for value in payload.values():
+            found = _find_conversation_id(value)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_conversation_id(value)
+            if found:
+                return found
+    return ""
+
+
+def _parse_hiagent_line(line: str) -> dict[str, Any] | None:
+    text = line.strip()
+    if text.startswith("data:"):
+        text = text[5:].strip()
+    if not text or text == "[DONE]" or text.startswith("event:") or not text.startswith("{"):
+        return None
+    try:
+        event = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
 class DeepSeekProvider(BaseLLMProvider):
     """Provider backed by the DeepSeek chat completions API."""
 
@@ -150,6 +208,8 @@ class DeepSeekProvider(BaseLLMProvider):
         model_name = self._effective_model_name
         if not api_base_url or not api_key or not model_name:
             raise ValueError("DeepSeek API configuration is incomplete.")
+        if _is_hiagent_base_url(api_base_url):
+            return self._post_hiagent_chat_result(messages)
 
         trimmed = _trim_messages(messages, MAX_INPUT_TOKENS)
         payload: dict[str, Any] = {
@@ -186,6 +246,107 @@ class DeepSeekProvider(BaseLLMProvider):
             provider="deepseek",
             model=str(data.get("model") or model_name),
             raw_response=data,
+            latency_ms=latency_ms,
+        )
+
+    def _post_hiagent_chat_result(
+        self,
+        messages: list[dict[str, str]],
+    ) -> LLMCallResult:
+        """同济 HiAgent：先建会话，再以流式 chat_query_v2 取正式回答。"""
+
+        api_base_url = self._effective_api_base_url.rstrip("/")
+        api_key = self._effective_api_key
+        model_name = self._effective_model_name
+        query = _hiagent_query(_trim_messages(messages, MAX_INPUT_TOKENS))
+        if not query:
+            raise ValueError("DeepSeek API configuration is incomplete.")
+        client_timeout = (
+            None
+            if self.disable_timeout
+            else httpx.Timeout(max(float(self._effective_timeout_seconds or 0), 1.0))
+        )
+        headers = {"Apikey": api_key, "Content-Type": "application/json"}
+        started = time.perf_counter()
+        answer_parts: list[str] = []
+        usage_raw: dict[str, Any] = {}
+        app_version = ""
+        saw_end = False
+        failed = ""
+        with httpx.Client(timeout=client_timeout) as client:
+            created = client.post(
+                f"{api_base_url}/create_conversation",
+                headers=headers,
+                json={"UserID": _HIAGENT_USER_ID},
+            )
+            created.raise_for_status()
+            conversation_id = _find_conversation_id(created.json())
+            if not conversation_id:
+                raise RuntimeError("同济会话创建失败")
+            with client.stream(
+                "POST",
+                f"{api_base_url}/chat_query_v2",
+                headers=headers,
+                json={
+                    "UserID": _HIAGENT_USER_ID,
+                    "AppConversationID": conversation_id,
+                    "Query": query,
+                    "ResponseMode": "streaming",
+                },
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    event = _parse_hiagent_line(line)
+                    if event is None:
+                        continue
+                    name = str(event.get("event") or "")
+                    if not name and isinstance(event.get("answer"), str):
+                        answer_parts.append(event["answer"])
+                        saw_end = True
+                    elif name == "message" and isinstance(event.get("answer"), str):
+                        answer_parts.append(event["answer"])
+                    elif name == "message_cost":
+                        usage_raw = {
+                            "prompt_tokens": int(event.get("input_tokens") or 0),
+                            "completion_tokens": int(event.get("output_tokens") or 0),
+                            "total_tokens": int(event.get("total_tokens") or 0),
+                        }
+                    elif name == "message_end":
+                        saw_end = True
+                    elif name in {"message_failed", "agent_error"}:
+                        failed = str(
+                            event.get("error")
+                            or event.get("message")
+                            or event.get("error_msg")
+                            or "模型调用失败"
+                        )
+                        break
+                    version = event.get("app_version")
+                    if isinstance(version, str) and version:
+                        app_version = version
+        if failed:
+            raise RuntimeError(failed[:180])
+        answer = "".join(answer_parts).strip()
+        if not answer:
+            raise RuntimeError("同济接口未返回标注输出")
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        raw_response = {
+            "model": model_name,
+            "app_version": app_version,
+            "choices": [
+                {
+                    "finish_reason": "stop" if saw_end else "length",
+                    "message": {"content": answer},
+                }
+            ],
+            "usage": usage_raw,
+        }
+        return LLMCallResult(
+            content=answer,
+            usage=_parse_usage(usage_raw),
+            provider="hiagent",
+            model=model_name,
+            raw_response=raw_response,
             latency_ms=latency_ms,
         )
 

@@ -39,6 +39,7 @@ from app.services.extraction_annotation_service import (
     AnnotationNotFoundError,
     AnnotationValidationError,
     context_sha256,
+    drop_meaningless_excluded_mentions,
     parse_imported_label,
     validate_for_submission,
 )
@@ -66,7 +67,9 @@ def _json_dump(value: Any) -> str:
 
 def _load_label_json(value: str) -> ExtractionAnnotationLabel:
     try:
-        return ExtractionAnnotationLabel.model_validate(json.loads(value or "{}"))
+        label = ExtractionAnnotationLabel.model_validate(json.loads(value or "{}"))
+        drop_meaningless_excluded_mentions(label)
+        return label
     except (json.JSONDecodeError, ValidationError, ValueError):
         return ExtractionAnnotationLabel()
 
@@ -262,6 +265,7 @@ def build_adjudication_differences(
         ("excluded_mentions", "review", "排除称谓", raw_a["excluded_mentions"], raw_b["excluded_mentions"]),
         ("unresolved_items", "review", "暂不能判断项", raw_a["unresolved_items"], raw_b["unresolved_items"]),
         ("schema_conflicts", "review", "Schema 冲突", raw_a["schema_conflicts"], raw_b["schema_conflicts"]),
+        ("omissions", "review", "差缺补漏", raw_a.get("omissions", []), raw_b.get("omissions", [])),
     )
     for path, category, label, value_a, value_b in collection_fields:
         if not _same(value_a, value_b):

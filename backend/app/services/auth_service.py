@@ -56,6 +56,12 @@ class AuthService:
 
         user = User(email=email, password_hash=get_password_hash(password), role="user")
         self.db.add(user)
+        self.db.flush()
+        from app.services.extraction_ai_annotation_share_service import (
+            ExtractionAIAnnotationShareService,
+        )
+
+        ExtractionAIAnnotationShareService(self.db).sync_user(user)
         self.db.commit()
         self.db.refresh(user)
         return user

@@ -10,6 +10,8 @@ from app.db.session import get_db
 from app.models.user import User
 from app.schemas.extraction_annotation import (
     AIAnnotationGenerateRequest,
+    AIAnnotationGenerationListResponse,
+    AIAnnotationGenerationSummary,
     AIAnnotationJobResponse,
     AIAnnotationMetricsResponse,
     AIAnnotationPromptRequest,
@@ -99,6 +101,43 @@ def list_ai_extraction_annotation_jobs(
     """返回当前用户每个篇目的最新 AI 标注任务状态。"""
 
     return ExtractionAIAnnotationJobService(db).list_latest_jobs(current_user)
+
+
+@router.get(
+    "/ai/tasks/{task_id}/generations",
+    response_model=AIAnnotationGenerationListResponse,
+)
+def list_ai_annotation_generations(
+    task_id: int,
+    include_archived: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationGenerationListResponse:
+    """返回当前用户在这一篇上的全部 AI 生成，按 provider 与 model 分组。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationJobService(db).list_generations(
+            task_id,
+            current_user,
+            include_archived=include_archived,
+        )
+    )
+
+
+@router.post(
+    "/ai/jobs/{job_id}/archive",
+    response_model=AIAnnotationGenerationSummary,
+)
+def archive_ai_annotation_generation(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AIAnnotationGenerationSummary:
+    """归档一份生成。只释放槽位，不删除 JSON 或质检。"""
+
+    return _run_service(
+        lambda: ExtractionAIAnnotationJobService(db).archive_generation(job_id, current_user)
+    )
 
 
 @router.get("/ai/jobs/{job_id}", response_model=AIAnnotationJobResponse)
@@ -234,7 +273,7 @@ def get_ai_extraction_annotation_metrics(
     _current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> AIAnnotationMetricsResponse:
-    """返回 AI 标注首轮质量、Token、修复与最终提交耗时统计。"""
+    """返回 AI 标注逐篇正确率、人工判否类型、Token 与流程耗时统计。"""
 
     return ExtractionAIAnnotationMetricsService(db).get_metrics(days=days, limit=limit)
 

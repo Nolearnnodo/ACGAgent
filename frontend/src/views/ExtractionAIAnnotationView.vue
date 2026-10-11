@@ -1,18 +1,24 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onActivated, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
 import { getApiErrorMessage } from '../api/client'
 import {
   type AIAnnotationConfig,
+  type AIAnnotationGenerationList,
+  type AIAnnotationGenerationSummary,
   type AIAnnotationJob,
   type AIAnnotationPrompt,
   type AIAnnotationPromptOverrides,
   type AIAnnotationResult,
   type AIAnnotationTaskContext,
+  archiveAIAnnotationGeneration,
+  fetchAIAnnotationJob,
+  fetchAIAnnotationReview,
   fetchAIAnnotationTask,
   generateAIAnnotation,
   enqueueAIAnnotationRepair,
+  listAIAnnotationGenerations,
   listAIAnnotationJobs,
   previewAIAnnotationPrompt,
   validateAIAnnotation,
@@ -28,6 +34,15 @@ import { useAuthStore } from '../stores/auth'
 const CONFIG_STORAGE_KEY = 'acgagent:ai-annotation-config'
 const authStore = useAuthStore()
 
+interface SavedAIProvider {
+  id: string
+  name: string
+  base_url: string
+  model: string
+}
+
+const BUILTIN_PROVIDER_KEYS = new Set(['', 'mock', 'deepseek', 'openai_compatible'])
+
 const defaultConfig: AIAnnotationConfig = {
   provider: '',
   api_key: '',
@@ -37,21 +52,32 @@ const defaultConfig: AIAnnotationConfig = {
   extra_instruction: '',
 }
 
+const savedProviders = ref<SavedAIProvider[]>([])
+const selectedProviderKey = ref('')
+const providerDraftOpen = ref(false)
+const providerDraftName = ref('')
+const providerNotice = ref('')
+
 const tasks = ref<ExtractionTaskSummary[]>([])
 const selectedTaskId = ref<number | null>(null)
 const taskContext = ref<AIAnnotationTaskContext | null>(null)
 const result = ref<AIAnnotationResult | null>(null)
 const rawJson = ref('')
-const jobsByTaskId = ref<Record<number, AIAnnotationJob>>({})
-const draftsByTaskId = ref<Record<number, { result: AIAnnotationResult | null; rawJson: string }>>({})
-const appliedJobKeysByTaskId = ref<Record<number, string>>({})
+const taskJobSummaries = ref<Record<number, AIAnnotationJob>>({})
+const generationList = ref<AIAnnotationGenerationList | null>(null)
+const selectedGenerationId = ref<number | null>(null)
+const selectedJob = ref<AIAnnotationJob | null>(null)
+const selectedGenerationByTaskId = ref<Record<number, number>>({})
+const draftsByGenerationJobId = ref<Record<number, { result: AIAnnotationResult | null; rawJson: string }>>({})
+const appliedJobKeys = ref<Record<number, string>>({})
+const archivingJobId = ref<number | null>(null)
 const config = ref<AIAnnotationConfig>({ ...defaultConfig })
 const searchQuery = ref('')
 const tasksLoading = ref(false)
 const contextLoading = ref(false)
-const generating = ref(false)
+const submittingTaskId = ref<number | null>(null)
 const validating = ref(false)
-const repairing = ref(false)
+const repairingTaskId = ref<number | null>(null)
 const importing = ref(false)
 const feedback = ref('')
 const configSaved = ref(false)
@@ -60,14 +86,14 @@ const promptLoading = ref(false)
 const promptPreview = ref<AIAnnotationPrompt | null>(null)
 let jobPollingTimer: number | null = null
 let jobPollingInFlight = false
+let pollBecauseBusy = false
 let contextRequestToken = 0
+let generationsRequestToken = 0
+let jobRequestToken = 0
+let editorGenerationId: number | null = null
 
 const selectedTask = computed(() => (
   tasks.value.find((task) => task.id === selectedTaskId.value) ?? null
-))
-
-const selectedJob = computed(() => (
-  selectedTaskId.value === null ? null : jobsByTaskId.value[selectedTaskId.value] ?? null
 ))
 
 const filteredTasks = computed(() => {
@@ -88,17 +114,48 @@ const promptReady = computed(() => (
   )
 ))
 
-const selectedJobBusy = computed(() => (
-  selectedJob.value?.status === 'queued' || selectedJob.value?.status === 'running'
-))
+const selectedGeneration = computed(() => {
+  const generationId = selectedGenerationId.value
+  const list = generationList.value
+  if (generationId === null || !list) return null
+  for (const group of list.groups) {
+    const row = group.generations.find((item) => item.job_id === generationId)
+    if (row) return row
+  }
+  return null
+})
+
+const generationQuota = computed(() => {
+  const list = generationList.value
+  const summary = selectedTaskId.value === null ? null : taskJobSummaries.value[selectedTaskId.value]
+  return {
+    active: list?.active_generation_count ?? summary?.active_generation_count ?? 0,
+    limit: list?.generation_limit ?? summary?.generation_limit ?? 12,
+  }
+})
+
+const quotaFull = computed(() => generationQuota.value.active >= generationQuota.value.limit)
+
+const taskBusy = computed(() => {
+  const list = generationList.value
+  if (list && list.task_id === selectedTaskId.value && list.active_job_id) return true
+  if (selectedTaskId.value === null) return false
+  return Boolean(taskJobSummaries.value[selectedTaskId.value]?.active_job_id)
+})
+
+const selectedRepairBusy = computed(() => {
+  const row = selectedGeneration.value
+  if (!row || row.latest_operation !== 'repair') return false
+  return row.latest_status === 'queued' || row.latest_status === 'running'
+})
 
 const canGenerate = computed(() => Boolean(
   selectedTask.value
   && taskContext.value
   && promptReady.value
-  && !generating.value
-  && !repairing.value
-  && !selectedJobBusy.value,
+  && submittingTaskId.value !== selectedTask.value.id
+  && repairingTaskId.value !== selectedTask.value.id
+  && !quotaFull.value,
 ))
 
 const canImport = computed(() => Boolean(
@@ -107,8 +164,9 @@ const canImport = computed(() => Boolean(
   && selectedTask.value.submission_state === 'draft'
   && selectedTask.value.revision !== null
   && result.value?.document
-  && selectedJob.value?.review_status === 'submitted'
-  && !repairing.value
+  && selectedJob.value?.status === 'success'
+  && selectedJob.value.review_status === 'submitted'
+  && repairingTaskId.value !== selectedTask.value.id
   && !importing.value,
 ))
 
@@ -122,14 +180,26 @@ const canReview = computed(() => Boolean(
 const canRepair = computed(() => Boolean(
   selectedTask.value
   && taskContext.value
+  && selectedGeneration.value?.status === 'success'
+  && !selectedGeneration.value?.archived_at
   && rawJson.value.trim()
   && result.value
   && result.value.validation_status !== 'valid'
-  && !repairing.value
+  && repairingTaskId.value !== selectedTask.value.id
+  && submittingTaskId.value !== selectedTask.value.id
   && !validating.value
-  && !generating.value
-  && !selectedJobBusy.value,
+  && !taskBusy.value,
 ))
+
+const resultBanner = computed(() => {
+  const job = selectedJob.value
+  if (!job || job.status !== 'success' || !result.value) return ''
+  if (job.saved_result) {
+    const lineageId = job.lineage_job_id ?? job.generation_job_id ?? job.id
+    return `lineage #${lineageId} 的工作副本`
+  }
+  return `根 job #${job.generation_job_id ?? job.id} 的不可变首轮 JSON`
+})
 
 const contextLength = computed(() => taskContext.value?.passage.context.length ?? 0)
 
@@ -150,30 +220,465 @@ function requestConfig(): AIAnnotationConfig {
   }
 }
 
+function newProviderId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `p-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function readSavedProviders(value: unknown): SavedAIProvider[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const providers: SavedAIProvider[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const record = item as Partial<SavedAIProvider>
+    const id = typeof record.id === 'string' ? record.id.trim() : ''
+    const name = typeof record.name === 'string' ? record.name.trim() : ''
+    const baseUrl = typeof record.base_url === 'string' ? record.base_url.trim() : ''
+    const model = typeof record.model === 'string' ? record.model.trim() : ''
+    const nameKey = name.toLowerCase()
+    if (!id || !name || name.length > 64 || seen.has(nameKey) || isBuiltinProviderName(name)) continue
+    seen.add(nameKey)
+    providers.push({ id, name, base_url: baseUrl, model })
+  }
+  return providers
+}
+
+function isBuiltinProviderName(name: string) {
+  const lowered = name.trim().toLowerCase()
+  return lowered === 'mock'
+    || lowered === 'deepseek'
+    || lowered === 'openai_compatible'
+    || lowered === 'openai-compatible'
+    || lowered === 'openai compatible'
+}
+
+function isHttpUrl(value: string) {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+const selectedCustomProvider = computed(() => {
+  const key = selectedProviderKey.value
+  if (!key.startsWith('custom:')) return null
+  return savedProviders.value.find((item) => `custom:${item.id}` === key) ?? null
+})
+
+function syncSelectedCustomProvider() {
+  const current = selectedCustomProvider.value
+  if (!current) return
+  current.base_url = config.value.base_url.trim()
+  current.model = config.value.model.trim()
+}
+
 function loadConfig() {
   try {
     const stored = window.localStorage.getItem(CONFIG_STORAGE_KEY)
     if (!stored) return
-    const parsed = JSON.parse(stored) as Partial<AIAnnotationConfig>
+    const parsed = JSON.parse(stored) as Partial<AIAnnotationConfig> & { providers?: unknown }
+    savedProviders.value = readSavedProviders(parsed.providers)
+    const provider = typeof parsed.provider === 'string' ? parsed.provider.trim() : ''
+    const matched = savedProviders.value.find((item) => item.name === provider)
+    const baseUrl = typeof parsed.base_url === 'string' ? parsed.base_url : ''
+    const model = typeof parsed.model === 'string' ? parsed.model : ''
+    const extraInstruction = typeof parsed.extra_instruction === 'string' ? parsed.extra_instruction : ''
+    if (matched) {
+      selectedProviderKey.value = `custom:${matched.id}`
+      config.value = {
+        ...defaultConfig,
+        provider: matched.name,
+        base_url: baseUrl || matched.base_url,
+        model: model || matched.model,
+        temperature: normalizeTemperature(parsed.temperature),
+        extra_instruction: extraInstruction,
+      }
+      return
+    }
+    if (BUILTIN_PROVIDER_KEYS.has(provider)) {
+      selectedProviderKey.value = provider
+      config.value = {
+        ...defaultConfig,
+        provider,
+        base_url: baseUrl,
+        model,
+        temperature: normalizeTemperature(parsed.temperature),
+        extra_instruction: extraInstruction,
+      }
+      return
+    }
+    selectedProviderKey.value = ''
     config.value = {
       ...defaultConfig,
-      ...parsed,
+      base_url: baseUrl,
+      model,
       temperature: normalizeTemperature(parsed.temperature),
-      // API Key 只在当前页面会话中使用，不写入 localStorage。
-      api_key: '',
+      extra_instruction: extraInstruction,
     }
   } catch {
     config.value = { ...defaultConfig }
+    savedProviders.value = []
+    selectedProviderKey.value = ''
   }
 }
 
 function saveConfig() {
+  syncSelectedCustomProvider()
   const { api_key: _apiKey, ...safeConfig } = requestConfig()
-  window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(safeConfig))
+  window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify({
+    ...safeConfig,
+    providers: savedProviders.value.map((item) => ({
+      id: item.id,
+      name: item.name,
+      base_url: item.base_url,
+      model: item.model,
+    })),
+  }))
   configSaved.value = true
   window.setTimeout(() => {
     configSaved.value = false
   }, 1800)
+}
+
+function onProviderSelected() {
+  providerNotice.value = ''
+  config.value.api_key = ''
+  const key = selectedProviderKey.value
+  if (key.startsWith('custom:')) {
+    const found = savedProviders.value.find((item) => `custom:${item.id}` === key)
+    if (!found) {
+      selectedProviderKey.value = ''
+      config.value.provider = ''
+    } else {
+      config.value.provider = found.name
+      config.value.base_url = found.base_url
+      config.value.model = found.model
+    }
+  } else {
+    config.value.provider = key
+  }
+  saveConfig()
+}
+
+function beginAddProvider() {
+  providerNotice.value = ''
+  providerDraftName.value = ''
+  providerDraftOpen.value = true
+}
+
+function cancelAddProvider() {
+  providerDraftOpen.value = false
+  providerDraftName.value = ''
+  providerNotice.value = ''
+}
+
+function addProvider() {
+  const name = providerDraftName.value.trim()
+  const baseUrl = config.value.base_url.trim()
+  const model = config.value.model.trim()
+  if (!name) {
+    providerNotice.value = '请填写 Provider 名称。'
+    return
+  }
+  if (name.length > 64) {
+    providerNotice.value = 'Provider 名称不能超过 64 个字符。'
+    return
+  }
+  if (isBuiltinProviderName(name)) {
+    providerNotice.value = '这个名称与内置 Provider 重复，请换一个名称。'
+    return
+  }
+  if (savedProviders.value.some((item) => item.name.toLowerCase() === name.toLowerCase())) {
+    providerNotice.value = '已经有同名 Provider。'
+    return
+  }
+  if (!isHttpUrl(baseUrl)) {
+    providerNotice.value = '请先填写以 http:// 或 https:// 开头的 Base URL。'
+    return
+  }
+  if (!model) {
+    providerNotice.value = '请先填写模型名称。'
+    return
+  }
+  const created: SavedAIProvider = {
+    id: newProviderId(),
+    name,
+    base_url: baseUrl,
+    model,
+  }
+  savedProviders.value = [...savedProviders.value, created]
+  selectedProviderKey.value = `custom:${created.id}`
+  config.value.provider = name
+  config.value.base_url = baseUrl
+  config.value.model = model
+  config.value.api_key = ''
+  providerDraftOpen.value = false
+  providerDraftName.value = ''
+  providerNotice.value = `已增加 Provider「${name}」。`
+  saveConfig()
+}
+
+function deleteProvider() {
+  const current = selectedCustomProvider.value
+  if (!current) return
+  if (!window.confirm(`删除 Provider「${current.name}」？已有生成记录仍会保留这个名称。`)) return
+  savedProviders.value = savedProviders.value.filter((item) => item.id !== current.id)
+  selectedProviderKey.value = ''
+  config.value.provider = ''
+  config.value.api_key = ''
+  providerNotice.value = `已删除 Provider「${current.name}」。`
+  saveConfig()
+}
+
+function providerLabel(provider: string | null | undefined) {
+  const text = provider?.trim() ?? ''
+  return text || '服务端默认'
+}
+
+function temperatureLabel(value: number | null | undefined) {
+  return value === null || value === undefined ? '温度未设置' : `温度 ${value}`
+}
+
+function generationStatusLabel(status: string) {
+  if (status === 'queued') return '排队中'
+  if (status === 'running') return '生成中'
+  if (status === 'failed') return '失败'
+  if (status === 'success') return '成功'
+  return '未生成'
+}
+
+function reviewStatusLabel(status: string | null | undefined) {
+  if (status === 'submitted') return '质检已提交'
+  if (status === 'draft') return '质检草稿'
+  return '未质检'
+}
+
+function taskSummary(taskId: number) {
+  return taskJobSummaries.value[taskId] ?? null
+}
+
+function taskRailStatus(taskId: number) {
+  const summary = taskSummary(taskId)
+  if (summary?.active_status) return summary.active_status
+  if ((summary?.generation_count ?? 0) > 0) return 'kept'
+  return 'idle'
+}
+
+function taskRailLabel(taskId: number) {
+  const summary = taskSummary(taskId)
+  const count = summary?.generation_count ?? 0
+  if (summary?.active_status === 'queued') return `已保留 ${count} 份 · 排队中`
+  if (summary?.active_status === 'running') return `已保留 ${count} 份 · 进行中`
+  if (count > 0) return `已保留 ${count} 份`
+  return '未生成'
+}
+
+function jobKey(job: AIAnnotationJob) {
+  const saved = job.saved_result
+  return [
+    job.id,
+    job.status,
+    job.finished_at ?? '',
+    job.saved_result_source_job_id ?? '',
+    saved?.validation_status ?? '',
+    saved?.elapsed_ms ?? '',
+    job.review_status,
+    job.review_submitted_at ?? '',
+  ].join(':')
+}
+
+function visibleGenerations(list: AIAnnotationGenerationList | null) {
+  if (!list) return []
+  return list.groups.flatMap((group) => group.generations)
+}
+
+function pickGenerationId(list: AIAnnotationGenerationList, prefer: number | null) {
+  const rows = visibleGenerations(list)
+  if (prefer !== null && rows.some((row) => row.job_id === prefer)) return prefer
+  if (!rows.length) return null
+  return [...rows].sort((left, right) => {
+    const delta = new Date(right.created_at).getTime() - new Date(left.created_at).getTime()
+    return delta || right.job_id - left.job_id
+  })[0].job_id
+}
+
+function rootIdForActive(list: AIAnnotationGenerationList | null, activeJobId: number) {
+  for (const row of visibleGenerations(list)) {
+    if (row.job_id === activeJobId || row.latest_job_id === activeJobId) return row.job_id
+  }
+  return activeJobId
+}
+
+function saveGenerationDraft(jobId: number) {
+  if (editorGenerationId !== jobId) return
+  if (selectedJob.value?.id !== jobId || selectedJob.value.status !== 'success') return
+  draftsByGenerationJobId.value = {
+    ...draftsByGenerationJobId.value,
+    [jobId]: {
+      result: result.value,
+      rawJson: rawJson.value,
+    },
+  }
+}
+
+function saveCurrentDraft() {
+  if (selectedGenerationId.value === null) return
+  saveGenerationDraft(selectedGenerationId.value)
+}
+
+function applyTaskSummaries(jobs: AIAnnotationJob[]) {
+  const next: Record<number, AIAnnotationJob> = {}
+  for (const job of jobs) next[job.task_id] = job
+  taskJobSummaries.value = next
+}
+
+function listIsBusy(jobs: AIAnnotationJob[]) {
+  return jobs.some((job) => job.active_job_id)
+}
+
+function clearEditor() {
+  selectedGenerationId.value = null
+  selectedJob.value = null
+  result.value = null
+  rawJson.value = ''
+  editorGenerationId = null
+}
+
+async function loadSelectedJob(jobId: number) {
+  const token = ++jobRequestToken
+  try {
+    const job = await fetchAIAnnotationJob(jobId)
+    if (token !== jobRequestToken || selectedGenerationId.value !== jobId) return
+    selectedJob.value = job
+    if (job.status !== 'success') {
+      result.value = null
+      rawJson.value = ''
+      editorGenerationId = jobId
+      return
+    }
+    const signature = jobKey(job)
+    if (editorGenerationId === jobId && appliedJobKeys.value[jobId] === signature) return
+    const draft = draftsByGenerationJobId.value[jobId]
+    if (draft && appliedJobKeys.value[jobId] === signature) {
+      result.value = draft.result
+      rawJson.value = draft.rawJson
+    } else {
+      const persisted = job.saved_result ?? job.result
+      result.value = persisted
+      rawJson.value = persisted?.document
+        ? stringifyOutput(persisted.document)
+        : (persisted?.raw_content ?? '')
+      appliedJobKeys.value = { ...appliedJobKeys.value, [jobId]: signature }
+      draftsByGenerationJobId.value = {
+        ...draftsByGenerationJobId.value,
+        [jobId]: { result: result.value, rawJson: rawJson.value },
+      }
+    }
+    editorGenerationId = jobId
+  } catch (error) {
+    if (token === jobRequestToken && selectedGenerationId.value === jobId) {
+      feedback.value = getApiErrorMessage(error, '这份生成的结果加载失败。')
+    }
+  }
+}
+
+async function showGeneration(jobId: number | null) {
+  if (
+    jobId !== null
+    && jobId === selectedGenerationId.value
+    && editorGenerationId === jobId
+    && selectedJob.value?.id === jobId
+  ) {
+    return
+  }
+  if (selectedGenerationId.value !== null && selectedGenerationId.value !== jobId) {
+    saveGenerationDraft(selectedGenerationId.value)
+  }
+  selectedGenerationId.value = jobId
+  if (selectedTaskId.value !== null && jobId !== null) {
+    selectedGenerationByTaskId.value = {
+      ...selectedGenerationByTaskId.value,
+      [selectedTaskId.value]: jobId,
+    }
+  }
+  if (jobId === null) {
+    selectedJob.value = null
+    result.value = null
+    rawJson.value = ''
+    editorGenerationId = null
+    return
+  }
+  await loadSelectedJob(jobId)
+}
+
+async function refreshGenerations(taskId: number, preferId?: number | null) {
+  const token = ++generationsRequestToken
+  const list = await listAIAnnotationGenerations(taskId)
+  if (token !== generationsRequestToken || selectedTaskId.value !== taskId) return null
+  generationList.value = list
+  const prefer = preferId === undefined ? selectedGenerationId.value : preferId
+  const nextId = pickGenerationId(list, prefer)
+  if (nextId === selectedGenerationId.value && nextId !== null && editorGenerationId === nextId) {
+    await loadSelectedJob(nextId)
+  } else {
+    await showGeneration(nextId)
+  }
+  return list
+}
+
+async function refreshTaskSummaries() {
+  const jobs = await listAIAnnotationJobs()
+  applyTaskSummaries(jobs)
+  return jobs
+}
+
+function stopJobPolling() {
+  if (jobPollingTimer !== null) {
+    window.clearInterval(jobPollingTimer)
+    jobPollingTimer = null
+  }
+}
+
+function startJobPolling() {
+  if (jobPollingTimer !== null) return
+  jobPollingTimer = window.setInterval(() => {
+    void pollJobs()
+  }, 2000)
+}
+
+function syncPolling(jobs: AIAnnotationJob[]) {
+  if (listIsBusy(jobs)) {
+    pollBecauseBusy = true
+    startJobPolling()
+    return
+  }
+  pollBecauseBusy = false
+  stopJobPolling()
+}
+
+async function pollJobs() {
+  if (jobPollingInFlight) return
+  jobPollingInFlight = true
+  const refreshOpen = pollBecauseBusy
+  try {
+    const jobs = await listAIAnnotationJobs()
+    applyTaskSummaries(jobs)
+    const stillBusy = listIsBusy(jobs)
+    if (selectedTaskId.value !== null && (refreshOpen || stillBusy)) {
+      await refreshGenerations(selectedTaskId.value)
+    }
+    pollBecauseBusy = stillBusy
+    if (!stillBusy) stopJobPolling()
+  } catch {
+    // 轮询失败不清空当前份的结果，下一轮继续尝试。
+  } finally {
+    jobPollingInFlight = false
+  }
 }
 
 async function loadTasks() {
@@ -185,133 +690,23 @@ async function loadTasks() {
       listAIAnnotationJobs(),
     ])
     tasks.value = nextTasks
-    replaceJobs(nextJobs)
+    applyTaskSummaries(nextJobs)
     const currentStillExists = nextTasks.some((task) => task.id === selectedTaskId.value)
     if (!currentStillExists && nextTasks.length) {
       await openTask(nextTasks[0])
     } else if (!nextTasks.length) {
       selectedTaskId.value = null
       taskContext.value = null
-      result.value = null
-      rawJson.value = ''
+      generationList.value = null
+      clearEditor()
+    } else if (selectedTaskId.value !== null) {
+      await refreshGenerations(selectedTaskId.value)
     }
+    syncPolling(nextJobs)
   } catch (error) {
     feedback.value = getApiErrorMessage(error, 'AI 标注任务列表加载失败。')
   } finally {
     tasksLoading.value = false
-  }
-}
-
-function jobKey(job: AIAnnotationJob) {
-  return `${job.id}:${job.status}:${job.finished_at ?? ''}`
-}
-
-function saveTaskDraft(taskId: number) {
-  draftsByTaskId.value = {
-    ...draftsByTaskId.value,
-    [taskId]: {
-      result: result.value,
-      rawJson: rawJson.value,
-    },
-  }
-}
-
-function saveCurrentDraft() {
-  if (selectedTaskId.value === null) return
-  saveTaskDraft(selectedTaskId.value)
-}
-
-function restoreTaskDraft(taskId: number) {
-  const draft = draftsByTaskId.value[taskId]
-  if (draft) {
-    result.value = draft.result
-    rawJson.value = draft.rawJson
-    return
-  }
-
-  const job = jobsByTaskId.value[taskId]
-  const persistedResult = job?.saved_result
-    ?? (job?.status === 'success' ? job.result : null)
-  if (persistedResult) {
-    result.value = persistedResult
-    rawJson.value = persistedResult.document
-      ? stringifyOutput(persistedResult.document)
-      : persistedResult.raw_content
-    saveTaskDraft(taskId)
-    return
-  }
-
-  result.value = null
-  rawJson.value = ''
-}
-
-function syncSelectedJob() {
-  const taskId = selectedTaskId.value
-  if (taskId === null) return
-  const job = jobsByTaskId.value[taskId]
-  if (!job) return
-
-  const key = jobKey(job)
-  if (appliedJobKeysByTaskId.value[taskId] === key) return
-
-  const persistedResult = job.saved_result ?? job.result
-  if (job.status === 'success' && persistedResult) {
-    result.value = persistedResult
-    rawJson.value = persistedResult.document
-      ? stringifyOutput(persistedResult.document)
-      : persistedResult.raw_content
-    saveTaskDraft(taskId)
-    feedback.value = persistedResult.validation_status === 'valid'
-      ? 'AI 标注已生成并通过校验。'
-      : 'AI 标注已返回，请根据校验提示修订输出。'
-  } else if (job.status === 'failed') {
-    feedback.value = job.error_message || 'AI 标注任务失败，请重新发送。'
-  }
-
-  appliedJobKeysByTaskId.value = {
-    ...appliedJobKeysByTaskId.value,
-    [taskId]: key,
-  }
-}
-
-function hasActiveJobs() {
-  return Object.values(jobsByTaskId.value).some((job) => (
-    job.status === 'queued' || job.status === 'running'
-  ))
-}
-
-function stopJobPolling() {
-  if (jobPollingTimer !== null) {
-    window.clearInterval(jobPollingTimer)
-    jobPollingTimer = null
-  }
-}
-
-function startJobPolling() {
-  if (jobPollingTimer !== null || !hasActiveJobs()) return
-  jobPollingTimer = window.setInterval(() => {
-    void pollJobs()
-  }, 2000)
-}
-
-function replaceJobs(nextJobs: AIAnnotationJob[]) {
-  const nextByTaskId: Record<number, AIAnnotationJob> = {}
-  for (const job of nextJobs) nextByTaskId[job.task_id] = job
-  jobsByTaskId.value = nextByTaskId
-  syncSelectedJob()
-  if (hasActiveJobs()) startJobPolling()
-  else stopJobPolling()
-}
-
-async function pollJobs() {
-  if (jobPollingInFlight) return
-  jobPollingInFlight = true
-  try {
-    replaceJobs(await listAIAnnotationJobs())
-  } catch {
-    // 轮询失败不清空当前篇目的结果，下一轮继续尝试。
-  } finally {
-    jobPollingInFlight = false
   }
 }
 
@@ -320,18 +715,23 @@ async function openTask(task: ExtractionTaskSummary) {
   saveCurrentDraft()
   selectedTaskId.value = task.id
   taskContext.value = null
-  restoreTaskDraft(task.id)
+  generationList.value = null
+  clearEditor()
   promptOpen.value = false
   promptPreview.value = null
   promptLoading.value = false
   feedback.value = ''
-  syncSelectedJob()
   contextLoading.value = true
   try {
-    const nextContext = await fetchAIAnnotationTask(task.id)
-    if (requestToken === contextRequestToken && selectedTaskId.value === task.id) {
-      taskContext.value = nextContext
-    }
+    const [nextContext, list] = await Promise.all([
+      fetchAIAnnotationTask(task.id),
+      listAIAnnotationGenerations(task.id),
+    ])
+    if (requestToken !== contextRequestToken || selectedTaskId.value !== task.id) return
+    taskContext.value = nextContext
+    generationList.value = list
+    const prefer = selectedGenerationByTaskId.value[task.id] ?? null
+    await showGeneration(pickGenerationId(list, prefer))
   } catch (error) {
     if (requestToken === contextRequestToken && selectedTaskId.value === task.id) {
       feedback.value = getApiErrorMessage(error, '篇目正文加载失败。')
@@ -376,9 +776,57 @@ function aiJobStatusHint(job?: AIAnnotationJob | null) {
   if (job.status === 'failed') return job.error_message || '后台任务失败，请检查配置后重新发送。'
   return (job.saved_result ?? job.result)?.validation_status === 'valid'
     ? job.review_status === 'submitted'
-      ? '结果与首轮质检均已保存，可继续编辑、下载或导入。'
-      : '结果已保存到服务器；请先完成首轮质检，再导入盲标草稿补改。'
-    : '结果已保存到服务器的当前篇目记录，请先修订并重新校验 JSON。'
+      ? '结果与首轮质检均已保存。导入后的是质检合成的标注，可到独立盲标页直接提交。'
+      : '这一份已保存；请先完成首轮质检，再导入盲标草稿。'
+    : '这一份的工作副本已保存，请先修订并重新校验 JSON。'
+}
+
+function selectedStatusHint() {
+  const row = selectedGeneration.value
+  if (
+    row
+    && row.latest_job_id !== row.job_id
+    && (row.latest_status === 'queued' || row.latest_status === 'running')
+  ) {
+    const action = row.latest_operation === 'repair' ? 'API 修复' : '生成'
+    return `这一份的${action} #${row.latest_job_id} 仍在进行，完成前不能再提交。`
+  }
+  return aiJobStatusHint(selectedJob.value)
+}
+
+function currentProviderLabel() {
+  return providerLabel(selectedGeneration.value?.provider || selectedJob.value?.provider || '')
+}
+
+function currentModelLabel() {
+  return selectedGeneration.value?.model || selectedJob.value?.model || '默认模型'
+}
+
+function noteBusyJob(next: AIAnnotationJob) {
+  const jobs = Object.values(taskJobSummaries.value)
+  if (listIsBusy(jobs) || next.status === 'queued' || next.status === 'running' || next.reused_existing) {
+    pollBecauseBusy = true
+    startJobPolling()
+  }
+}
+
+async function followActiveJob(next: AIAnnotationJob, taskId: number) {
+  await refreshTaskSummaries()
+  if (selectedTaskId.value !== taskId) {
+    noteBusyJob(next)
+    return
+  }
+  if (next.reused_existing) {
+    await refreshGenerations(taskId)
+    if (selectedTaskId.value !== taskId) {
+      noteBusyJob(next)
+      return
+    }
+    const activeId = next.active_job_id ?? next.id
+    await showGeneration(rootIdForActive(generationList.value, activeId))
+    feedback.value = `本篇已有进行中的生成或 API 修复 #${activeId}，完成前不能再提交`
+  }
+  noteBusyJob(next)
 }
 
 function sourceTypeLabel(sourceType: string) {
@@ -389,6 +837,18 @@ function sourceTypeLabel(sourceType: string) {
 
 function digestPreview(value: string) {
   return value ? `${value.slice(0, 10)}…${value.slice(-8)}` : '—'
+}
+
+function formatDateTime(value: string | null | undefined) {
+  if (!value) return '—'
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(new Date(value))
 }
 
 function resultStatusLabel(status?: AIAnnotationResult['validation_status']) {
@@ -403,8 +863,8 @@ function resultStatusHint(
   reviewStatus?: AIAnnotationJob['review_status'],
 ) {
   if (status === 'valid') return reviewStatus === 'submitted'
-    ? '标注与首轮质检均已完成，可下载或导入当前篇目的独立盲标草稿。'
-    : '结果已生成；请先完成首轮质检，通过后即可导入当前篇目的独立盲标草稿。'
+    ? '标注与首轮质检均已完成。导入会写入质检后的 ground truth，再到独立盲标页直接提交。'
+    : '结果已生成；请先完成首轮质检，通过后即可导入质检后的标注。'
   if (status === 'invalid_rules') return '可先在首轮质检中逐项记录问题；完成质检后再导入独立盲标草稿修改，也可以调用 API 修复。'
   if (status === 'invalid_format') return '只有无法解析为 JSON 时不能导入；请先修正 JSON 结构或调用 API 修复问题。'
   return '选择左侧篇目后填写调用配置。'
@@ -445,59 +905,64 @@ async function togglePrompt() {
 async function generate() {
   if (!selectedTask.value || !canGenerate.value) return
   const clientStartedAt = new Date().toISOString()
+  const taskId = selectedTask.value.id
   saveCurrentDraft()
-  // 当前篇目的上一轮结果已经保存在 draftsByTaskId 中；本轮请求开始后先清空可见结果，
-  // 避免“本轮模型调用失败”与“上一轮待校验”同时显示造成误判。
-  result.value = null
-  rawJson.value = ''
-  generating.value = true
+  submittingTaskId.value = taskId
   feedback.value = ''
   try {
     const next = await generateAIAnnotation(
-      selectedTask.value.id,
+      taskId,
       requestConfig(),
       activePromptOverrides(),
       clientStartedAt,
     )
-    jobsByTaskId.value = {
-      ...jobsByTaskId.value,
-      [next.task_id]: next,
-    }
-    syncSelectedJob()
-    if (hasActiveJobs()) startJobPolling()
     saveConfig()
+    if (selectedTaskId.value !== taskId) {
+      await refreshTaskSummaries()
+      noteBusyJob(next)
+      return
+    }
+    if (next.reused_existing) {
+      await followActiveJob(next, taskId)
+      return
+    }
+    const drafts = { ...draftsByGenerationJobId.value }
+    delete drafts[next.id]
+    draftsByGenerationJobId.value = drafts
+    const applied = { ...appliedJobKeys.value }
+    delete applied[next.id]
+    appliedJobKeys.value = applied
+    await refreshTaskSummaries()
+    await refreshGenerations(taskId, next.id)
+    if (selectedTaskId.value !== taskId) {
+      noteBusyJob(next)
+      return
+    }
     feedback.value = next.status === 'failed'
       ? (next.error_message || 'AI 标注任务提交失败。')
-      : `AI 标注已${aiJobStatusLabel(next)}，完成后会自动回填当前篇目。`
+      : `已再生成一份 #${next.id}，完成后会自动回填这一份。`
+    await followActiveJob(next, taskId)
   } catch (error) {
-    feedback.value = getApiErrorMessage(error, 'AI 标注调用失败。')
+    if (selectedTaskId.value === taskId) {
+      feedback.value = getApiErrorMessage(error, 'AI 标注调用失败。')
+    }
   } finally {
-    generating.value = false
+    if (submittingTaskId.value === taskId) submittingTaskId.value = null
   }
 }
 
 async function validateOutput() {
-  if (!selectedTask.value || !rawJson.value.trim() || validating.value || repairing.value) return
+  if (!selectedTask.value || !rawJson.value.trim() || validating.value || repairingTaskId.value === selectedTask.value.id) return
+  const rootId = selectedGenerationId.value
+  if (!rootId || selectedJob.value?.status !== 'success') return
   validating.value = true
   feedback.value = ''
   try {
-    const next = await validateAIAnnotation(
-      selectedTask.value.id,
-      rawJson.value,
-      selectedJob.value?.id,
-    )
+    const next = await validateAIAnnotation(selectedTask.value.id, rawJson.value, rootId)
     result.value = next
     if (next.document) rawJson.value = stringifyOutput(next.document)
-    if (selectedJob.value) {
-      jobsByTaskId.value = {
-        ...jobsByTaskId.value,
-        [selectedTask.value.id]: {
-          ...selectedJob.value,
-          saved_result: next,
-        },
-      }
-    }
     saveCurrentDraft()
+    await refreshGenerations(selectedTask.value.id, rootId)
     feedback.value = next.validation_status === 'valid'
       ? '当前 JSON 已通过格式和标注规则校验。'
       : '当前 JSON 尚未通过全部校验，请查看问题列表。'
@@ -509,33 +974,66 @@ async function validateOutput() {
 }
 
 async function repairOutput() {
-  if (!selectedTask.value || !canRepair.value) return
+  if (!selectedTask.value || !canRepair.value || selectedGenerationId.value === null) return
   const clientStartedAt = new Date().toISOString()
+  const taskId = selectedTask.value.id
+  const rootId = selectedGenerationId.value
   saveCurrentDraft()
-  repairing.value = true
+  repairingTaskId.value = taskId
   feedback.value = ''
   try {
     const next = await enqueueAIAnnotationRepair(
-      selectedTask.value.id,
+      taskId,
       rawJson.value,
       requestConfig(),
-      selectedJob.value?.id,
+      rootId,
       clientStartedAt,
     )
-    jobsByTaskId.value = {
-      ...jobsByTaskId.value,
-      [next.task_id]: next,
-    }
-    syncSelectedJob()
-    if (hasActiveJobs()) startJobPolling()
     saveConfig()
+    if (selectedTaskId.value !== taskId) {
+      await refreshTaskSummaries()
+      noteBusyJob(next)
+      return
+    }
+    if (next.reused_existing) {
+      await followActiveJob(next, taskId)
+      return
+    }
+    await refreshTaskSummaries()
+    await refreshGenerations(taskId, rootId)
+    if (selectedTaskId.value !== taskId) {
+      noteBusyJob(next)
+      return
+    }
     feedback.value = next.status === 'failed'
       ? (next.error_message || 'API 修复任务提交失败。')
-      : 'API 修复问题的请求已加入共享队列，完成后会自动回填当前篇目。'
+      : 'API 修复问题的请求已加入共享队列，完成后会自动回填这一份。'
+    await followActiveJob(next, taskId)
   } catch (error) {
-    feedback.value = getApiErrorMessage(error, 'API 修复调用失败。')
+    if (selectedTaskId.value === taskId) {
+      feedback.value = getApiErrorMessage(error, 'API 修复调用失败。')
+    }
   } finally {
-    repairing.value = false
+    if (repairingTaskId.value === taskId) repairingTaskId.value = null
+  }
+}
+
+async function archiveGeneration(row: AIAnnotationGenerationSummary) {
+  if (!selectedTask.value) return
+  const label = `${providerLabel(row.provider)} · ${row.model || '默认模型'} #${row.job_id}`
+  if (!window.confirm(`归档 ${label} 后，它会离开默认列表并释放名额。JSON 仍保留，且不能撤销。继续吗？`)) return
+  archivingJobId.value = row.job_id
+  feedback.value = ''
+  try {
+    await archiveAIAnnotationGeneration(row.job_id)
+    const prefer = selectedGenerationId.value === row.job_id ? null : selectedGenerationId.value
+    await refreshGenerations(selectedTask.value.id, prefer)
+    await refreshTaskSummaries()
+    feedback.value = `已归档 #${row.job_id}。这份 JSON 仍保留，只是不再占用生成名额。`
+  } catch (error) {
+    feedback.value = getApiErrorMessage(error, '归档失败。')
+  } finally {
+    archivingJobId.value = null
   }
 }
 
@@ -552,13 +1050,23 @@ function downloadOutput() {
 }
 
 async function importToDraft() {
-  if (!selectedTask.value || !result.value?.document || !canImport.value) return
-  if (!window.confirm('将当前 AI 结果覆盖到你的独立盲标草稿中，继续吗？')) return
+  if (!selectedTask.value || !result.value?.document || !canImport.value || !selectedJob.value) return
+  const rootId = selectedJob.value.generation_job_id
+  if (!rootId) return
+  const provider = currentProviderLabel()
+  const model = currentModelLabel()
+  if (!window.confirm(`将把 ${provider} · ${model} 的根 job #${rootId} 质检结果覆盖到当前盲标草稿，不会删除其它 AI 生成。继续吗？`)) return
   importing.value = true
   feedback.value = ''
   try {
+    const review = await fetchAIAnnotationReview(rootId)
+    const document = review.ground_truth_document ?? selectedJob.value.result?.document ?? null
+    if (!document) {
+      feedback.value = '这份生成没有可导入的首轮结果。'
+      return
+    }
     const file = new File(
-      [JSON.stringify(result.value.document, null, 2)],
+      [JSON.stringify(document, null, 2)],
       `ai-annotation-task-${selectedTask.value.id}.json`,
       { type: 'application/json' },
     )
@@ -567,8 +1075,7 @@ async function importToDraft() {
       selectedTask.value.revision ?? 0,
       file,
       true,
-      selectedJob.value?.saved_result_source_job_id
-        ?? (selectedJob.value?.status === 'success' ? selectedJob.value.id : undefined),
+      rootId,
     )
     const index = tasks.value.findIndex((task) => task.id === selectedTask.value?.id)
     if (index >= 0) {
@@ -578,7 +1085,7 @@ async function importToDraft() {
         submission_state: detail.submission.state,
       }
     }
-    feedback.value = 'AI 结果已导入独立盲标草稿；超出正文范围的证据片段已忽略，其余约束错误保留，等待人工修改。'
+    feedback.value = '质检后的标注已导入盲标草稿。请到独立盲标页直接提交，一般无需再改。'
   } catch (error) {
     feedback.value = getApiErrorMessage(error, 'AI 结果导入盲标草稿失败。')
   } finally {
@@ -588,6 +1095,9 @@ async function importToDraft() {
 
 onMounted(() => {
   loadConfig()
+})
+
+onActivated(() => {
   void loadTasks()
 })
 
@@ -653,9 +1163,9 @@ onBeforeUnmount(() => {
                 <em>{{ submissionLabel(task) }}</em>
                 <em
                   class="task-item__ai-status"
-                  :data-status="jobsByTaskId[task.id]?.status ?? 'idle'"
+                  :data-status="taskRailStatus(task.id)"
                 >
-                  AI · {{ aiJobStatusLabel(jobsByTaskId[task.id]) }}
+                  AI · {{ taskRailLabel(task.id) }}
                 </em>
               </span>
             </button>
@@ -708,24 +1218,59 @@ onBeforeUnmount(() => {
               <header>
                 <span>MODEL CONFIG</span>
                 <h3>调用配置</h3>
-                <p>仅在本次调用中使用 API Key；其余配置会保存在当前浏览器。</p>
+                <p>自定义 Provider 保存在当前浏览器，可以增加或删除。API Key 只在本次调用中使用，不会保存。</p>
               </header>
               <label class="field">
                 <span>Provider</span>
-                <select v-model="config.provider">
+                <select v-model="selectedProviderKey" @change="onProviderSelected">
                   <option value="">跟随服务端默认配置</option>
                   <option value="mock">Mock（离线格式演示）</option>
                   <option value="deepseek">DeepSeek</option>
                   <option value="openai_compatible">OpenAI 兼容接口</option>
+                  <option
+                    v-for="item in savedProviders"
+                    :key="item.id"
+                    :value="`custom:${item.id}`"
+                  >
+                    {{ item.name }}
+                  </option>
                 </select>
               </label>
+              <div class="provider-actions">
+                <button class="button" type="button" @click="beginAddProvider">增加 Provider</button>
+                <button
+                  class="button"
+                  type="button"
+                  :disabled="!selectedCustomProvider"
+                  @click="deleteProvider"
+                >
+                  删除
+                </button>
+              </div>
+              <div v-if="providerDraftOpen" class="provider-draft">
+                <label class="field">
+                  <span>新 Provider 名称</span>
+                  <input
+                    v-model="providerDraftName"
+                    type="text"
+                    maxlength="64"
+                    placeholder="例如：硅基流动"
+                  />
+                </label>
+                <p class="config-footnote">保存时使用下面的 Base URL 和模型名称。内置 Provider 不能删除。</p>
+                <div class="provider-actions">
+                  <button class="button button--primary" type="button" @click="addProvider">保存</button>
+                  <button class="button" type="button" @click="cancelAddProvider">取消</button>
+                </div>
+              </div>
+              <p v-if="providerNotice" class="config-footnote">{{ providerNotice }}</p>
               <label class="field">
                 <span>Base URL</span>
-                <input v-model="config.base_url" type="url" placeholder="https://api.deepseek.com" />
+                <input v-model="config.base_url" type="url" placeholder="https://api.deepseek.com" @change="saveConfig" />
               </label>
               <label class="field">
                 <span>模型名称</span>
-                <input v-model="config.model" type="text" placeholder="deepseek-chat" />
+                <input v-model="config.model" type="text" placeholder="deepseek-chat" @change="saveConfig" />
               </label>
               <label class="field">
                 <span>API Key</span>
@@ -771,16 +1316,17 @@ onBeforeUnmount(() => {
                   <p v-else class="prompt-viewer__loading">请先选择篇目。</p>
                 </div>
               </section>
-              <button class="button button--primary button--wide" type="button" :disabled="!canGenerate" @click="generate">
-                {{ generating
-                  ? '提交中…'
-                  : selectedJob?.status === 'queued'
-                    ? '排队中…'
-                    : selectedJob?.status === 'running'
-                      ? '标注中…'
-                      : '调用大模型生成标注' }}
+              <button
+                class="button button--primary button--wide"
+                type="button"
+                :disabled="!canGenerate"
+                :title="quotaFull ? '未归档的成功或进行中生成已达上限，请先归档一份再生成' : undefined"
+                @click="generate"
+              >
+                {{ submittingTaskId !== null && submittingTaskId === selectedTaskId ? '提交中…' : '再生成一份' }}
               </button>
-              <p class="config-footnote">生成不会修改人工标注，也不会自动提交或领取任务。</p>
+              <p v-if="quotaFull" class="config-footnote">未归档的成功或进行中生成已达上限，请先归档一份再生成。</p>
+              <p class="config-footnote">再生成一份会新增一条记录，不会覆盖已有生成，也不会自动提交或领取任务。</p>
             </section>
 
             <section class="inspector-section inspector-section--result">
@@ -795,6 +1341,42 @@ onBeforeUnmount(() => {
               </header>
               <p class="result-hint">{{ resultStatusHint(result?.validation_status, selectedJob?.review_status) }}</p>
 
+              <section v-if="generationList" class="generation-switcher" aria-label="已保留的 AI 生成">
+                <header>
+                  <strong>已保留 {{ generationList.generation_count }} 份</strong>
+                  <small>名额 {{ generationList.active_generation_count }} / {{ generationList.generation_limit }}</small>
+                </header>
+                <p v-if="!generationList.groups.length" class="generation-switcher__empty">这一篇还没有 AI 生成。</p>
+                <div
+                  v-for="group in generationList.groups"
+                  :key="`${group.provider}::${group.model}`"
+                  class="generation-group"
+                >
+                  <h4>{{ providerLabel(group.provider) }} · {{ group.model || '默认模型' }}</h4>
+                  <div
+                    v-for="row in group.generations"
+                    :key="row.job_id"
+                    class="generation-row"
+                    :class="{ active: selectedGenerationId === row.job_id }"
+                    :data-status="row.status"
+                  >
+                    <button type="button" class="generation-row__select" @click="showGeneration(row.job_id)">
+                      <span>#{{ row.job_id }} · {{ formatDateTime(row.created_at) }}</span>
+                      <span>{{ generationStatusLabel(row.status) }} · {{ row.validation_status || '未校验' }} · {{ reviewStatusLabel(row.review_status) }}</span>
+                      <span>{{ temperatureLabel(row.temperature) }} · {{ row.prompt_overridden ? '提示词已覆盖' : '规范提示词' }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="generation-row__archive"
+                      :disabled="row.latest_status === 'queued' || row.latest_status === 'running' || archivingJobId === row.job_id"
+                      @click="archiveGeneration(row)"
+                    >
+                      {{ archivingJobId === row.job_id ? '归档中…' : '归档' }}
+                    </button>
+                  </div>
+                </div>
+              </section>
+
               <div
                 v-if="selectedJob"
                 class="job-status"
@@ -802,10 +1384,11 @@ onBeforeUnmount(() => {
               >
                 <div class="job-status__heading">
                   <strong>{{ aiJobStatusLabel(selectedJob) }}</strong>
-                  <span>{{ aiJobOperationLabel(selectedJob) }}任务 #{{ selectedJob.id }}</span>
+                  <span>{{ currentProviderLabel() }} · {{ currentModelLabel() }} · #{{ selectedJob.generation_job_id ?? selectedJob.id }}</span>
                 </div>
-                <p>{{ aiJobStatusHint(selectedJob) }}</p>
+                <p>{{ selectedStatusHint() }}</p>
               </div>
+              <p v-if="resultBanner" class="generation-banner">{{ resultBanner }}</p>
 
               <div v-if="result" class="result-summary">
                 <span v-if="result.provider">{{ result.provider }} · {{ result.model || '默认模型' }}</span>
@@ -824,6 +1407,7 @@ onBeforeUnmount(() => {
                 <span v-if="result.document">人物 {{ result.document.label.persons.length }} · 关系 {{ result.document.label.person_relations.length }}</span>
                 <span v-if="selectedJob?.review_status === 'submitted'" class="result-summary__reviewed">
                   首轮质检 {{ ((selectedJob.review_accuracy ?? 0) * 100).toFixed(1) }}%
+                  · {{ formatDateTime(selectedJob.review_submitted_at) }} 提交
                 </span>
               </div>
 
@@ -841,7 +1425,7 @@ onBeforeUnmount(() => {
                 <small v-if="result.validation_issues.length > 12">仅显示前 12 条，导出前请完整检查。</small>
               </div>
 
-              <label class="field output-field">
+              <label v-if="!selectedJob || selectedJob.status === 'success'" class="field output-field">
                 <span>可编辑 JSON</span>
                 <textarea
                   v-model="rawJson"
@@ -852,11 +1436,16 @@ onBeforeUnmount(() => {
                   @input="saveCurrentDraft"
                 />
               </label>
+              <p v-else class="generation-pending">
+                {{ selectedJob.status === 'failed'
+                  ? (selectedJob.error_message || '这份生成失败，没有可审阅的 JSON。')
+                  : '这一份还在排队或生成中，完成前不显示 JSON。' }}
+              </p>
               <div class="result-actions">
                 <RouterLink
-                  v-if="canReview && selectedJob"
+                  v-if="canReview && selectedJob?.generation_job_id"
                   class="button button--review"
-                  :to="`/annotations/extraction/ai/review/${selectedJob.id}`"
+                  :to="`/annotations/extraction/ai/review/${selectedJob.generation_job_id}`"
                 >
                   {{ selectedJob.review_status === 'submitted'
                     ? '查看首轮质检'
@@ -871,19 +1460,22 @@ onBeforeUnmount(() => {
                   :disabled="!canRepair"
                   @click="repairOutput"
                 >
-                  {{ repairing
+                  {{ repairingTaskId !== null && repairingTaskId === selectedTaskId
                     ? '提交 API 修复中…'
-                    : selectedJob?.operation === 'repair' && selectedJobBusy
+                    : selectedRepairBusy
                       ? 'API 修复排队中…'
                       : '调用 API 修复问题' }}
                 </button>
-                <button class="button" type="button" :disabled="!rawJson.trim() || validating || repairing" @click="validateOutput">
+                <button class="button" type="button" :disabled="!rawJson.trim() || validating || (repairingTaskId !== null && repairingTaskId === selectedTaskId)" @click="validateOutput">
                   {{ validating ? '校验中…' : '重新校验 JSON' }}
                 </button>
                 <button class="button" type="button" :disabled="!rawJson.trim()" @click="downloadOutput">下载 JSON</button>
                 <button class="button button--primary" type="button" :disabled="!canImport" @click="importToDraft">
-                  {{ importing ? '导入中…' : '一键导入盲标草稿' }}
+                  {{ importing ? '导入中…' : '导入质检结果到盲标' }}
                 </button>
+                <RouterLink v-if="selectedJob?.review_status === 'submitted'" class="button" to="/annotations/extraction">
+                  去盲标页提交
+                </RouterLink>
               </div>
               <p v-if="result && result.validation_status !== 'valid'" class="repair-note">
                 可调用 API 修复当前问题；修复任务不会修改人工标注，约束错误仍可保留到人工标注页面继续修改。
@@ -893,8 +1485,12 @@ onBeforeUnmount(() => {
                   ? '当前输出无法解析为 JSON，修复或整理 JSON 后才能导入。'
                   : selectedTask.submission_state === 'submitted'
                   ? '当前篇目的盲标已提交，不能覆盖；可下载后另行处理。'
+                  : selectedJob?.status === 'queued' || selectedJob?.status === 'running'
+                  ? '这一份还在生成，完成前不能导入。'
+                  : selectedJob?.status === 'failed'
+                  ? '失败的生成不能进入首轮质检，也不能导入。'
                   : selectedJob?.review_status !== 'submitted'
-                  ? '请先完成首轮逐项质检，记录错误和缺漏后再导入盲标草稿补改。'
+                  ? '请先完成首轮逐项质检，系统会按正确值和划选证据合成标注后再导入。'
                   : '要一键导入，请先在独立盲标页面领取该篇目的草稿槽位。' }}
               </p>
             </section>
@@ -994,7 +1590,8 @@ onBeforeUnmount(() => {
 .task-item__body .task-item__ai-status { color: #7183a8; }
 .task-item__body .task-item__ai-status[data-status='queued'],
 .task-item__body .task-item__ai-status[data-status='running'] { color: #a2701f; }
-.task-item__body .task-item__ai-status[data-status='success'] { color: #258660; }
+.task-item__body .task-item__ai-status[data-status='success'],
+.task-item__body .task-item__ai-status[data-status='kept'] { color: #258660; }
 .task-item__body .task-item__ai-status[data-status='failed'] { color: #c04f56; }
 .empty-note { padding: 20px 10px; color: var(--muted); text-align: center; font-size: 10px; line-height: 1.6; }
 .task-rail__footer { display: grid; gap: 6px; padding: 12px; border-top: 1px solid #eef2f8; color: var(--muted); font-size: 9px; line-height: 1.5; }
@@ -1022,6 +1619,9 @@ onBeforeUnmount(() => {
 .inspector-section header h3 { margin: 5px 0 5px; color: var(--ink); font-size: 16px; }
 .inspector-section header p, .config-footnote, .import-note, .result-hint { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .field { display: grid; gap: 5px; min-width: 0; }
+.provider-actions { display: flex; gap: 8px; }
+.provider-actions .button { flex: 1; }
+.provider-draft { display: grid; gap: 8px; padding: 10px; border: 1px solid #dce6f5; border-radius: 10px; background: #f8fbff; }
 .field textarea { resize: vertical; padding: 8px 9px; line-height: 1.5; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
 .prompt-viewer { display: grid; gap: 8px; }
@@ -1046,6 +1646,23 @@ onBeforeUnmount(() => {
 .status-pill[data-status='valid'] { background: #e8f7ef; color: #258660; }
 .status-pill[data-status='invalid_rules'] { background: #fff5df; color: #a2701f; }
 .status-pill[data-status='invalid_format'] { background: #ffebeb; color: #c04f56; }
+.generation-switcher { display: grid; gap: 8px; max-height: 240px; overflow: auto; padding: 8px; border: 1px solid #dce6f5; border-radius: 10px; background: #f8fbff; }
+.generation-switcher header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.generation-switcher header strong { color: var(--ink); font-size: 10px; }
+.generation-switcher header small, .generation-switcher__empty { color: var(--muted); font-size: 9px; }
+.generation-switcher__empty { margin: 0; }
+.generation-group { display: grid; gap: 4px; }
+.generation-group h4 { margin: 4px 0 0; color: #506287; font-size: 10px; }
+.generation-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; align-items: center; border: 1px solid #e4ebf7; border-radius: 8px; padding: 4px; background: #fff; }
+.generation-row.active { border-color: var(--blue); background: #eef5ff; }
+.generation-row[data-status='failed'] { border-color: #f2d9d9; }
+.generation-row[data-status='queued'], .generation-row[data-status='running'] { border-color: #f0dfb6; }
+.generation-row__select { display: grid; gap: 2px; width: 100%; border: 0; padding: 4px; background: transparent; color: #506287; text-align: left; cursor: pointer; }
+.generation-row__select span { overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.generation-row__archive { border: 1px solid #dce6f5; border-radius: 8px; padding: 5px 7px; background: #fff; color: #8b641c; font-size: 9px; cursor: pointer; }
+.generation-row__archive:disabled { cursor: not-allowed; opacity: .48; }
+.generation-banner { margin: 0; padding: 7px 8px; border-radius: 8px; background: #eef5ff; color: var(--blue); font-size: 10px; }
+.generation-pending { margin: 0; padding: 10px; border: 1px dashed #dce6f5; border-radius: 10px; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .job-status { display: grid; gap: 5px; padding: 10px; border: 1px solid #dce6f5; border-radius: 10px; background: #f8fbff; }
 .job-status__heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .job-status__heading strong { color: var(--blue); font-size: 10px; }

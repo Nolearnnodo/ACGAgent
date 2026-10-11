@@ -15,6 +15,7 @@ from app.models.extraction_annotation import (
 from app.models.passage import Passage
 from app.models.user import User
 from app.schemas.extraction_annotation import (
+    AnnotationOmission,
     EvidenceSpan,
     ExtractionAnnotationLabel,
     ExtractionTaskCreateRequest,
@@ -27,6 +28,7 @@ from app.services.extraction_annotation_service import (
     ExtractionAnnotationService,
     codepoint_to_utf16_offset,
     validate_evidence_offsets,
+    validate_for_submission,
 )
 
 
@@ -66,6 +68,7 @@ def _person_label(context: str) -> ExtractionAnnotationLabel:
         end_utf16=codepoint_to_utf16_offset(context, end),
     )
     return ExtractionAnnotationLabel(
+        step_reviews={"material": True, "persons": True, "relations": True, "checks": True},
         persons=[
             PersonAnnotation(
                 key="person-1",
@@ -96,6 +99,45 @@ def test_utf16_offset_is_validated_for_extension_b_character():
     label.persons[0].mentions[0].end_utf16 = 2
     issues = validate_evidence_offsets(label, context)
     assert issues[0]["code"] == "evidence_utf16_mismatch"
+
+
+def test_old_draft_defaults_to_unconfirmed_steps_and_submit_requires_all_steps(annotation_db):
+    _db, _admin, _a, _b, passage = annotation_db
+    label = _person_label(passage.context)
+    payload = label.model_dump(exclude={"step_reviews"})
+    old_draft = ExtractionAnnotationLabel.model_validate(payload)
+    assert old_draft.step_reviews == {
+        "material": False, "persons": False, "relations": False, "checks": False,
+    }
+    issues = validate_for_submission(old_draft, passage.context, old_draft.schema_version)
+    assert sum(item["code"] == "annotation_step_incomplete" for item in issues) == 4
+
+
+def test_unresolved_omission_blocks_submission_and_completed_one_keeps_evidence(annotation_db):
+    _db, _admin, _a, _b, passage = annotation_db
+    label = _person_label(passage.context)
+    label.omissions = [AnnotationOmission(key="o1")]
+    issues = validate_for_submission(label, passage.context, label.schema_version)
+    assert {item["code"] for item in issues} >= {
+        "omission_category_required",
+        "omission_description_required",
+        "omission_target_required",
+        "omission_evidence_required",
+        "omission_unresolved",
+    }
+
+    omission = label.omissions[0]
+    omission.category = "关系缺漏"
+    omission.description = "李𠮷与李彦的父子关系"
+    omission.target_path = "人物关系 / 李𠮷与李彦"
+    omission.evidence_note = "关系见原文“父李彦”"
+    omission.resolution = "resolved"
+    issues = validate_for_submission(label, passage.context, label.schema_version)
+    assert not any(item["code"].startswith("omission_") for item in issues)
+
+    omission.resolution = "unsupported"
+    issues = validate_for_submission(label, passage.context, label.schema_version)
+    assert any(item["code"] == "omission_resolution_note_required" for item in issues)
 
 
 def test_claimed_submissions_are_blind_and_revision_is_optimistic(annotation_db):

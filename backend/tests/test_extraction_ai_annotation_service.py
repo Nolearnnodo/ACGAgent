@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -12,19 +13,26 @@ from app.models.extraction_ai_annotation import (
     ExtractionAIAnnotationJob,
     ExtractionAIAnnotationSavedResult,
 )
-from app.models.extraction_annotation import ExtractionGoldVersion
+from app.models.extraction_annotation import ExtractionAnnotationTask, ExtractionGoldVersion
 from app.models.passage import Passage
 from app.models.user import User
 from app.schemas.extraction_annotation import (
+    EVENT_TYPES,
     AIAnnotationConfigRequest,
     AIAnnotationGenerateRequest,
+    AIAnnotationJobResponse,
     AIAnnotationPromptOverrides,
     AIAnnotationPromptRequest,
     AIAnnotationRepairRequest,
     ExtractionTaskCreateRequest,
 )
-from app.services.extraction_ai_annotation_service import ExtractionAIAnnotationService
+from app.services.extraction_ai_annotation_service import (
+    AIAnnotationConfigError,
+    ExtractionAIAnnotationService,
+    parse_ai_annotation_result,
+)
 from app.services.extraction_ai_annotation_prompt import (
+    AI_ANNOTATION_EVENT_FRAGMENT_SYSTEM_PROMPT,
     AI_ANNOTATION_FORMAT_REQUIREMENTS,
     AI_ANNOTATION_FORMAT_REVIEW_SYSTEM_PROMPT,
     AI_ANNOTATION_SYSTEM_PROMPT,
@@ -34,7 +42,7 @@ from app.services.extraction_ai_annotation_job_service import (
     ExtractionAIAnnotationJobService,
     _run_job_background,
 )
-from app.services.extraction_annotation_service import ExtractionAnnotationService
+from app.services.extraction_annotation_service import ExtractionAnnotationService, context_sha256
 
 
 @pytest.fixture()
@@ -79,6 +87,33 @@ def test_mock_generation_returns_importable_document(ai_annotation_db):
     assert result.validation_issues == []
 
 
+def test_remote_generation_releases_sqlite_before_model_call(ai_annotation_db, monkeypatch):
+    db, task_id = ai_annotation_db
+    service = ExtractionAIAnnotationService(db)
+    seen: dict[str, bool] = {}
+
+    def fake_generate(_task, _passage, _config, _provider, prompt_overrides=None):
+        seen["in_transaction"] = service.db.in_transaction()
+        return {"label": {"persons": [], "person_relations": []}}, "annotation-model", 1, [], []
+
+    monkeypatch.setattr(service, "_build_provider", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(service, "_generate_staged_document", fake_generate)
+
+    service.generate(
+        AIAnnotationGenerateRequest(
+            task_id=task_id,
+            config=AIAnnotationConfigRequest(
+                provider="deepseek",
+                api_key="temporary-key",
+                base_url="https://example.test",
+                model="annotation-model",
+            ),
+        )
+    )
+
+    assert seen["in_transaction"] is False
+
+
 def test_prompt_preview_uses_spec_prompt_and_current_passage(ai_annotation_db):
     db, task_id = ai_annotation_db
     result = ExtractionAIAnnotationService(db).preview_prompt(
@@ -118,6 +153,15 @@ def test_prompt_overrides_are_used_only_for_current_message_build(ai_annotation_
         {"role": "system", "content": "临时 system prompt"},
         {"role": "user", "content": "临时 user prompt"},
     ]
+
+
+def test_event_fragment_prompt_requires_replayable_evidence_for_has_fact():
+    prompt = AI_ANNOTATION_EVENT_FRAGMENT_SYSTEM_PROMPT
+
+    assert 'event_check="has_fact"' in prompt
+    assert "life_events 必须返回一条对应 event_type 的事件" in prompt
+    assert "必须包含 1 至 8 条非空、可按 quote/start/end 回放的 evidence" in prompt
+    assert "找不到上述有效正文证据时，禁止填写 has_fact" in prompt
 
 
 def test_validation_reports_evidence_problem(ai_annotation_db):
@@ -212,6 +256,21 @@ def test_enqueue_repair_persists_input_in_shared_queue(ai_annotation_db, monkeyp
     content = json.dumps(generated.document.model_dump(mode="json"), ensure_ascii=False)
     monkeypatch.setattr(job_module, "_submit_job", lambda _job_id, _payload: None)
 
+    task = db.get(ExtractionAnnotationTask, task_id)
+    assert task is not None
+    root = ExtractionAIAnnotationJob(
+        task_id=task_id,
+        passage_id=task.passage_id,
+        requested_by=admin.id,
+        operation="generate",
+        status="success",
+        provider="mock",
+        model="mock-ai-annotation",
+        result_json=json.dumps(generated.model_dump(mode="json"), ensure_ascii=False),
+    )
+    db.add(root)
+    db.commit()
+
     response = ExtractionAIAnnotationJobService(db).enqueue_repair(
         AIAnnotationRepairRequest(
             task_id=task_id,
@@ -229,7 +288,7 @@ def test_enqueue_repair_persists_input_in_shared_queue(ai_annotation_db, monkeyp
     assert response.operation == "repair"
     assert saved.operation == "repair"
     assert saved.input_content == content
-    assert saved.source_job_id is None
+    assert saved.source_job_id == root.id
     assert json.loads(saved.config_json)["api_key"] == ""
 
 
@@ -310,10 +369,23 @@ def test_background_worker_runs_queued_repair(ai_annotation_db, monkeypatch):
         lambda self, payload: generated,
     )
 
+    root = ExtractionAIAnnotationJob(
+        task_id=task_id,
+        passage_id=generated.passage_id,
+        requested_by=admin.id,
+        operation="generate",
+        status="success",
+        provider="mock",
+        model="mock-ai-annotation",
+        result_json=json.dumps(generated.model_dump(mode="json"), ensure_ascii=False),
+    )
+    db.add(root)
+    db.commit()
     payload = AIAnnotationRepairRequest(
         task_id=task_id,
         content=content,
         config=AIAnnotationConfigRequest(provider="deepseek"),
+        job_id=root.id,
     )
     response = ExtractionAIAnnotationJobService(db).enqueue_repair(payload, admin)
     _run_job_background(response.id, payload)
@@ -338,14 +410,29 @@ def test_validation_persists_current_result_for_user(ai_annotation_db):
     )
     assert generated.document is not None
 
+    root = ExtractionAIAnnotationJob(
+        task_id=task_id,
+        passage_id=generated.passage_id,
+        requested_by=admin.id,
+        operation="generate",
+        status="success",
+        provider="mock",
+        model="mock-ai-annotation",
+        result_json=json.dumps(generated.model_dump(mode="json"), ensure_ascii=False),
+    )
+    db.add(root)
+    db.commit()
+
     result = ExtractionAIAnnotationService(db).validate(
         task_id,
         json.dumps(generated.document.model_dump(mode="json"), ensure_ascii=False),
         requested_by=admin.id,
+        job_id=root.id,
     )
 
     saved_result = db.query(ExtractionAIAnnotationSavedResult).one()
-    assert saved_result.source_job_id is None
+    assert saved_result.source_job_id == root.id
+    assert saved_result.lineage_job_id == root.id
     assert json.loads(saved_result.result_json)["source"] == "validated"
     assert result.validation_status == "valid"
 
@@ -474,9 +561,26 @@ def test_repair_rebuilds_only_semantic_fragments_and_persists(ai_annotation_db, 
         FakeProvider,
     )
 
+    root = ExtractionAIAnnotationJob(
+        task_id=task_id,
+        passage_id=1,
+        requested_by=admin.id,
+        operation="generate",
+        status="success",
+        provider="mock",
+        model="mock-ai-annotation",
+        result_json="{}",
+    )
+    task = db.get(ExtractionAnnotationTask, task_id)
+    assert task is not None
+    root.passage_id = task.passage_id
+    db.add(root)
+    db.commit()
+
     result = service.repair(
         AIAnnotationRepairRequest(
             task_id=task_id,
+            job_id=root.id,
             content="这不是 JSON",
             config=AIAnnotationConfigRequest(
                 provider="deepseek",
@@ -492,7 +596,8 @@ def test_repair_rebuilds_only_semantic_fragments_and_persists(ai_annotation_db, 
     assert len(calls) == 8
     assert all(call[1]["purpose"] != "extraction_ai_annotation_format_review" for call in calls)
     saved_result = db.query(ExtractionAIAnnotationSavedResult).one()
-    assert saved_result.source_job_id is None
+    assert saved_result.source_job_id == root.id
+    assert saved_result.lineage_job_id == root.id
     assert json.loads(saved_result.result_json)["validation_status"] == "valid"
 
 
@@ -574,6 +679,7 @@ def test_repair_routes_event_issue_to_one_event_fragment(ai_annotation_db, monke
 
         def chat_completion_with_usage(self, messages, metadata):
             calls.append((messages, metadata))
+            assert not service.db.in_transaction()
             assert metadata["purpose"] == "extraction_ai_annotation_life_event_repair"
             return SimpleNamespace(
                 content=json.dumps(
@@ -657,7 +763,7 @@ def test_repair_recomputes_existing_evidence_offsets(ai_annotation_db, monkeypat
     assert repaired_mention.end == 2
 
 
-def test_repair_routes_auxiliary_issue_to_auxiliary_fragment(ai_annotation_db, monkeypatch):
+def test_repair_drops_meaningless_excluded_mention_without_model_call(ai_annotation_db, monkeypatch):
     db, task_id = ai_annotation_db
     service = ExtractionAIAnnotationService(db)
     generated = service.generate(
@@ -669,33 +775,17 @@ def test_repair_routes_auxiliary_issue_to_auxiliary_fragment(ai_annotation_db, m
     assert generated.document is not None
     document = generated.document.model_dump(mode="json")
     document["label"]["excluded_mentions"] = [{"key": "x1", "reason": "", "evidence": []}]
-    calls = []
 
-    class FakeProvider:
+    class NeverCalledProvider:
         def __init__(self, **_kwargs):
             pass
 
-        def chat_completion_with_usage(self, _messages, metadata):
-            calls.append(metadata)
-            assert metadata["purpose"] == "extraction_ai_annotation_auxiliary_repair"
-            return SimpleNamespace(
-                content=json.dumps(
-                    {
-                        "excluded_mentions": [
-                            {
-                                "reason": "正文中的泛称不是人物实体",
-                                "evidence": [{"quote": "李白", "start": 0, "end": 2}],
-                            }
-                        ]
-                    },
-                    ensure_ascii=False,
-                ),
-                model="targeted-repair-model",
-            )
+        def chat_completion_with_usage(self, _messages, _metadata):
+            raise AssertionError("meaningless excluded mentions must be dropped locally")
 
     monkeypatch.setattr(
         "app.services.extraction_ai_annotation_service.DeepSeekProvider",
-        FakeProvider,
+        NeverCalledProvider,
     )
     result = service.repair(
         AIAnnotationRepairRequest(
@@ -710,18 +800,19 @@ def test_repair_routes_auxiliary_issue_to_auxiliary_fragment(ai_annotation_db, m
         )
     )
 
-    assert result.validation_status == "valid"
-    assert calls == [{
-        "response_format": "json",
-        "purpose": "extraction_ai_annotation_auxiliary_repair",
-        "retry": False,
-    }]
+    assert result.validation_status == "valid", result.validation_issues
+    assert result.fragment_count == 0
     assert result.document is not None
-    assert result.document.label.excluded_mentions[0].reason == "正文中的泛称不是人物实体"
+    assert result.document.label.excluded_mentions == []
 
 
 def test_repair_routes_relation_issue_to_relation_fragment(ai_annotation_db, monkeypatch):
     db, task_id = ai_annotation_db
+    task = db.get(ExtractionAnnotationTask, task_id)
+    passage = db.get(Passage, task.passage_id)
+    passage.context = "李白字太白，与故人交游。"
+    task.context_sha256 = context_sha256(passage.context)
+    db.commit()
     service = ExtractionAIAnnotationService(db)
     generated = service.generate(
         AIAnnotationGenerateRequest(
@@ -731,6 +822,7 @@ def test_repair_routes_relation_issue_to_relation_fragment(ai_annotation_db, mon
     )
     assert generated.document is not None
     document = generated.document.model_dump(mode="json")
+    first_person_key = document["label"]["persons"][0]["key"]
     second_person = json.loads(json.dumps(document["label"]["persons"][0], ensure_ascii=False))
     second_person.update(
         {
@@ -742,27 +834,32 @@ def test_repair_routes_relation_issue_to_relation_fragment(ai_annotation_db, mon
                     "id": "p2-m1",
                     "source": "context",
                     "quote": "太白",
-                    "start": 2,
-                    "end": 4,
-                    "start_utf16": 2,
-                    "end_utf16": 4,
+                    "start": 3,
+                    "end": 5,
+                    "start_utf16": 3,
+                    "end_utf16": 5,
                 }
             ],
         }
     )
     document["label"]["persons"].append(second_person)
     third_person = json.loads(json.dumps(second_person, ensure_ascii=False))
-    third_person.update({"key": "p3", "name_surface": "故人", "level": 3})
+    third_person.update(
+        {
+            "key": "p3",
+            "name_surface": "故人",
+            "level": 3,
+            "mentions": [{"id": "p3-m1", "source": "context", "quote": "故人", "start": 7, "end": 9, "start_utf16": 7, "end_utf16": 9}],
+        }
+    )
     document["label"]["persons"].append(third_person)
     document["label"]["person_relations"] = [
         {
             "key": "r1",
-            "source_person_key": "p1",
-            "target_person_key": "p2",
-            "codes": ["O", "F"],
-            "reverse_codes": ["O"],
-            "note": "",
-            "reverse_note": "",
+            "source_person_key": "p2",
+            "target_person_key": first_person_key,
+            "relation_category": "",
+            "relation_summary": "",
             "state": "confirmed",
             "evidence": [],
         }
@@ -779,14 +876,12 @@ def test_repair_routes_relation_issue_to_relation_fragment(ai_annotation_db, mon
                     {
                         "person_relations": [
                             {
-                                "source_person_key": "p1",
+                                "source_person_key": first_person_key,
                                 "target_person_key": "p3",
-                                "codes": ["O"],
-                                "reverse_codes": ["O"],
-                                "note": "泛化关系",
-                                "reverse_note": "泛化关系",
+                                "relation_category": "交游与往来",
+                                "relation_summary": "交游",
                                 "state": "confirmed",
-                                "evidence": [],
+                                "evidence": [{"quote": "与故人交游", "start": 6, "end": 11}],
                             }
                         ]
                     },
@@ -812,11 +907,336 @@ def test_repair_routes_relation_issue_to_relation_fragment(ai_annotation_db, mon
         )
     )
 
-    assert result.validation_status == "valid"
+    assert result.validation_status == "valid", result.validation_issues
     assert result.fragment_count == 1
     assert result.document is not None
-    assert result.document.label.person_relations == []
-    assert any(
-        item.category == "level_three_relation_discarded"
-        for item in result.document.label.unresolved_items
+    assert len(result.document.label.person_relations) == 1
+    assert result.document.label.person_relations[0].target_person_key == "p3"
+    assert result.document.label.person_relations[0].relation_category == "交游与往来"
+
+
+def _person_payload(mentions: list[dict]) -> dict:
+    return {
+        "key": "p4",
+        "name_surface": "刘季述",
+        "level": 2,
+        "level_reason": "测试占用区间",
+        "mentions": mentions,
+        "event_checks": {event_type: "not_mentioned" for event_type in EVENT_TYPES},
+    }
+
+
+def test_same_person_mentions_match_longest_first_and_skip_occupied_spans(ai_annotation_db):
+    db, task_id = ai_annotation_db
+    task = db.get(ExtractionAnnotationTask, task_id)
+    passage = db.get(Passage, task.passage_id)
+    assert task is not None and passage is not None
+    passage.context = "遇刘季述，明日季述等，授季述。"
+    full_start = passage.context.find("刘季述")
+    nested_start = full_start + 1
+    later_start = passage.context.find("季述", full_start + 3)
+    service = ExtractionAIAnnotationService(db)
+
+    label = service._normalize_assembled_label(
+        task,
+        passage,
+        {
+            "schema_version": task.spec_version,
+            "passage": {},
+            "persons": [
+                _person_payload(
+                    [
+                        {
+                            "quote": "季述",
+                            "start": nested_start,
+                            "end": nested_start + 2,
+                        },
+                        {
+                            "quote": "刘季述",
+                            "start": full_start,
+                            "end": full_start + 3,
+                        },
+                    ]
+                )
+            ],
+        },
     )
+
+    mentions = [(item.quote, item.start, item.end) for item in label.persons[0].mentions]
+    assert mentions == [
+        ("刘季述", full_start, full_start + 3),
+        ("季述", later_start, later_start + 2),
+    ]
+    assert later_start == passage.context.find("明日季述") + 2
+
+
+def test_same_person_drops_short_mention_when_only_occupied_span_remains(ai_annotation_db):
+    db, task_id = ai_annotation_db
+    task = db.get(ExtractionAnnotationTask, task_id)
+    passage = db.get(Passage, task.passage_id)
+    assert task is not None and passage is not None
+    passage.context = "遇刘季述，留王紫廷院。"
+    full_start = passage.context.find("刘季述")
+    service = ExtractionAIAnnotationService(db)
+
+    label = service._normalize_assembled_label(
+        task,
+        passage,
+        {
+            "schema_version": task.spec_version,
+            "passage": {},
+            "persons": [
+                _person_payload(
+                    [
+                        {"quote": "刘季述", "start": full_start, "end": full_start + 3},
+                        {"quote": "季述", "start": full_start + 1, "end": full_start + 3},
+                    ]
+                )
+            ],
+        },
+    )
+
+    mentions = [(item.quote, item.start, item.end) for item in label.persons[0].mentions]
+    assert mentions == [("刘季述", full_start, full_start + 3)]
+
+
+def test_overlong_label_fields_keep_original_text_and_mark_schema_mismatch(ai_annotation_db):
+    db, task_id = ai_annotation_db
+    task = db.get(ExtractionAnnotationTask, task_id)
+    passage = db.get(Passage, task.passage_id)
+    assert task is not None and passage is not None
+    admin = db.get(User, 1)
+    assert admin is not None
+    service = ExtractionAIAnnotationService(db)
+    original_summary = "请帝劳军牵动后从御南楼"
+    historical_summary = "请帝劳军牵动后从御南楼观礼毕还宫"
+    titles = [f"衔{index}" for index in range(21)]
+    person = _person_payload([])
+    person["titles"] = titles
+    person["historical_events"] = [
+        {
+            "event_name": "劳军",
+            "relation_summary": historical_summary,
+            "state": "confirmed",
+            "evidence": [],
+        }
+    ]
+
+    label = service._normalize_assembled_label(
+        task,
+        passage,
+        {
+            "schema_version": task.spec_version,
+            "passage": {},
+            "persons": [person],
+            "person_relations": [
+                {
+                    "source_person_key": "p1",
+                    "target_person_key": "p2",
+                    "relation_category": "隶属与任用",
+                    "relation_summary": original_summary,
+                    "state": "confirmed",
+                    "evidence": [],
+                },
+                {
+                    "source_person_key": "p1",
+                    "target_person_key": "p3",
+                    "relation_category": "亲属",
+                    "relation_summary": "父子",
+                    "state": "confirmed",
+                    "evidence": [],
+                },
+            ],
+        },
+    )
+
+    assert label.person_relations[0].relation_summary == original_summary
+    assert label.person_relations[1].relation_summary == "父子"
+    assert label.persons[0].historical_events[0].relation_summary == historical_summary
+    assert label.persons[0].titles == titles
+    result = service._validate_content(
+        task,
+        passage,
+        json.dumps(label.model_dump(mode="json"), ensure_ascii=False),
+        source="generated",
+        provider="百炼",
+        model="qwen3.8-max",
+        elapsed_ms=0,
+    )
+    mismatched = {
+        issue.path: issue
+        for issue in result.validation_issues
+        if issue.code == "schema_mismatch"
+    }
+    assert result.document is not None
+    assert result.document.label.person_relations[0].relation_summary == original_summary
+    assert result.validation_status == "invalid_rules"
+    assert mismatched["person_relations.0.relation_summary"].message == (
+        "与 schema 不符：最多 10 个字符，当前 11 个，原文已保留。"
+    )
+    assert "person_relations.1.relation_summary" not in mismatched
+    assert "最多 15 个字符，当前 16 个" in mismatched["persons.0.historical_events.0.relation_summary"].message
+    assert mismatched["persons.0.titles"].message == (
+        "与 schema 不符：最多 20 条，当前 21 条，原列表已保留。"
+    )
+    job = ExtractionAIAnnotationJob(
+        task_id=task_id,
+        passage_id=task.passage_id,
+        requested_by=admin.id,
+        operation="generate",
+        status="success",
+        provider="百炼",
+        model="qwen3.8-max",
+        result_json=json.dumps(result.model_dump(mode="json"), ensure_ascii=False),
+    )
+    db.add(job)
+    db.commit()
+    loaded = parse_ai_annotation_result(json.loads(job.result_json or "{}"))
+    assert loaded.document is not None
+    assert loaded.document.label.person_relations[0].relation_summary == original_summary
+    assert loaded.document.label.persons[0].titles == titles
+    assert "model_output_json" not in AIAnnotationJobResponse.model_fields
+
+
+def test_non_length_schema_error_still_fails_assembly(ai_annotation_db):
+    db, task_id = ai_annotation_db
+    task = db.get(ExtractionAnnotationTask, task_id)
+    passage = db.get(Passage, task.passage_id)
+    assert task is not None and passage is not None
+    service = ExtractionAIAnnotationService(db)
+
+    with pytest.raises(ValidationError):
+        service._normalize_assembled_label(
+            task,
+            passage,
+            {
+                "schema_version": task.spec_version,
+                "passage": {},
+                "persons": [],
+                "person_relations": [
+                    {
+                        "source_person_key": "p1",
+                        "target_person_key": "p2",
+                        "relation_category": "朋友",
+                        "relation_summary": "请帝劳军牵动后从御南楼",
+                        "state": "confirmed",
+                        "evidence": [],
+                    }
+                ],
+            },
+        )
+
+
+def test_model_output_is_kept_when_later_schema_validation_fails(ai_annotation_db):
+    db, task_id = ai_annotation_db
+    task = db.get(ExtractionAnnotationTask, task_id)
+    passage = db.get(Passage, task.passage_id)
+    admin = db.get(User, 1)
+    assert task is not None and passage is not None and admin is not None
+    job = ExtractionAIAnnotationJob(
+        task_id=task_id,
+        passage_id=task.passage_id,
+        requested_by=admin.id,
+        operation="generate",
+        status="running",
+        provider="百炼",
+        model="qwen3.8-max",
+    )
+    db.add(job)
+    db.commit()
+    service = ExtractionAIAnnotationService(db)
+    service.capture_model_output(job.id)
+    service._remember_model_output("人物关系分片 1", "请帝劳军牵动后从御南楼")
+
+    with pytest.raises(ValidationError):
+        service._normalize_assembled_label(
+            task,
+            passage,
+            {
+                "schema_version": task.spec_version,
+                "passage": {},
+                "persons": [],
+                "person_relations": [
+                    {
+                        "source_person_key": "p1",
+                        "target_person_key": "p2",
+                        "relation_category": "朋友",
+                        "relation_summary": "请帝劳军牵动后从御南楼",
+                        "state": "confirmed",
+                        "evidence": [],
+                    }
+                ],
+            },
+        )
+
+    db.rollback()
+    stored = db.get(ExtractionAIAnnotationJob, job.id)
+    assert stored is not None
+    saved = json.loads(stored.model_output_json or "{}")
+    stages = [item["stage"] for item in saved["fragments"]]
+    assert stages == ["人物关系分片 1", "assembled"]
+    assert saved["fragments"][0]["content"] == "请帝劳军牵动后从御南楼"
+    assert saved["fragments"][1]["content"]["person_relations"][0]["relation_summary"] == "请帝劳军牵动后从御南楼"
+
+
+def test_custom_provider_name_is_kept_for_remote_calls():
+    provider_name, model_name = ExtractionAIAnnotationService._resolve_provider_config(
+        AIAnnotationConfigRequest(
+            provider="硅基流动",
+            base_url="https://api.example.com/v1",
+            model="Qwen2.5",
+        )
+    )
+
+    assert provider_name == "硅基流动"
+    assert model_name == "Qwen2.5"
+
+
+def test_builtin_provider_names_are_normalized():
+    deepseek_name, _model_name = ExtractionAIAnnotationService._resolve_provider_config(
+        AIAnnotationConfigRequest(provider="DeepSeek", model="deepseek-chat")
+    )
+    compatible_name, _compatible_model = ExtractionAIAnnotationService._resolve_provider_config(
+        AIAnnotationConfigRequest(provider="OpenAI-Compatible", model="gpt-4o")
+    )
+
+    assert deepseek_name == "deepseek"
+    assert compatible_name == "openai_compatible"
+
+
+def test_provider_name_rejects_control_characters_and_overlong_values():
+    with pytest.raises(AIAnnotationConfigError, match="控制字符"):
+        ExtractionAIAnnotationService._resolve_provider_config(
+            AIAnnotationConfigRequest(provider="硅基\n流动", model="Qwen2.5")
+        )
+
+    with pytest.raises(ValidationError):
+        AIAnnotationConfigRequest(provider="名" * 65, model="Qwen2.5")
+
+
+def test_enqueue_stores_custom_provider_without_api_key(ai_annotation_db, monkeypatch):
+    db, task_id = ai_annotation_db
+    admin = db.get(User, 1)
+    assert admin is not None
+    monkeypatch.setattr(job_module, "_submit_job", lambda _job_id, _payload: None)
+
+    response = ExtractionAIAnnotationJobService(db).enqueue(
+        AIAnnotationGenerateRequest(
+            task_id=task_id,
+            config=AIAnnotationConfigRequest(
+                provider="硅基流动",
+                base_url="https://api.example.com/v1",
+                model="Qwen2.5",
+                api_key="temporary-secret",
+            ),
+        ),
+        admin,
+    )
+
+    saved = db.get(ExtractionAIAnnotationJob, response.id)
+    assert saved is not None
+    assert saved.provider == "硅基流动"
+    assert saved.model == "Qwen2.5"
+    stored = json.loads(saved.config_json)
+    assert stored["provider"] == "硅基流动"
+    assert stored["api_key"] == ""

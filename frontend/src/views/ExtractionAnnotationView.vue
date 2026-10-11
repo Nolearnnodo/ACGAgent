@@ -13,6 +13,8 @@ import { onBeforeRouteLeave, RouterLink } from 'vue-router'
 
 import {
   EVENT_TYPES,
+  OMISSION_CATEGORIES,
+  RELATION_CATEGORIES,
   type AnnotationDictionaries,
   type CheckState,
   type EventType,
@@ -47,24 +49,23 @@ import {
   createPerson,
   createPersonRelation,
   evidenceGranularityIssue,
-  parseRelationCodes,
-  relationReverseSuggestions,
   runClientChecks,
   uid,
 } from '../utils/extractionAnnotation'
 
-type StepId = 'document' | 'persons' | 'events' | 'relations' | 'checks'
+type StepId = 'document' | 'persons' | 'relations' | 'checks'
+type StepReviewKey = keyof ExtractionAnnotationLabel['step_reviews']
 type SaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'error'
 type TaskFilter = 'mine' | 'available' | 'all'
 type PassageTaskState = 'uncreated' | 'established' | 'completed'
 
 const steps: { id: StepId; index: string; label: string }[] = [
-  { id: 'document', index: '01', label: '文献' },
-  { id: 'persons', index: '02', label: '人物' },
-  { id: 'events', index: '03', label: '事件' },
-  { id: 'relations', index: '04', label: '关系' },
-  { id: 'checks', index: '05', label: '检查' },
+  { id: 'document', index: '01', label: '材料' },
+  { id: 'persons', index: '02', label: '人物基本信息' },
+  { id: 'relations', index: '03', label: '人物关系' },
+  { id: 'checks', index: '04', label: '差缺补漏' },
 ]
+const stepReviewKeys: StepReviewKey[] = ['material', 'persons', 'relations', 'checks']
 
 const checkStateOptions: { value: CheckState; label: string }[] = [
   { value: 'unreviewed', label: '尚未检查' },
@@ -95,10 +96,13 @@ const managingTaskId = ref<number | null>(null)
 const activeDetail = ref<ExtractionTaskDetail | null>(null)
 const label = ref<ExtractionAnnotationLabel | null>(null)
 const activeStep = ref<StepId>('document')
+const personPanel = ref<'profile' | 'events'>('profile')
+const relationPanel = ref<'people' | 'history'>('people')
 const activePersonKey = ref<string | null>(null)
 const activeEventKey = ref<string | null>(null)
 const activeHistoricalEventKey = ref<string | null>(null)
 const activeRelationKey = ref<string | null>(null)
+const activeOmissionKey = ref<string | null>(null)
 const activeEvidenceId = ref<string | null>(null)
 const pendingEvidence = ref<EvidenceSpan | null>(null)
 const saveState = ref<SaveState>('idle')
@@ -140,10 +144,10 @@ const currentHistoricalEvent = computed(() =>
 const currentRelation = computed(() =>
   label.value?.person_relations.find((relation) => relation.key === activeRelationKey.value) ?? null,
 )
-const reverseSuggestions = computed(() =>
-  currentRelation.value ? relationReverseSuggestions(currentRelation.value.codes) : [],
+const currentOmission = computed(() =>
+  label.value?.omissions?.find((omission) => omission.key === activeOmissionKey.value) ?? null,
 )
-const relationPersons = computed(() => label.value?.persons.filter((person) => person.level !== 3) ?? [])
+const relationPersons = computed(() => label.value?.persons ?? [])
 const pendingEntityIssue = computed(() => evidenceGranularityIssue(pendingEvidence.value, 'entity'))
 const pendingFactIssue = computed(() => evidenceGranularityIssue(pendingEvidence.value, 'fact'))
 
@@ -188,25 +192,36 @@ const createTaskButtonLabel = computed(() => {
 })
 const progressPercent = computed(() => {
   if (!label.value) return 0
-  let completed = 0
-  if (label.value.passage.source_type !== 'uncertain') completed += 1
-  if (label.value.persons.length && label.value.persons.every((person) => person.name_surface && person.level_reason)) completed += 1
-  const reviewedPeople = label.value.persons.filter((person) => person.level !== 3)
-  if (reviewedPeople.length && reviewedPeople.every((person) => EVENT_TYPES.every(
-    (eventType) => person.event_checks[eventType] !== 'unreviewed',
-  ))) completed += 1
-  if (label.value.person_relations.every((relation) => relation.evidence.length)) completed += 1
-  if (!blockingCheckCount.value) completed += 1
-  return completed * 20
+  return stepReviewKeys.filter((key) => label.value?.step_reviews[key]).length * 25
 })
+const currentReviewKey = computed<StepReviewKey>(() => activeStep.value === 'document' ? 'material' : activeStep.value)
+const currentStepIssues = computed(() => clientChecks.value.filter(
+  (check) => check.step === currentReviewKey.value && check.level === 'error',
+))
+const allStepsCompleted = computed(() => stepReviewKeys.every((key) => label.value?.step_reviews[key]))
+const firstIncompleteStep = computed<StepId>(() => {
+  const index = stepReviewKeys.findIndex((key) => !label.value?.step_reviews[key])
+  return steps[Math.max(index, 0)].id
+})
+const canConfirmStep = computed(() => {
+  return currentStepIssues.value.length === 0
+    && (activeStep.value !== 'checks' || blockingCheckCount.value === 0)
+})
+function confirmCurrentStep() {
+  if (!label.value || !canConfirmStep.value || isReadOnly.value) return
+  label.value.step_reviews[currentReviewKey.value] = true
+  const nextIndex = steps.findIndex((step) => step.id === activeStep.value) + 1
+  if (nextIndex < steps.length) activeStep.value = steps[nextIndex].id
+}
 const pendingTargetLabel = computed(() => {
-  if (activeStep.value === 'events' && currentEvent.value) {
+  if (activeStep.value === 'persons' && personPanel.value === 'events' && currentEvent.value) {
     return `${currentPerson.value?.name_surface || '当前人物'}的${currentEvent.value.event_type}事件`
   }
-  if (activeStep.value === 'events' && currentHistoricalEvent.value) {
+  if (activeStep.value === 'relations' && relationPanel.value === 'history' && currentHistoricalEvent.value) {
     return `${currentPerson.value?.name_surface || '当前人物'}的历史事件关联`
   }
-  if (activeStep.value === 'relations' && currentRelation.value) return '当前人物关系'
+  if (activeStep.value === 'relations' && relationPanel.value === 'people' && currentRelation.value) return '当前人物关系'
+  if (activeStep.value === 'checks' && currentOmission.value) return '当前缺漏'
   return ''
 })
 
@@ -393,6 +408,7 @@ function clearActiveTask(taskId: number) {
   activeEventKey.value = null
   activeHistoricalEventKey.value = null
   activeRelationKey.value = null
+  activeOmissionKey.value = null
   activeEvidenceId.value = null
   pendingEvidence.value = null
   dirty.value = false
@@ -466,12 +482,25 @@ async function hydrateTask(detail: ExtractionTaskDetail) {
   hydrating = true
   clearSaveTimer()
   activeDetail.value = detail
-  label.value = cloneLabel(detail.submission.label)
+  const restored = cloneLabel(detail.submission.label)
+  restored.step_reviews = Object.assign({
+    material: false, persons: false, relations: false, checks: false,
+  }, restored.step_reviews ?? {})
+  restored.person_relations = restored.person_relations.map((relation) => ({
+    ...relation,
+    relation_category: relation.relation_category ?? '',
+    relation_summary: relation.relation_summary ?? '',
+  }))
+  restored.omissions = restored.omissions ?? []
+  label.value = restored
   activeStep.value = 'document'
+  personPanel.value = 'profile'
+  relationPanel.value = 'people'
   activePersonKey.value = label.value.persons[0]?.key ?? null
   activeEventKey.value = null
   activeHistoricalEventKey.value = null
   activeRelationKey.value = null
+  activeOmissionKey.value = restored.omissions[0]?.key ?? null
   activeEvidenceId.value = null
   pendingEvidence.value = null
   dirty.value = false
@@ -577,6 +606,11 @@ function extractServerIssues(error: unknown) {
 async function handleSubmit() {
   if (!activeDetail.value || !label.value || isReadOnly.value || submitting.value) return
   serverIssues.value = []
+  if (!allStepsCompleted.value) {
+    activeStep.value = firstIncompleteStep.value
+    saveMessage.value = '请完成并确认四个标注步骤，再提交。'
+    return
+  }
   if (blockingCheckCount.value) {
     activeStep.value = 'checks'
     saveMessage.value = `还有 ${blockingCheckCount.value} 个阻断问题，请先处理。`
@@ -617,6 +651,7 @@ function createPersonFromSelection() {
   label.value.persons.push(person)
   activePersonKey.value = person.key
   activeStep.value = 'persons'
+  personPanel.value = 'profile'
   activeEvidenceId.value = pendingEvidence.value.id
   pendingEvidence.value = null
 }
@@ -627,6 +662,7 @@ function addBlankPerson() {
   label.value.persons.push(person)
   activePersonKey.value = person.key
   activeStep.value = 'persons'
+  personPanel.value = 'profile'
 }
 
 function addMentionToCurrentPerson() {
@@ -638,12 +674,14 @@ function addMentionToCurrentPerson() {
 
 function addEvidenceToCurrentFact() {
   if (!pendingEvidence.value || pendingFactIssue.value) return
-  if (activeStep.value === 'events' && currentEvent.value) {
+  if (activeStep.value === 'persons' && personPanel.value === 'events' && currentEvent.value) {
     currentEvent.value.evidence.push(pendingEvidence.value)
-  } else if (activeStep.value === 'events' && currentHistoricalEvent.value) {
+  } else if (activeStep.value === 'relations' && relationPanel.value === 'history' && currentHistoricalEvent.value) {
     currentHistoricalEvent.value.evidence.push(pendingEvidence.value)
-  } else if (activeStep.value === 'relations' && currentRelation.value) {
+  } else if (activeStep.value === 'relations' && relationPanel.value === 'people' && currentRelation.value) {
     currentRelation.value.evidence.push(pendingEvidence.value)
+  } else if (activeStep.value === 'checks' && currentOmission.value) {
+    currentOmission.value.evidence.push(pendingEvidence.value)
   } else {
     return
   }
@@ -672,7 +710,7 @@ function markPendingUnresolved() {
   })
   activeEvidenceId.value = pendingEvidence.value.id
   pendingEvidence.value = null
-  activeStep.value = 'checks'
+  saveMessage.value = '已登记暂不能判断项，请在“差缺补漏”步骤补充理由。'
 }
 
 function activateHighlight(evidenceId: string) {
@@ -681,17 +719,23 @@ function activateHighlight(evidenceId: string) {
   activeEvidenceId.value = evidenceId
   if (highlight.kind === 'person') {
     activeStep.value = 'persons'
+    personPanel.value = 'profile'
     activePersonKey.value = highlight.personKey ?? null
   } else if (highlight.kind === 'event' || highlight.kind === 'history') {
-    activeStep.value = 'events'
+    activeStep.value = highlight.kind === 'history' ? 'relations' : 'persons'
+    personPanel.value = 'events'
+    relationPanel.value = 'history'
     activePersonKey.value = highlight.personKey ?? null
     activeEventKey.value = highlight.kind === 'event' ? highlight.objectKey ?? null : null
     activeHistoricalEventKey.value = highlight.kind === 'history' ? highlight.objectKey ?? null : null
   } else if (highlight.kind === 'relation') {
     activeStep.value = 'relations'
+    relationPanel.value = 'people'
     activeRelationKey.value = highlight.objectKey ?? null
   } else {
     activeStep.value = 'checks'
+    activeOmissionKey.value = label.value?.omissions?.some((item) => item.key === highlight.objectKey)
+      ? highlight.objectKey ?? null : activeOmissionKey.value
   }
 }
 
@@ -803,26 +847,6 @@ function selectRelation(relation: PersonRelationAnnotation) {
   activeRelationKey.value = relation.key
 }
 
-function setRelationCodes(direction: 'forward' | 'reverse', event: Event) {
-  if (!currentRelation.value) return
-  const codes = parseRelationCodes((event.target as HTMLInputElement).value)
-  if (direction === 'forward') {
-    currentRelation.value.codes = codes
-    const suggestions = relationReverseSuggestions(codes)
-    if (suggestions.length === 1) {
-      currentRelation.value.reverse_codes = [...suggestions[0]]
-    } else if (!suggestions.some(
-      (candidate) => candidate.join('') === currentRelation.value?.reverse_codes.join(''),
-    )) {
-      currentRelation.value.reverse_codes = []
-    }
-  } else currentRelation.value.reverse_codes = codes
-}
-
-function useReverseSuggestion(codes: PersonRelationAnnotation['reverse_codes']) {
-  if (currentRelation.value) currentRelation.value.reverse_codes = [...codes]
-}
-
 function reconcileHistoricalEventDictionary() {
   if (!currentHistoricalEvent.value) return
   const exact = dictionaries.value.historical_events.some(
@@ -877,6 +901,49 @@ watch(label, () => {
   saveState.value = 'dirty'
   scheduleAutosave()
 }, { deep: true })
+
+function invalidateReviewsFrom(step: StepReviewKey) {
+  if (hydrating || isReadOnly.value || !label.value) return
+  const index = stepReviewKeys.indexOf(step)
+  for (const key of stepReviewKeys.slice(index)) label.value.step_reviews[key] = false
+}
+
+function addOmission() {
+  if (!label.value) return
+  const omission = {
+    key: uid('omission'),
+    category: '' as const,
+    description: '',
+    target_path: '',
+    evidence: [] as EvidenceSpan[],
+    evidence_note: '',
+    resolution: 'open' as const,
+    resolution_note: '',
+  }
+  label.value.omissions.push(omission)
+  activeOmissionKey.value = omission.key
+}
+
+function removeOmission(key: string) {
+  if (!label.value) return
+  removeByKey(label.value.omissions, key)
+  if (activeOmissionKey.value === key) activeOmissionKey.value = label.value.omissions[0]?.key ?? null
+}
+
+watch(() => JSON.stringify(label.value?.passage), () => invalidateReviewsFrom('material'))
+watch(() => JSON.stringify(label.value && {
+  persons: label.value.persons.map(({ historical_events: _historicalEvents, ...person }) => person),
+  excluded_mentions: label.value.excluded_mentions,
+}), () => invalidateReviewsFrom('persons'))
+watch(() => JSON.stringify(label.value && {
+  person_relations: label.value.person_relations,
+  historical_events: label.value.persons.map((person) => ({ key: person.key, events: person.historical_events })),
+}), () => invalidateReviewsFrom('relations'))
+watch(() => JSON.stringify(label.value && {
+  unresolved_items: label.value.unresolved_items,
+  schema_conflicts: label.value.schema_conflicts,
+  omissions: label.value.omissions,
+}), () => invalidateReviewsFrom('checks'))
 
 onBeforeRouteLeave(() => canLeaveCurrentTask())
 
@@ -939,7 +1006,7 @@ onBeforeUnmount(() => {
           <button
             class="button button--primary"
             type="button"
-            :disabled="!activeDetail || isReadOnly || submitting || managingTaskId === activeDetail?.id"
+            :disabled="!activeDetail || isReadOnly || submitting || !allStepsCompleted || blockingCheckCount > 0 || managingTaskId === activeDetail?.id"
             @click="handleSubmit"
           >{{ submitting ? '提交中…' : isReadOnly ? '已锁定' : '提交标注' }}</button>
         </div>
@@ -1151,10 +1218,12 @@ onBeforeUnmount(() => {
               :key="step.id"
               type="button"
               :class="{ active: activeStep === step.id }"
+              :data-status="label?.step_reviews[step.id === 'document' ? 'material' : step.id] ? 'complete' : 'pending'"
               :disabled="!label"
               @click="activeStep = step.id"
             >
-              <span>{{ step.index }}</span>{{ step.label }}
+              <span>{{ step.index }}</span><strong>{{ step.label }}</strong>
+              <small>{{ label?.step_reviews[step.id === 'document' ? 'material' : step.id] ? '已完成' : '未完成' }}</small>
             </button>
           </nav>
 
@@ -1162,8 +1231,8 @@ onBeforeUnmount(() => {
             <fieldset :disabled="isReadOnly || managingTaskId === activeDetail.id">
               <section v-if="activeStep === 'document'" class="inspector-section">
                 <header>
-                  <span>01 / DOCUMENT</span>
-                  <h3>文献与探针属性</h3>
+                  <span>01 / MATERIAL</span>
+                  <h3>材料</h3>
                   <p>只依据当前标题和完整正文，不使用外部常识补全。</p>
                 </header>
 
@@ -1215,12 +1284,16 @@ onBeforeUnmount(() => {
                 </label>
               </section>
 
-              <section v-else-if="activeStep === 'persons'" class="inspector-section">
+              <section v-else-if="activeStep === 'persons' && personPanel === 'profile'" class="inspector-section">
                 <header>
                   <span>02 / PERSONS</span>
-                  <h3>人物识别与分级</h3>
+                  <h3>人物基本信息</h3>
                   <p>划选正文可快速新建人物；Alt + 1/2/3 可切换当前人物等级。</p>
                 </header>
+                <div class="substep-nav" aria-label="人物基本信息子项">
+                  <button class="active" type="button">人物识别与分级</button>
+                  <button type="button" @click="personPanel = 'events'">五类生平事件</button>
+                </div>
 
                 <div class="object-tabs">
                   <button
@@ -1302,12 +1375,20 @@ onBeforeUnmount(() => {
                 <p v-else class="inspector-empty">先从正文划选姓名，或点击“＋ 人物”。</p>
               </section>
 
-              <section v-else-if="activeStep === 'events'" class="inspector-section">
+              <section v-else-if="(activeStep === 'persons' && personPanel === 'events') || (activeStep === 'relations' && relationPanel === 'history')" class="inspector-section">
                 <header>
-                  <span>03 / EVENTS</span>
-                  <h3>生平与历史事件</h3>
-                  <p>一级、二级人物逐类检查；三级人物不进入主评测事件。</p>
+                  <span>{{ activeStep === 'persons' ? '02 / LIFE EVENTS' : '03 / HISTORICAL EVENTS' }}</span>
+                  <h3>{{ activeStep === 'persons' ? '五类生平事件' : '人物与历史事件' }}</h3>
+                  <p>{{ activeStep === 'persons' ? '一级、二级人物逐类检查五类生平事件；三级人物不进入主评测事件。' : '只依据原文明示的人物、历史事件及其联系建立关联。' }}</p>
                 </header>
+                <div v-if="activeStep === 'persons'" class="substep-nav" aria-label="人物基本信息子项">
+                  <button type="button" @click="personPanel = 'profile'">人物识别与分级</button>
+                  <button class="active" type="button">五类生平事件</button>
+                </div>
+                <div v-else class="substep-nav" aria-label="人物关系子项">
+                  <button type="button" @click="relationPanel = 'people'">人物之间</button>
+                  <button class="active" type="button">历史事件关联</button>
+                </div>
 
                 <label class="field">
                   <span>当前人物</span>
@@ -1319,7 +1400,7 @@ onBeforeUnmount(() => {
                 </label>
 
                 <template v-if="currentPerson && currentPerson.level !== 3">
-                  <div class="event-checks">
+                  <div v-if="activeStep === 'persons'" class="event-checks">
                     <label v-for="eventType in EVENT_TYPES" :key="eventType">
                       <span>{{ eventType }}</span>
                       <select v-model="currentPerson.event_checks[eventType]">
@@ -1333,6 +1414,7 @@ onBeforeUnmount(() => {
 
                   <div class="event-list">
                     <button
+                      v-if="activeStep === 'persons'"
                       v-for="event in currentPerson.life_events"
                       :key="event.key"
                       type="button"
@@ -1343,6 +1425,7 @@ onBeforeUnmount(() => {
                       <strong>{{ event.official_title || event.location.raw || event.time.raw || '待填写' }}</strong>
                     </button>
                     <button
+                      v-if="activeStep === 'relations'"
                       v-for="event in currentPerson.historical_events"
                       :key="event.key"
                       type="button"
@@ -1352,12 +1435,12 @@ onBeforeUnmount(() => {
                       <span>历史事件</span>
                       <strong>{{ event.event_name || '待填写' }}</strong>
                     </button>
-                    <button class="event-list__add" type="button" @click="addHistoricalEventLink">
+                    <button v-if="activeStep === 'relations'" class="event-list__add" type="button" @click="addHistoricalEventLink">
                       ＋ 历史事件关联
                     </button>
                   </div>
 
-                  <div v-if="currentEvent" class="object-editor">
+                  <div v-if="activeStep === 'persons' && currentEvent" class="object-editor">
                     <div class="object-editor__heading">
                       <strong>生平事件</strong>
                       <button type="button" @click="removeCurrentEvent">删除</button>
@@ -1389,19 +1472,21 @@ onBeforeUnmount(() => {
                           </option>
                         </select>
                       </label>
-                      <label class="field">
-                        <span>原文时间</span>
-                        <input v-model.trim="currentEvent.time.raw" :disabled="currentEvent.event_type === '籍贯'" placeholder="如：开元二十年、明年" />
-                      </label>
-                      <div class="field-row field-row--three">
-                        <label class="field"><span>年号</span><input v-model.trim="currentEvent.time.era" list="annotation-era-options" :disabled="currentEvent.event_type === '籍贯'" /></label>
-                        <label class="field"><span>年号内年</span><input type="number" :value="currentEvent.time.era_year ?? ''" :disabled="currentEvent.event_type === '籍贯'" @input="setNullableTimeNumber('era_year', $event)" /></label>
-                        <label class="field"><span>公元年</span><input type="number" :value="currentEvent.time.gregorian_year ?? ''" :disabled="currentEvent.event_type === '籍贯'" @input="setNullableTimeNumber('gregorian_year', $event)" /></label>
-                      </div>
-                      <div class="field-row">
-                        <label class="field"><span>月原文</span><input v-model.trim="currentEvent.time.month_text" :disabled="currentEvent.event_type === '籍贯'" /></label>
-                        <label class="field"><span>日原文</span><input v-model.trim="currentEvent.time.day_text" :disabled="currentEvent.event_type === '籍贯'" /></label>
-                      </div>
+                      <template v-if="currentEvent.time.state !== 'not_mentioned' && currentEvent.time.state !== 'not_applicable'">
+                        <label class="field">
+                          <span>原文时间</span>
+                          <input v-model.trim="currentEvent.time.raw" :disabled="currentEvent.event_type === '籍贯'" placeholder="如：开元二十年、明年" />
+                        </label>
+                        <div class="field-row field-row--three">
+                          <label class="field"><span>年号</span><input v-model.trim="currentEvent.time.era" list="annotation-era-options" :disabled="currentEvent.event_type === '籍贯'" /></label>
+                          <label class="field"><span>年号内年</span><input type="number" :value="currentEvent.time.era_year ?? ''" :disabled="currentEvent.event_type === '籍贯'" @input="setNullableTimeNumber('era_year', $event)" /></label>
+                          <label class="field"><span>公元年</span><input type="number" :value="currentEvent.time.gregorian_year ?? ''" :disabled="currentEvent.event_type === '籍贯'" @input="setNullableTimeNumber('gregorian_year', $event)" /></label>
+                        </div>
+                        <div class="field-row">
+                          <label class="field"><span>月原文</span><input v-model.trim="currentEvent.time.month_text" :disabled="currentEvent.event_type === '籍贯'" /></label>
+                          <label class="field"><span>日原文</span><input v-model.trim="currentEvent.time.day_text" :disabled="currentEvent.event_type === '籍贯'" /></label>
+                        </div>
+                      </template>
                     </div>
 
                     <div class="subsection">
@@ -1414,6 +1499,7 @@ onBeforeUnmount(() => {
                           </option>
                         </select>
                       </label>
+                      <template v-if="currentEvent.location.state !== 'not_mentioned' && currentEvent.location.state !== 'not_applicable'">
                       <label class="field"><span>原文地点</span><input v-model.trim="currentEvent.location.raw" /></label>
                       <div class="location-grid">
                         <label v-for="field in ([
@@ -1425,6 +1511,7 @@ onBeforeUnmount(() => {
                           <input v-model.trim="currentEvent.location[field.key]" />
                         </label>
                       </div>
+                      </template>
                     </div>
 
                     <label v-if="currentEvent.event_type === '任职'" class="field">
@@ -1441,7 +1528,7 @@ onBeforeUnmount(() => {
                     </div>
                   </div>
 
-                  <div v-else-if="currentHistoricalEvent" class="object-editor">
+                  <div v-else-if="activeStep === 'relations' && currentHistoricalEvent" class="object-editor">
                     <div class="object-editor__heading">
                       <strong>人物—历史事件</strong>
                       <button type="button" @click="removeCurrentHistoricalEvent">删除</button>
@@ -1462,18 +1549,22 @@ onBeforeUnmount(() => {
                       <p v-if="!currentHistoricalEvent.evidence.length">尚未绑定证据</p>
                     </div>
                   </div>
-                  <p v-else class="inspector-empty">点击五类事件后的“＋”，或建立历史事件关联。</p>
+                  <p v-else class="inspector-empty">{{ activeStep === 'persons' ? '逐类检查五类事件，并按需要点击“＋”建立事实。' : '点击“＋ 历史事件关联”建立原文明示的关联。' }}</p>
                 </template>
                 <p v-else-if="currentPerson" class="inspector-empty">三级人物只保留最小信息，不展开主评测事件。</p>
                 <p v-else class="inspector-empty">请先建立并选择人物。</p>
               </section>
 
-              <section v-else-if="activeStep === 'relations'" class="inspector-section">
+              <section v-else-if="activeStep === 'relations' && relationPanel === 'people'" class="inspector-section">
                 <header>
-                  <span>04 / RELATIONS</span>
+                  <span>03 / RELATIONS</span>
                   <h3>人物关系</h3>
-                  <p>从甲看乙：乙是甲的谁。先确认两端，再填写正向与反向关系链。</p>
+                  <p>先确认两端人物，再选择七类之一，填写 10 字内的具体表现和原文证据。人物等级按篇章作用独立判断，三级人物也可建立关系。</p>
                 </header>
+                <div class="substep-nav" aria-label="人物关系子项">
+                  <button class="active" type="button">人物之间</button>
+                  <button type="button" @click="relationPanel = 'history'">历史事件关联</button>
+                </div>
 
                 <div class="object-tabs">
                   <button
@@ -1483,7 +1574,7 @@ onBeforeUnmount(() => {
                     :class="{ active: relation.key === activeRelationKey }"
                     @click="selectRelation(relation)"
                   >
-                    <strong>{{ relation.codes.join('') || '未定义' }}</strong>
+                    <strong>{{ relation.relation_category || '待分类' }}</strong>
                     <span>{{ relation.evidence.length }} 处证据</span>
                   </button>
                   <button
@@ -1495,46 +1586,31 @@ onBeforeUnmount(() => {
                 </div>
 
                 <template v-if="currentRelation">
-                  <div class="relation-direction">
+                  <div class="field-row">
                     <label class="field">
-                      <span>甲（source）</span>
+                      <span>关系人物一</span>
                       <select v-model="currentRelation.source_person_key">
                         <option v-for="person in relationPersons" :key="person.key" :value="person.key">{{ person.name_surface || '未命名' }}</option>
                       </select>
                     </label>
-                    <span>看</span>
                     <label class="field">
-                      <span>乙（target）</span>
+                      <span>关系人物二</span>
                       <select v-model="currentRelation.target_person_key">
                         <option v-for="person in relationPersons" :key="person.key" :value="person.key">{{ person.name_surface || '未命名' }}</option>
                       </select>
                     </label>
                   </div>
-                  <div class="field-row">
-                    <label class="field">
-                      <span>正向代码链</span>
-                      <input :value="currentRelation.codes.join('')" maxlength="3" placeholder="如 F、FS、O" @input="setRelationCodes('forward', $event)" />
-                    </label>
-                    <label class="field">
-                      <span>反向代码链</span>
-                      <input :value="currentRelation.reverse_codes.join('')" maxlength="3" placeholder="如 S、DF、O" @input="setRelationCodes('reverse', $event)" />
-                    </label>
-                  </div>
-                  <p class="relation-code-help">F 父 · M 母 · S 子 · D 女 · H 夫 · W 妻 · Z 妾 · C/B 兄弟姐妹 · O 其他</p>
-                  <div v-if="reverseSuggestions.length" class="reverse-suggestions">
-                    <span>{{ reverseSuggestions.length === 1 ? '已按路径自动反转' : '请选择合法反向链（不猜子女性别）' }}</span>
-                    <button
-                      v-for="candidate in reverseSuggestions"
-                      :key="candidate.join('')"
-                      type="button"
-                      :class="{ active: candidate.join('') === currentRelation.reverse_codes.join('') }"
-                      @click="useReverseSuggestion(candidate)"
-                    >{{ candidate.join('') }}</button>
-                  </div>
-                  <div v-if="currentRelation.codes.includes('O') || currentRelation.reverse_codes.includes('O')" class="field-row">
-                    <label class="field"><span>正向说明</span><input v-model.trim="currentRelation.note" maxlength="15" /></label>
-                    <label class="field"><span>反向说明</span><input v-model.trim="currentRelation.reverse_note" maxlength="15" /></label>
-                  </div>
+                  <label class="field">
+                    <span>关系类别</span>
+                    <select v-model="currentRelation.relation_category">
+                      <option value="" disabled>请选择七类之一</option>
+                      <option v-for="category in RELATION_CATEGORIES" :key="category" :value="category">{{ category }}</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>具体表现（不超过 10 字）</span>
+                    <input v-model.trim="currentRelation.relation_summary" maxlength="10" placeholder="如：父子、师徒、同僚、仇敌" />
+                  </label>
                   <label class="field">
                     <span>关系状态</span>
                     <select v-model="currentRelation.state">
@@ -1542,6 +1618,10 @@ onBeforeUnmount(() => {
                       <option value="uncertain">暂不能判断</option>
                       <option value="unsupported">工具暂不支持</option>
                     </select>
+                  </label>
+                  <label v-if="currentRelation.state !== 'confirmed'" class="field">
+                    <span>待定或工具限制说明</span>
+                    <textarea v-model.trim="currentRelation.note" rows="2" maxlength="1000" placeholder="写明原文歧义或工具限制" />
                   </label>
                   <div class="evidence-block">
                     <div class="evidence-block__title"><span>关系证据</span><small>需要支持两端人物和关系本身</small></div>
@@ -1553,21 +1633,78 @@ onBeforeUnmount(() => {
                   <button class="danger-link" type="button" @click="removeCurrentRelation">删除当前关系</button>
                 </template>
                 <p v-else class="inspector-empty">
-                  {{ relationPersons.length < 2 ? '至少需要两位一级或二级人物才能建立关系。' : '点击“＋ 关系”开始。' }}
+                  {{ relationPersons.length < 2 ? '至少需要两位已建立的人物才能记录关系。' : '点击“＋ 关系”开始。' }}
                 </p>
               </section>
 
               <section v-else class="inspector-section">
                 <header>
-                  <span>05 / VALIDATION</span>
-                  <h3>完整性检查</h3>
-                  <p>前端先提示，提交时后端会再次校验 Schema、正文哈希和全部证据位置。</p>
+                  <span>04 / COMPLETENESS</span>
+                  <h3>差缺补漏</h3>
+                  <p>按人物、事件、关系与证据三遍回查全文；所有待定项和工具限制均须写明理由。</p>
                 </header>
+                <div class="coverage-guide">
+                  <strong>三遍回查</strong>
+                  <ol>
+                    <li>按人物：核对全部具名人物、同人合并、等级和分级理由。</li>
+                    <li>按事件：逐人核对五类生平事件及时间、地点、官职。</li>
+                    <li>按关系与证据：核对三级人物关系、历史事件关联和每条证据。</li>
+                  </ol>
+                  <p>发现缺漏时回到对应步骤补齐；工具无法承载的事实记录在下方 Schema 冲突中。</p>
+                </div>
+                <div class="review-list omission-list">
+                  <div class="review-list__heading">
+                    <strong>缺漏清单 · {{ label.omissions.length }}</strong>
+                    <button type="button" @click="addOmission">＋ 登记缺漏</button>
+                  </div>
+                  <p v-if="!label.omissions.length" class="omission-list__empty">三遍回查后若无缺漏，可直接确认本步。</p>
+                  <article v-for="omission in label.omissions" :key="omission.key" :class="{ active: omission.key === activeOmissionKey }">
+                    <button type="button" @click="activeOmissionKey = omission.key">
+                      {{ omission.key === activeOmissionKey ? '当前证据目标' : '选为证据目标' }}
+                    </button>
+                    <label class="field">
+                      <span>缺漏类型</span>
+                      <select v-model="omission.category">
+                        <option value="" disabled>选择缺漏类型</option>
+                        <option v-for="category in OMISSION_CATEGORIES" :key="category" :value="category">{{ category }}</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>对象与具体缺漏</span>
+                      <textarea v-model.trim="omission.description" rows="2" maxlength="1000" placeholder="如：李承的第二次任职未建立" />
+                    </label>
+                    <label class="field">
+                      <span>应补入步骤及位置</span>
+                      <input v-model.trim="omission.target_path" maxlength="255" placeholder="如：人物基本信息 / 李承 / 任职" />
+                    </label>
+                    <div class="evidence-block">
+                      <div class="evidence-block__title"><span>原文证据</span><small>先选为证据目标，再划选正文</small></div>
+                      <button v-for="evidence in omission.evidence" :key="evidence.id" class="evidence-chip" type="button" @click="focusEvidence(evidence.id)">
+                        <span>“{{ evidence.quote }}”</span><i @click.stop="removeEvidence(omission.evidence, evidence.id)">×</i>
+                      </button>
+                      <p v-if="!omission.evidence.length">尚未绑定原文证据</p>
+                    </div>
+                    <label class="field"><span>证据位置补充说明</span><input v-model.trim="omission.evidence_note" maxlength="1000" placeholder="可写前后文或位置说明" /></label>
+                    <label class="field">
+                      <span>处理状态</span>
+                      <select v-model="omission.resolution">
+                        <option value="open">待处理</option>
+                        <option value="resolved">已补齐</option>
+                        <option value="unsupported">工具暂不支持</option>
+                      </select>
+                    </label>
+                    <label v-if="omission.resolution !== 'open'" class="field">
+                      <span>处理说明</span>
+                      <textarea v-model.trim="omission.resolution_note" rows="2" maxlength="1000" placeholder="说明补入位置，或写明工具限制" />
+                    </label>
+                    <i role="button" tabindex="0" aria-label="删除缺漏" @click="removeOmission(omission.key)" @keydown.enter="removeOmission(omission.key)">×</i>
+                  </article>
+                </div>
 
                 <div class="check-summary">
                   <strong>{{ blockingCheckCount }}</strong>
                   <span>个阻断问题</span>
-                  <small>{{ label.unresolved_items.length }} 个待定项 · {{ label.schema_conflicts.length }} 个 Schema 冲突</small>
+                  <small>{{ label.omissions.length }} 条缺漏 · {{ label.unresolved_items.length }} 个待定项 · {{ label.schema_conflicts.length }} 个 Schema 冲突</small>
                 </div>
                 <ul class="check-list">
                   <li v-for="(check, index) in clientChecks" :key="`${check.message}-${index}`" :data-level="check.level">
@@ -1620,15 +1757,28 @@ onBeforeUnmount(() => {
 
                 <div class="submit-panel">
                   <p>提交后当前盲标槽位将锁定；另一位标注员和 AI 输出仍不会在本页面显示。</p>
-                  <button type="button" :disabled="blockingCheckCount > 0 || submitting" @click="handleSubmit">
+                  <button type="button" :disabled="!allStepsCompleted || blockingCheckCount > 0 || submitting" @click="handleSubmit">
                     {{ submitting ? '正在提交…' : `提交第 ${activeDetail.submission.slot_no} 号盲标` }}
                   </button>
                 </div>
               </section>
+              <div class="step-review">
+                <div>
+                  <strong>{{ label.step_reviews[currentReviewKey] ? '本步已完成' : '本步未完成' }}</strong>
+                  <p v-if="currentStepIssues.length">还有 {{ currentStepIssues.length }} 项内容须处理。</p>
+                  <p v-else>核对当前步骤全部内容后，点击确认继续。</p>
+                  <ul v-if="currentStepIssues.length">
+                    <li v-for="(issue, index) in currentStepIssues" :key="`${issue.message}-${index}`">{{ issue.message }}</li>
+                  </ul>
+                </div>
+                <button type="button" :disabled="label.step_reviews[currentReviewKey] || !canConfirmStep" @click="confirmCurrentStep">
+                  {{ label.step_reviews[currentReviewKey] ? '已确认' : '完成本步' }}
+                </button>
+              </div>
             </fieldset>
           </div>
           <div v-else class="inspector__empty">
-            <span>五步标注</span>
+            <span>四步标注</span>
             <p>领取任务后，这里会显示结构化编辑器。</p>
           </div>
 
@@ -2140,14 +2290,7 @@ onBeforeUnmount(() => {
 .location-grid label { display: grid; gap: 4px; }
 .check-line { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
 
-.relation-direction { display: grid; grid-template-columns: 1fr auto 1fr; align-items: end; gap: 8px; }
-.relation-direction > span { padding-bottom: 9px; color: var(--vermilion); font: 600 11px 'Noto Serif SC', serif; }
-.relation-code-help { margin: -6px 0 0; color: var(--muted); font-size: 9px; line-height: 1.6; }
 .dictionary-hint { color: var(--muted); font-size: 9px; line-height: 1.5; }
-.reverse-suggestions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: -4px; }
-.reverse-suggestions > span { width: 100%; color: var(--muted); font-size: 9px; }
-.reverse-suggestions button { min-width: 34px; border: 1px solid #cfc5b6; padding: 4px 7px; background: transparent; color: var(--ink); cursor: pointer; font: 600 10px ui-monospace, monospace; }
-.reverse-suggestions button.active { border-color: var(--vermilion); background: #f1dfd7; color: var(--vermilion-dark); }
 
 .check-summary { display: grid; grid-template-columns: auto 1fr; align-items: baseline; column-gap: 8px; padding: 14px 0; border-block: 1px solid var(--line); }
 .check-summary strong { color: var(--vermilion); font: 500 30px ui-monospace, monospace; }
@@ -2345,6 +2488,36 @@ onBeforeUnmount(() => {
 .step-nav { border-bottom-color: #e4ebf7; background: #f5f8ff; }
 .step-nav button { border-right-color: #e4ebf7; color: #7183a8; }
 .step-nav button.active { background: #eef5ff; color: #2f6fed; box-shadow: inset 0 -3px 0 #2f6fed; }
+.step-nav { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.step-nav button { min-width: 0; gap: 2px; padding: 8px 2px; }
+.step-nav button strong { font-size: 10px; font-weight: 700; white-space: nowrap; }
+.step-nav button small { font-size: 9px; }
+.step-nav button[data-status='pending'] { color: #a73434; background: #fff2f1; }
+.step-nav button[data-status='complete'] { color: #18744c; background: #eaf8ef; }
+.step-nav button.active[data-status='pending'] { box-shadow: inset 0 -3px 0 #bb3737; }
+.step-nav button.active[data-status='complete'] { box-shadow: inset 0 -3px 0 #278258; }
+.step-nav button:disabled { opacity: 0.72; }
+.substep-nav { display: flex; gap: 6px; }
+.substep-nav button { flex: 1; border: 1px solid #dce6f5; border-radius: 9px; padding: 8px 5px; background: #fff; color: #536586; font-size: 11px; cursor: pointer; }
+.substep-nav button.active { border-color: #2f6fed; background: #eaf2ff; color: #245bd0; font-weight: 700; }
+.coverage-guide { border: 1px solid #dce6f5; border-radius: 11px; padding: 12px; background: #f8fbff; color: #44536f; font-size: 11px; line-height: 1.55; }
+.coverage-guide ol { margin: 7px 0; padding-left: 19px; }
+.coverage-guide p { margin: 7px 0 0; }
+.omission-list article { padding: 11px; }
+.omission-list article.active { border-color: #2f6fed; background: #f7faff; }
+.omission-list article > i { top: 12px; right: 12px; }
+.omission-list article > button { margin-bottom: 4px; }
+.omission-list__empty { margin: 0; color: #7183a8; font-size: 11px; }
+.omission-list .field input,
+.omission-list .field select,
+.omission-list .field textarea { width: 100%; }
+.omission-list .evidence-block { display: grid; gap: 6px; padding: 8px; }
+.step-review { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 20px 20px; border: 1px solid #dce6f5; border-radius: 11px; padding: 11px 12px; background: #fff; color: #31456f; }
+.step-review strong { font-size: 12px; }
+.step-review p { margin: 3px 0 0; color: #7183a8; font-size: 10px; }
+.step-review ul { margin: 7px 0 0; padding-left: 15px; color: #a73434; font-size: 10px; line-height: 1.55; }
+.step-review button { flex: none; border: 0; border-radius: 8px; padding: 8px 11px; background: #2f6fed; color: #fff; font-size: 11px; cursor: pointer; }
+.step-review button:disabled { background: #cbd6e9; cursor: default; }
 .inspector-section > header { border-bottom-color: #e9eef8; }
 .inspector-section > header span { color: #2f6fed; }
 .inspector-section > header h3 { color: #31456f; }
@@ -2386,8 +2559,6 @@ onBeforeUnmount(() => {
 .event-checks button { border-color: #dce6f5; border-radius: 8px; background: #e8f1ff; color: #2f6fed; }
 .subsection { border-color: #e4ebf7; border-radius: 12px; background: #fafcff; }
 .subsection h4 { color: #2f6fed; }
-.reverse-suggestions button { border-color: #dce6f5; border-radius: 8px; background: #fafcff; }
-.reverse-suggestions button.active { border-color: #2f6fed; background: #e8f1ff; color: #2f6fed; }
 .review-list article { border: 1px solid #e9eef8; border-radius: 10px; background: #fafcff; }
 .submit-panel { border: 1px solid #d6e4ff; border-radius: 12px; background: #eef5ff; color: #31456f; }
 .submit-panel p { color: #586a8e; }

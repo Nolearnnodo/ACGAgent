@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from types import UnionType
+from typing import Annotated, Any, Union, get_args, get_origin
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -49,6 +53,7 @@ from app.services.extraction_annotation_service import (
     ExtractionAnnotationServiceError,
     codepoint_to_utf16_offset,
     context_sha256,
+    drop_meaningless_excluded_mentions,
     validate_for_submission,
 )
 from app.services.extraction_ai_annotation_prompt import (
@@ -62,7 +67,9 @@ from app.services.extraction_ai_annotation_prompt import (
 )
 
 
+logger = logging.getLogger(__name__)
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
+_SCHEMA_FIT_ATTEMPTS = 5
 
 _FRAGMENT_RETRY_LIMIT = 2
 _RELATION_SOURCE_BATCH_SIZE = 4
@@ -134,32 +141,75 @@ class AIAnnotationProviderError(AIAnnotationServiceError):
     status_code = 502
 
 
+def lineage_root(
+    db: Session,
+    job: ExtractionAIAnnotationJob | None,
+) -> ExtractionAIAnnotationJob | None:
+    """沿 repair 的 source_job_id 走到 generate 根。断链返回 None。"""
+
+    current = job
+    seen: set[int] = set()
+    while current is not None and current.operation != "generate":
+        if current.id in seen or current.source_job_id is None:
+            return None
+        seen.add(current.id)
+        current = db.get(ExtractionAIAnnotationJob, current.source_job_id)
+    return current
+
+
+def working_copy_for(
+    db: Session,
+    root: ExtractionAIAnnotationJob | None,
+) -> ExtractionAIAnnotationSavedResult | None:
+    if root is None:
+        return None
+    return (
+        db.query(ExtractionAIAnnotationSavedResult)
+        .filter(
+            ExtractionAIAnnotationSavedResult.task_id == root.task_id,
+            ExtractionAIAnnotationSavedResult.requested_by == root.requested_by,
+            ExtractionAIAnnotationSavedResult.lineage_job_id == root.id,
+        )
+        .one_or_none()
+    )
+
+
 def persist_ai_annotation_result(
     db: Session,
     result: AIAnnotationResultResponse,
     *,
     requested_by: int,
     source_job_id: int | None = None,
+    lineage_job_id: int | None = None,
 ) -> None:
-    """保存每个用户在每篇任务上的当前结果，供刷新和跨会话恢复。"""
+    """按生成根保存工作副本。lineage 为空时只更新已有的 NULL 槽，不新插。"""
 
-    saved = (
-        db.query(ExtractionAIAnnotationSavedResult)
-        .filter(
-            ExtractionAIAnnotationSavedResult.task_id == result.task_id,
-            ExtractionAIAnnotationSavedResult.requested_by == requested_by,
-        )
-        .first()
+    query = db.query(ExtractionAIAnnotationSavedResult).filter(
+        ExtractionAIAnnotationSavedResult.task_id == result.task_id,
+        ExtractionAIAnnotationSavedResult.requested_by == requested_by,
     )
-    if saved is None:
-        saved = ExtractionAIAnnotationSavedResult(
-            task_id=result.task_id,
-            passage_id=result.passage_id,
-            requested_by=requested_by,
-        )
+    if lineage_job_id is None:
+        saved = query.filter(
+            ExtractionAIAnnotationSavedResult.lineage_job_id.is_(None)
+        ).one_or_none()
+        if saved is None:
+            return
+    else:
+        saved = query.filter(
+            ExtractionAIAnnotationSavedResult.lineage_job_id == lineage_job_id
+        ).one_or_none()
+        if saved is None:
+            saved = ExtractionAIAnnotationSavedResult(
+                task_id=result.task_id,
+                passage_id=result.passage_id,
+                requested_by=requested_by,
+                lineage_job_id=lineage_job_id,
+            )
     saved.passage_id = result.passage_id
     saved.source_job_id = source_job_id
+    saved.lineage_job_id = lineage_job_id
     saved.result_json = json.dumps(result.model_dump(mode="json"), ensure_ascii=False)
+    saved.updated_at = datetime.now(timezone.utc)
     db.add(saved)
 
 
@@ -205,12 +255,262 @@ def _validation_issues_from_pydantic(exc: ValidationError) -> list[AIAnnotationV
     ]
 
 
+def _issue_path(loc: tuple[Any, ...]) -> str:
+    return ".".join(str(part) for part in loc) or "root"
+
+
+def _unwrap_annotation(annotation: Any) -> Any:
+    if get_origin(annotation) is Annotated:
+        return _unwrap_annotation(get_args(annotation)[0])
+    return annotation
+
+
+def _model_from_annotation(annotation: Any) -> type[Any] | None:
+    annotation = _unwrap_annotation(annotation)
+    origin = get_origin(annotation)
+    if origin in {Union, UnionType}:
+        for arg in get_args(annotation):
+            if arg is type(None):
+                continue
+            found = _model_from_annotation(arg)
+            if found is not None:
+                return found
+        return None
+    if isinstance(annotation, type):
+        try:
+            if issubclass(annotation, BaseModel):
+                return annotation
+        except TypeError:
+            return None
+    return None
+
+
+def _list_item_annotation(annotation: Any) -> Any:
+    annotation = _unwrap_annotation(annotation)
+    if get_origin(annotation) is list:
+        args = get_args(annotation)
+        return args[0] if args else Any
+    return Any
+
+
+def _annotation_at(model: type[Any], loc: tuple[Any, ...]) -> Any:
+    current_model = model
+    annotation: Any = None
+    for index, part in enumerate(loc):
+        if isinstance(part, int):
+            annotation = _list_item_annotation(annotation)
+            item_model = _model_from_annotation(annotation)
+            if item_model is not None:
+                current_model = item_model
+            continue
+        field = current_model.model_fields[str(part)]
+        annotation = field.annotation
+        nested = _model_from_annotation(annotation)
+        if nested is not None and index + 1 < len(loc) and isinstance(loc[index + 1], str):
+            current_model = nested
+    return annotation
+
+
+def _dig(payload: Any, loc: tuple[Any, ...]) -> Any:
+    current = payload
+    for part in loc:
+        if isinstance(current, dict) and isinstance(part, str) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and isinstance(part, int) and 0 <= part < len(current):
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def _put(payload: Any, loc: tuple[Any, ...], value: Any) -> bool:
+    parent = payload if len(loc) == 1 else _dig(payload, loc[:-1])
+    key = loc[-1]
+    if isinstance(parent, dict) and isinstance(key, str) and key in parent:
+        parent[key] = value
+        return True
+    if isinstance(parent, list) and isinstance(key, int) and 0 <= key < len(parent):
+        parent[key] = value
+        return True
+    return False
+
+
+def _assign_model(root: Any, loc: tuple[Any, ...], value: Any) -> None:
+    current = root
+    for part in loc[:-1]:
+        current = current[part] if isinstance(part, int) else getattr(current, str(part))
+    key = loc[-1]
+    if isinstance(key, int):
+        current[key] = value
+    else:
+        setattr(current, str(key), value)
+
+
+def _schema_mismatch_issue(error: dict[str, Any], original: Any) -> AIAnnotationValidationIssue:
+    loc = tuple(error.get("loc") or ())
+    max_length = (error.get("ctx") or {}).get("max_length")
+    if error.get("type") == "string_too_long" and isinstance(original, str) and isinstance(max_length, int):
+        message = f"与 schema 不符：最多 {max_length} 个字符，当前 {len(original)} 个，原文已保留。"
+    elif error.get("type") == "too_long" and isinstance(original, list) and isinstance(max_length, int):
+        message = f"与 schema 不符：最多 {max_length} 条，当前 {len(original)} 条，原列表已保留。"
+    else:
+        message = f"与 schema 不符：{error.get('msg', '字段校验失败')}。原文已保留。"
+    return _issue(_issue_path(loc), message, "schema_mismatch")
+
+
+def _dedupe_issues(
+    issues: list[AIAnnotationValidationIssue],
+) -> list[AIAnnotationValidationIssue]:
+    unique: list[AIAnnotationValidationIssue] = []
+    seen: set[tuple[str, str]] = set()
+    for issue in issues:
+        key = (issue.path, issue.code)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    return unique
+
+
+def load_model_keeping_original(
+    model: type[Any],
+    payload: Any,
+) -> tuple[Any, list[AIAnnotationValidationIssue]]:
+    """校验模型，但字符串和列表超出上限时保留原文，只记录 schema 不符。"""
+
+    try:
+        return model.model_validate(payload), []
+    except ValidationError as first_exc:
+        if not any(error.get("type") in {"string_too_long", "too_long"} for error in first_exc.errors()):
+            raise
+
+    current = copy.deepcopy(payload)
+    issues: list[AIAnnotationValidationIssue] = []
+    string_restorations: list[tuple[tuple[Any, ...], str]] = []
+    list_restorations: list[tuple[tuple[Any, ...], list[Any]]] = []
+    seen: set[str] = set()
+    last_exc: ValidationError | None = None
+    for _ in range(_SCHEMA_FIT_ATTEMPTS):
+        try:
+            loaded = model.model_validate(current)
+        except ValidationError as exc:
+            last_exc = exc
+            progressed = False
+            for error in exc.errors():
+                err_type = error.get("type")
+                if err_type not in {"string_too_long", "too_long"}:
+                    continue
+                loc = tuple(error.get("loc") or ())
+                max_length = (error.get("ctx") or {}).get("max_length")
+                if not loc or not isinstance(max_length, int):
+                    continue
+                original = _dig(payload, loc)
+                path = _issue_path(loc)
+                if err_type == "string_too_long" and isinstance(original, str) and len(original) > max_length:
+                    existing = _dig(current, loc)
+                    if isinstance(existing, str) and len(existing) <= max_length:
+                        continue
+                    if not _put(current, loc, original[:max_length]):
+                        continue
+                    progressed = True
+                    if path not in seen:
+                        seen.add(path)
+                        issues.append(_schema_mismatch_issue(error, original))
+                        string_restorations.append((loc, original))
+                elif err_type == "too_long" and isinstance(original, list) and len(original) > max_length:
+                    existing = _dig(current, loc)
+                    if isinstance(existing, list) and len(existing) <= max_length:
+                        continue
+                    if not _put(current, loc, original[:max_length]):
+                        continue
+                    progressed = True
+                    if path not in seen:
+                        seen.add(path)
+                        issues.append(_schema_mismatch_issue(error, original))
+                        list_restorations.append((loc, original))
+            if not progressed:
+                raise
+            continue
+
+        for loc, original in string_restorations:
+            _assign_model(loaded, loc, original)
+        for loc, original in list_restorations:
+            item_annotation = _list_item_annotation(_annotation_at(model, loc))
+            item_model = _model_from_annotation(item_annotation)
+            if item_model is None:
+                _assign_model(loaded, loc, original)
+                continue
+            coerced: list[Any] = []
+            prefix = _issue_path(loc)
+            for index, item in enumerate(original):
+                if not isinstance(item, dict):
+                    coerced.append(item)
+                    continue
+                nested, nested_issues = load_model_keeping_original(item_model, item)
+                for nested_issue in nested_issues:
+                    nested_path = nested_issue.path if nested_issue.path != "root" else ""
+                    nested_issue.path = f"{prefix}.{index}.{nested_path}" if nested_path else f"{prefix}.{index}"
+                issues.extend(nested_issues)
+                coerced.append(nested)
+            _assign_model(loaded, loc, coerced)
+        return loaded, _dedupe_issues(issues)
+
+    if last_exc is not None:
+        raise last_exc
+    raise ValidationError.from_exception_data(model.__name__, [])
+
+
+def parse_ai_annotation_result(data: dict[str, Any]) -> AIAnnotationResultResponse:
+    """读回已保存的 AI 结果。超出 schema 长度的原文仍保留在对象里。"""
+
+    result, _issues = load_model_keeping_original(AIAnnotationResultResponse, data)
+    return result
+
+
 class ExtractionAIAnnotationService:
     """对指定标注任务执行分片 AI 抽取，并在服务端合并结果。"""
 
     def __init__(self, db: Session):
         self.db = db
         self._token_usage = _AnnotationTokenAccumulator()
+        self._model_output_job_id: int | None = None
+
+    def capture_model_output(self, job_id: int) -> None:
+        """把后续模型原文写到这条任务上，供失败后人工补回。"""
+
+        self._model_output_job_id = job_id
+
+    def _remember_model_output(self, stage: str, content: Any) -> None:
+        """先提交模型原文。后面的校验失败回滚不会把它清掉，接口也不返回它。"""
+
+        job_id = self._model_output_job_id
+        if job_id is None:
+            return
+        try:
+            job = self.db.get(ExtractionAIAnnotationJob, job_id)
+            if job is None:
+                return
+            try:
+                stored = json.loads(job.model_output_json or "{}")
+            except json.JSONDecodeError:
+                stored = {}
+            if not isinstance(stored, dict):
+                stored = {}
+            fragments = stored.get("fragments")
+            if not isinstance(fragments, list):
+                fragments = []
+            fragments.append({"stage": stage, "content": content})
+            stored["fragments"] = fragments
+            job.model_output_json = json.dumps(stored, ensure_ascii=False, default=str)
+            self.db.add(job)
+            previous = self.db.expire_on_commit
+            self.db.expire_on_commit = False
+            try:
+                self.db.commit()
+            finally:
+                self.db.expire_on_commit = previous
+        except Exception:
+            logger.exception("Unable to store AI annotation model output job_id=%s", job_id)
 
     @property
     def token_usage(self) -> AIAnnotationTokenUsage:
@@ -227,6 +527,9 @@ class ExtractionAIAnnotationService:
         provider_name, model_name = self._resolve_provider_config(config)
         started = time.perf_counter()
         self._token_usage = _AnnotationTokenAccumulator()
+        # 模型调用可能持续数分钟。先结束这次读取，避免占住 SQLite，
+        # 否则切换篇目、入队和保存都会一直等待。
+        self._release_db_for_model_call()
 
         if provider_name == "mock":
             # Mock 是离线格式演示，不具备第二个真实模型调用；线上 Provider 会执行格式复核轮次。
@@ -283,19 +586,19 @@ class ExtractionAIAnnotationService:
         """按分片重新抽取当前文献，避免把完整 JSON 再交给模型重生成。"""
 
         task, passage = self._get_task_and_passage(payload.task_id)
+        source_job_id: int | None = None
+        lineage_job_id: int | None = None
+        if requested_by is not None:
+            source_job_id, lineage_job_id = self.require_generation_lineage(
+                task.id,
+                requested_by,
+                payload.job_id,
+            )
         provider_name, model_name = self._resolve_provider_config(payload.config)
         self._token_usage = _AnnotationTokenAccumulator()
         if provider_name == "mock":
             raise AIAnnotationConfigError(
                 "Mock 模式不支持继续调用格式复核模型，请切换到远程 Provider。"
-            )
-
-        source_job_id: int | None = None
-        if requested_by is not None:
-            source_job_id = self._resolve_source_job_id(
-                task.id,
-                requested_by,
-                payload.job_id,
             )
 
         started = time.perf_counter()
@@ -313,6 +616,7 @@ class ExtractionAIAnnotationService:
             model=model_name,
             elapsed_ms=0,
         )
+        self._release_db_for_model_call()
         if current_result.label is None:
             (
                 assembled_document,
@@ -356,12 +660,13 @@ class ExtractionAIAnnotationService:
             fragment_warnings=fragment_warnings,
             token_usage=self.token_usage,
         )
-        if requested_by is not None:
+        if requested_by is not None and lineage_job_id is not None:
             persist_ai_annotation_result(
                 self.db,
                 result,
                 requested_by=requested_by,
                 source_job_id=source_job_id,
+                lineage_job_id=lineage_job_id,
             )
             self.db.commit()
         return result
@@ -386,15 +691,67 @@ class ExtractionAIAnnotationService:
             elapsed_ms=max(int((time.perf_counter() - started) * 1000), 0),
         )
         if requested_by is not None:
-            source_job_id = self._resolve_source_job_id(task_id, requested_by, job_id)
+            source_job_id, lineage_job_id = self.require_generation_lineage(
+                task_id,
+                requested_by,
+                job_id,
+            )
             persist_ai_annotation_result(
                 self.db,
                 result,
                 requested_by=requested_by,
                 source_job_id=source_job_id,
+                lineage_job_id=lineage_job_id,
             )
             self.db.commit()
         return result
+
+    def require_generation_lineage(
+        self,
+        task_id: int,
+        requested_by: int,
+        job_id: int | None,
+    ) -> tuple[int, int]:
+        """校验或修复只能写到未归档的成功 generate 根。返回 (source_job_id, lineage_job_id)。"""
+
+        if job_id is None:
+            root = (
+                self.db.query(ExtractionAIAnnotationJob)
+                .filter(
+                    ExtractionAIAnnotationJob.task_id == task_id,
+                    ExtractionAIAnnotationJob.requested_by == requested_by,
+                    ExtractionAIAnnotationJob.operation == "generate",
+                    ExtractionAIAnnotationJob.status == "success",
+                    ExtractionAIAnnotationJob.archived_at.is_(None),
+                    ExtractionAIAnnotationJob.cloned_from_job_id.is_(None),
+                )
+                .order_by(
+                    ExtractionAIAnnotationJob.created_at.desc(),
+                    ExtractionAIAnnotationJob.id.desc(),
+                )
+                .first()
+            )
+            if root is None:
+                raise AIAnnotationServiceError("未找到可保存的成功生成", status_code=404)
+            return root.id, root.id
+
+        job = self.db.get(ExtractionAIAnnotationJob, job_id)
+        if job is None or job.requested_by != requested_by or job.task_id != task_id:
+            raise AIAnnotationServiceError("未找到当前用户可保存的 AI 标注任务", status_code=404)
+        root = lineage_root(self.db, job)
+        if (
+            root is None
+            or root.operation != "generate"
+            or root.status != "success"
+            or root.requested_by != requested_by
+            or root.task_id != task_id
+            or root.archived_at is not None
+        ):
+            raise AIAnnotationServiceError(
+                "只有未归档的成功生成才能校验或修复",
+                status_code=409,
+            )
+        return job.id, root.id
 
     def _resolve_source_job_id(
         self,
@@ -419,6 +776,16 @@ class ExtractionAIAnnotationService:
             .first()
         )
         return latest_job.id if latest_job is not None else None
+
+    def _release_db_for_model_call(self) -> None:
+        """结束当前事务，但保留已加载的篇目对象，供随后的模型调用使用。"""
+
+        previous = self.db.expire_on_commit
+        self.db.expire_on_commit = False
+        try:
+            self.db.commit()
+        finally:
+            self.db.expire_on_commit = previous
 
     def get_task_context(self, task_id: int) -> AIAnnotationTaskContextResponse:
         task, passage = self._get_task_and_passage(task_id)
@@ -496,7 +863,12 @@ class ExtractionAIAnnotationService:
                 f"{stage}模型服务请求失败，请检查网络和服务状态。"
             ) from exc
         except RuntimeError as exc:
-            raise AIAnnotationProviderError(f"{stage}模型鉴权或调用失败，请检查调用配置。") from exc
+            detail = " ".join(str(exc).split())
+            if "authentication failed" in detail.lower():
+                message = f"{stage}模型鉴权或调用失败，请检查调用配置。"
+            else:
+                message = f"{stage}模型调用失败：{detail[:180] or '请检查调用配置。'}"
+            raise AIAnnotationProviderError(message) from exc
         except Exception as exc:
             raise AIAnnotationProviderError(f"{stage}模型调用失败，请检查调用配置和服务日志。") from exc
 
@@ -870,17 +1242,23 @@ class ExtractionAIAnnotationService:
 
         base_relations = list(payload.get("person_relations") or [])
         relation_source_keys: set[str] = set()
+        person_order = {
+            str(person.get("key")): index
+            for index, person in enumerate(persons)
+            if person.get("key")
+        }
         for relation_index in relation_issue_indices:
             if 0 <= relation_index < len(base_relations):
                 relation = base_relations[relation_index]
                 if isinstance(relation, dict) and relation.get("source_person_key"):
                     source_key = str(relation["source_person_key"])
-                    if source_key in {
-                        str(person.get("key"))
-                        for person in persons
-                        if person.get("key")
-                    }:
-                        relation_source_keys.add(source_key)
+                    target_key = str(relation.get("target_person_key") or "")
+                    if source_key in person_order and target_key in person_order:
+                        # 分片统一按人物顺序选择两端中较早者作为 source。
+                        canonical_source = min(
+                            (source_key, target_key), key=person_order.__getitem__
+                        )
+                        relation_source_keys.add(canonical_source)
                     else:
                         relation_repair_all = True
                 else:
@@ -896,9 +1274,7 @@ class ExtractionAIAnnotationService:
 
         if relation_repair_needed:
             valid_relation_sources = [
-                str(person.get("key"))
-                for person in persons
-                if person.get("level") in {1, 2} and person.get("key")
+                str(person.get("key")) for person in persons if person.get("key")
             ]
             if relation_repair_all or not relation_source_keys:
                 relation_source_keys = set(valid_relation_sources)
@@ -972,7 +1348,6 @@ class ExtractionAIAnnotationService:
                     and relation.get("source_person_key") in replaced_sources
                 )
             ] + relation_replacements
-            self._drop_level_three_relations(payload)
 
         if auxiliary_fields:
             auxiliary_fragment = record_fragment(
@@ -1081,38 +1456,6 @@ class ExtractionAIAnnotationService:
         )
         return result
 
-    @staticmethod
-    def _drop_level_three_relations(payload: dict[str, Any]) -> None:
-        """关系分片即使误返回三级人物端点，也不能进入最终标签。"""
-
-        level_by_key = {
-            str(person.get("key")): person.get("level")
-            for person in payload.get("persons") or []
-            if isinstance(person, dict) and person.get("key")
-        }
-        kept: list[dict[str, Any]] = []
-        dropped = 0
-        for relation in payload.get("person_relations") or []:
-            if not isinstance(relation, dict):
-                continue
-            endpoints = (
-                str(relation.get("source_person_key") or ""),
-                str(relation.get("target_person_key") or ""),
-            )
-            if any(level_by_key.get(endpoint) == 3 for endpoint in endpoints):
-                dropped += 1
-                continue
-            kept.append(relation)
-        if dropped:
-            payload["unresolved_items"] = list(payload.get("unresolved_items") or [])
-            payload["unresolved_items"].append(
-                {
-                    "category": "level_three_relation_discarded",
-                    "note": f"已丢弃 {dropped} 条连接三级人物的关系，三级人物不进入主关系标注。",
-                }
-            )
-        payload["person_relations"] = kept
-
     def _generate_staged_document(
         self,
         task: ExtractionAnnotationTask,
@@ -1218,9 +1561,7 @@ class ExtractionAIAnnotationService:
 
         # 关系按 source 人物分组；每个请求最多四个 source，遇到截断时由
         # _call_fragment_json 仅重试当前关系批次，不会重新生成前面的内容。
-        relation_sources = [
-            person["key"] for person in persons if person.get("level") in {1, 2}
-        ]
+        relation_sources = [person["key"] for person in persons if person.get("key")]
         for start in range(0, len(relation_sources), _RELATION_SOURCE_BATCH_SIZE):
             source_keys = relation_sources[start : start + _RELATION_SOURCE_BATCH_SIZE]
             relation_fragment = self._call_fragment_json(
@@ -1333,6 +1674,7 @@ class ExtractionAIAnnotationService:
                 stage=stage,
                 purpose=purpose,
             )
+            self._remember_model_output(stage, call.content)
             models.append(call.model)
             if call.finish_reason == "length":
                 truncated.append(stage)
@@ -1504,7 +1846,7 @@ class ExtractionAIAnnotationService:
     ) -> ExtractionAnnotationLabel:
         persons = payload.get("persons") or []
         for person in persons:
-            person["mentions"] = self._materialize_evidence(
+            person["mentions"] = self._materialize_person_mentions(
                 passage.context,
                 person.get("mentions"),
                 prefix=f"{person.get('key', 'p')}-m",
@@ -1562,7 +1904,10 @@ class ExtractionAIAnnotationService:
 
         payload["schema_version"] = task.spec_version
         payload["passage"] = payload.get("passage") or {}
-        return ExtractionAnnotationLabel.model_validate(payload)
+        self._remember_model_output("assembled", payload)
+        label, _schema_issues = load_model_keeping_original(ExtractionAnnotationLabel, payload)
+        drop_meaningless_excluded_mentions(label)
+        return label
 
     def _normalize_life_event(
         self,
@@ -1620,6 +1965,114 @@ class ExtractionAIAnnotationService:
         if value in {"confirmed", "present", "mentioned"}:
             return "has_fact"
         return "uncertain" if value in {"unknown", "unclear"} else "not_mentioned"
+
+    @staticmethod
+    def _spans_overlap(left_start: int, left_end: int, right_start: int, right_end: int) -> bool:
+        return left_start < right_end and right_start < left_end
+
+    @classmethod
+    def _find_unoccupied_span(
+        cls,
+        context: str,
+        quote: str,
+        occupied: list[tuple[int, int]],
+        *,
+        prefer: tuple[int, int] | None,
+    ) -> tuple[int, int] | None:
+        if prefer is not None:
+            start, end = prefer
+            if (
+                0 <= start < end <= len(context)
+                and context[start:end] == quote
+                and not any(
+                    cls._spans_overlap(start, end, occupied_start, occupied_end)
+                    for occupied_start, occupied_end in occupied
+                )
+            ):
+                return start, end
+            cursor = max(start + 1, 0)
+            allow_wrap = True
+        else:
+            cursor = 0
+            allow_wrap = False
+        wrapped = False
+        while True:
+            index = context.find(quote, cursor)
+            if index < 0:
+                if allow_wrap and not wrapped:
+                    wrapped = True
+                    cursor = 0
+                    continue
+                return None
+            end = index + len(quote)
+            if not any(
+                cls._spans_overlap(index, end, occupied_start, occupied_end)
+                for occupied_start, occupied_end in occupied
+            ):
+                return index, end
+            cursor = index + 1
+
+    def _materialize_person_mentions(
+        self,
+        context: str,
+        raw: Any,
+        *,
+        prefix: str,
+    ) -> list[dict[str, Any]]:
+        """同一人物 mentions 从长到短匹配，已占用区间不再给后续短称呼。"""
+
+        candidates: list[tuple[int, int, str, tuple[int, int] | None]] = []
+        if not isinstance(raw, list):
+            return []
+        for original_index, item in enumerate(raw[:50]):
+            if isinstance(item, EvidenceSpan):
+                item = item.model_dump(mode="python")
+            if not isinstance(item, dict):
+                continue
+            quote = str(item.get("quote") or "")
+            if not quote:
+                continue
+            start = item.get("start")
+            end = item.get("end")
+            prefer: tuple[int, int] | None = None
+            if (
+                isinstance(start, int)
+                and isinstance(end, int)
+                and 0 <= start < end <= len(context)
+                and context[start:end] == quote
+            ):
+                prefer = (start, end)
+            candidates.append((len(quote), original_index, quote, prefer))
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        occupied: list[tuple[int, int]] = []
+        placed: list[tuple[int, dict[str, Any]]] = []
+        for _length, original_index, quote, prefer in candidates:
+            span = self._find_unoccupied_span(context, quote, occupied, prefer=prefer)
+            if span is None:
+                continue
+            start, end = span
+            occupied.append((start, end))
+            placed.append(
+                (
+                    original_index,
+                    {
+                        "source": "context",
+                        "quote": quote,
+                        "start": start,
+                        "end": end,
+                        "start_utf16": codepoint_to_utf16_offset(context, start),
+                        "end_utf16": codepoint_to_utf16_offset(context, end),
+                    },
+                )
+            )
+
+        placed.sort(key=lambda item: (item[1]["start"], item[0]))
+        result: list[dict[str, Any]] = []
+        for index, (_original_index, item) in enumerate(placed, start=1):
+            item["id"] = f"{prefix}{index}"
+            result.append(item)
+        return result
 
     @staticmethod
     def _materialize_evidence(
@@ -1737,7 +2190,11 @@ class ExtractionAIAnnotationService:
             payload = json.loads(raw or "{}")
             if isinstance(payload, dict) and isinstance(payload.get("label"), dict):
                 payload = payload["label"]
-            return ExtractionAnnotationLabel.model_validate(payload).model_dump(mode="json")
+            example = ExtractionAnnotationLabel.model_validate(payload).model_dump(mode="json")
+            # 人工步骤确认与缺漏清单不是模型抽取目标，避免示例诱导复制。
+            example.pop("step_reviews", None)
+            example.pop("omissions", None)
+            return example
         except (json.JSONDecodeError, TypeError, ValidationError, ValueError):
             return None
 
@@ -1759,12 +2216,35 @@ class ExtractionAIAnnotationService:
         return task, passage
 
     @staticmethod
+    def _canonical_provider_name(raw: str) -> str:
+        """内置名称归一成固定代号，自定义名称保留显示文本。"""
+
+        if any(ord(char) < 32 for char in raw):
+            raise AIAnnotationConfigError("Provider 名称不能包含控制字符。")
+        text = " ".join(raw.split())
+        if not text:
+            return ""
+        if len(text) > 64:
+            raise AIAnnotationConfigError("Provider 名称不能超过 64 个字符。")
+        lowered = text.lower()
+        aliases = {
+            "openai-compatible": "openai_compatible",
+            "openai compatible": "openai_compatible",
+        }
+        if lowered in aliases:
+            return aliases[lowered]
+        if lowered in {"mock", "deepseek", "openai_compatible"}:
+            return lowered
+        return text
+
+    @staticmethod
     def _resolve_provider_config(config: AIAnnotationConfigRequest) -> tuple[str, str]:
         settings = get_settings()
-        provider_name = (config.provider.strip().lower() or settings.llm_provider.strip().lower() or "mock")
-        if provider_name not in {"mock", "deepseek", "openai_compatible"}:
-            raise AIAnnotationConfigError(
-                "暂不支持该模型 Provider，请选择 mock、deepseek 或 openai-compatible。"
+        provider_name = ExtractionAIAnnotationService._canonical_provider_name(config.provider)
+        if not provider_name:
+            provider_name = (
+                ExtractionAIAnnotationService._canonical_provider_name(settings.llm_provider)
+                or "mock"
             )
 
         model_name = config.model.strip() or settings.llm_model_name.strip()
@@ -1876,7 +2356,12 @@ class ExtractionAIAnnotationService:
                 )
             else:
                 try:
-                    label = ExtractionAnnotationLabel.model_validate(label_payload)
+                    label, schema_issues = load_model_keeping_original(
+                        ExtractionAnnotationLabel,
+                        label_payload,
+                    )
+                    drop_meaningless_excluded_mentions(label)
+                    rule_issues.extend(schema_issues)
                 except ValidationError as exc:
                     format_issues.extend(_validation_issues_from_pydantic(exc))
 
@@ -1889,6 +2374,7 @@ class ExtractionAIAnnotationService:
                     passage.context,
                     task.spec_version,
                     self.db,
+                    require_step_reviews=False,
                 )
             )
             export_document = AIAnnotationExportDocument(

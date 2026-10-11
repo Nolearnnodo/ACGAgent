@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base_class import Base
@@ -36,6 +36,11 @@ class ExtractionAIAnnotationJob(Base):
         index=True,
     )
     source_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    cloned_from_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("extraction_ai_annotation_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     input_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
     provider: Mapped[str] = mapped_column(String(64), nullable=False, default="")
@@ -44,6 +49,8 @@ class ExtractionAIAnnotationJob(Base):
     config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     prompt_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 模型原文只供失败后人工补回，不进入任务接口响应。
+    model_output_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # client_started_at 由前端在用户点击“生成标注”时写入；created_at 仍保留
     # 服务端接收时刻，便于识别客户端时钟异常并计算排队时间。
@@ -78,6 +85,11 @@ class ExtractionAIAnnotationJob(Base):
     first_round_truncated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     final_difference_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     final_differences_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -91,14 +103,22 @@ class ExtractionAIAnnotationJob(Base):
 
 
 class ExtractionAIAnnotationSavedResult(Base):
-    """每个用户在每篇任务上的当前 AI 结果，独立于前端页面生命周期。"""
+    """每个用户在每一份生成上的工作副本，独立于前端页面生命周期。"""
 
     __tablename__ = "extraction_ai_annotation_saved_results"
     __table_args__ = (
         UniqueConstraint(
             "task_id",
             "requested_by",
-            name="uq_extraction_ai_annotation_saved_result_task_user",
+            "lineage_job_id",
+            name="uq_extraction_ai_annotation_saved_result_lineage",
+        ),
+        Index(
+            "uq_extraction_ai_annotation_saved_result_null_lineage",
+            "task_id",
+            "requested_by",
+            unique=True,
+            sqlite_where=text("lineage_job_id IS NULL"),
         ),
     )
 
@@ -119,6 +139,11 @@ class ExtractionAIAnnotationSavedResult(Base):
         index=True,
     )
     source_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("extraction_ai_annotation_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    lineage_job_id: Mapped[int | None] = mapped_column(
         ForeignKey("extraction_ai_annotation_jobs.id", ondelete="SET NULL"),
         nullable=True,
         index=True,

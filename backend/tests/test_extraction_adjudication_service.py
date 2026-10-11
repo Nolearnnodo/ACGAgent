@@ -26,7 +26,6 @@ from app.services.extraction_annotation_service import (
     AnnotationValidationError,
     ExtractionAnnotationService,
     codepoint_to_utf16_offset,
-    relation_reverse_suggestions,
     validate_for_submission,
 )
 
@@ -67,6 +66,7 @@ def _evidence(context: str, start: int, end: int, evidence_id: str) -> EvidenceS
 
 def _label(context: str, *, reason: str, key_suffix: str) -> ExtractionAnnotationLabel:
     return ExtractionAnnotationLabel(
+        step_reviews={"material": True, "persons": True, "relations": True, "checks": True},
         persons=[
             PersonAnnotation(
                 key=f"person-{key_suffix}",
@@ -219,12 +219,10 @@ def test_gold_import_rejects_a_changed_context(adjudication_db):
         service.import_gold_yaml(task.id, yaml.safe_dump(document, allow_unicode=True), admin)
 
 
-def test_relation_reverse_suggestions_and_submission_validation():
-    suggestions = relation_reverse_suggestions(["F", "W"])
-    assert suggestions == [["H", "S"], ["H", "D"]]
-
+def test_relation_category_summary_and_level_three_submission_validation():
     context = "甲父乙"
     label = ExtractionAnnotationLabel(
+        step_reviews={"material": True, "persons": True, "relations": True, "checks": True},
         persons=[
             PersonAnnotation(
                 key="a",
@@ -237,10 +235,9 @@ def test_relation_reverse_suggestions_and_submission_validation():
             PersonAnnotation(
                 key="b",
                 name_surface="乙",
-                level=2,
+                level=3,
                 level_reason="父子关系",
                 mentions=[_evidence(context, 2, 3, "b-e")],
-                event_checks={event: "not_mentioned" for event in ("出生", "籍贯", "死亡", "埋葬", "任职")},
             ),
         ],
         person_relations=[
@@ -248,6 +245,8 @@ def test_relation_reverse_suggestions_and_submission_validation():
                 key="r",
                 source_person_key="a",
                 target_person_key="b",
+                relation_category="亲属",
+                relation_summary="父子",
                 codes=["F"],
                 reverse_codes=["F"],
                 evidence=[_evidence(context, 0, 3, "r-e")],
@@ -255,4 +254,11 @@ def test_relation_reverse_suggestions_and_submission_validation():
         ],
     )
     issues = validate_for_submission(label, context, label.schema_version)
-    assert any(item["code"] == "relation_inverse_mismatch" for item in issues)
+    assert issues == []
+
+    label.person_relations[0].relation_category = ""
+    label.person_relations[0].relation_summary = ""
+    issues = validate_for_submission(label, context, label.schema_version)
+    assert {item["code"] for item in issues} == {
+        "relation_category_required", "relation_summary_required"
+    }

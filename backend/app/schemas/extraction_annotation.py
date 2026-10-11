@@ -6,7 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
-ANNOTATION_SPEC_VERSION = "0.2.0"
+ANNOTATION_SPEC_VERSION = "0.3.0"
 EVENT_TYPES = ("出生", "籍贯", "死亡", "埋葬", "任职")
 
 EventType = Literal["出生", "籍贯", "死亡", "埋葬", "任职"]
@@ -14,6 +14,41 @@ CheckState = Literal["unreviewed", "has_fact", "not_mentioned", "uncertain", "un
 FactState = Literal["confirmed", "uncertain", "unsupported"]
 FieldState = Literal["present", "not_mentioned", "not_applicable", "uncertain", "unsupported"]
 RelationCode = Literal["F", "M", "S", "D", "H", "W", "Z", "C", "B", "O"]
+RELATION_CATEGORIES = (
+    "亲属",
+    "教授与传承",
+    "隶属与任用",
+    "合作与援助",
+    "交游与往来",
+    "对抗与冲突",
+    "其他",
+)
+RelationCategory = Literal[
+    "亲属", "教授与传承", "隶属与任用", "合作与援助", "交游与往来", "对抗与冲突", "其他"
+]
+OMISSION_CATEGORIES = (
+    "人物缺漏",
+    "等级缺漏",
+    "属性缺漏",
+    "事件缺漏",
+    "时间缺漏",
+    "地点缺漏",
+    "官职缺漏",
+    "历史事件缺漏",
+    "关系缺漏",
+    "证据缺漏",
+    "其他缺漏",
+)
+OmissionCategory = Literal[
+    "人物缺漏", "等级缺漏", "属性缺漏", "事件缺漏", "时间缺漏", "地点缺漏",
+    "官职缺漏", "历史事件缺漏", "关系缺漏", "证据缺漏", "其他缺漏"
+]
+ANNOTATION_STEPS = ("material", "persons", "relations", "checks")
+AnnotationStep = Literal["material", "persons", "relations", "checks"]
+
+
+def default_step_reviews() -> dict[AnnotationStep, bool]:
+    return {step: False for step in ANNOTATION_STEPS}
 
 
 def default_event_checks() -> dict[str, CheckState]:
@@ -118,9 +153,12 @@ class PersonRelationAnnotation(BaseModel):
     key: str = Field(min_length=1, max_length=64)
     source_person_key: str = Field(min_length=1, max_length=64)
     target_person_key: str = Field(min_length=1, max_length=64)
+    relation_category: RelationCategory | Literal[""] = ""
+    relation_summary: str = Field(default="", max_length=10)
+    # 旧标签保留代码字段以便读取；新关系只填写类别、具体表现和证据。
     codes: list[RelationCode] = Field(default_factory=list, max_length=3)
     reverse_codes: list[RelationCode] = Field(default_factory=list, max_length=3)
-    note: str = Field(default="", max_length=15)
+    note: str = Field(default="", max_length=1000)
     reverse_note: str = Field(default="", max_length=15)
     state: FactState = "confirmed"
     evidence: list[EvidenceSpan] = Field(default_factory=list, max_length=8)
@@ -146,14 +184,29 @@ class SchemaConflict(BaseModel):
     evidence: list[EvidenceSpan] = Field(default_factory=list, max_length=8)
 
 
+class AnnotationOmission(BaseModel):
+    """第四步独立登记的缺漏，不参与已标注项目的正确率。"""
+
+    key: str = Field(min_length=1, max_length=64)
+    category: OmissionCategory | Literal[""] = ""
+    description: str = Field(default="", max_length=1000)
+    target_path: str = Field(default="", max_length=255)
+    evidence: list[EvidenceSpan] = Field(default_factory=list, max_length=8)
+    evidence_note: str = Field(default="", max_length=1000)
+    resolution: Literal["open", "resolved", "unsupported"] = "open"
+    resolution_note: str = Field(default="", max_length=1000)
+
+
 class ExtractionAnnotationLabel(BaseModel):
     schema_version: str = Field(default=ANNOTATION_SPEC_VERSION, max_length=32)
+    step_reviews: dict[AnnotationStep, bool] = Field(default_factory=default_step_reviews)
     passage: PassageAnnotation = Field(default_factory=PassageAnnotation)
     persons: list[PersonAnnotation] = Field(default_factory=list, max_length=500)
     person_relations: list[PersonRelationAnnotation] = Field(default_factory=list, max_length=500)
     excluded_mentions: list[ExcludedMention] = Field(default_factory=list, max_length=500)
     unresolved_items: list[UnresolvedItem] = Field(default_factory=list, max_length=500)
     schema_conflicts: list[SchemaConflict] = Field(default_factory=list, max_length=100)
+    omissions: list[AnnotationOmission] = Field(default_factory=list, max_length=500)
 
 
 class ExtractionTaskCreateRequest(BaseModel):
@@ -225,7 +278,7 @@ class ExtractionTaskDetailResponse(BaseModel):
 class AIAnnotationConfigRequest(BaseModel):
     """单次 AI 标注调用的配置；API Key 不会写入数据库。"""
 
-    provider: Literal["", "mock", "deepseek", "openai_compatible"] = ""
+    provider: str = Field(default="", max_length=64)
     api_key: str = Field(default="", max_length=500)
     base_url: str = Field(default="", max_length=500)
     model: str = Field(default="", max_length=200)
@@ -376,12 +429,75 @@ class AIAnnotationJobResponse(BaseModel):
     generation_job_id: int | None = None
     review_status: Literal["not_started", "draft", "submitted"] = "not_started"
     review_accuracy: float | None = Field(default=None, ge=0, le=1)
+    review_submitted_at: datetime | None = None
     result: AIAnnotationResultResponse | None = None
     saved_result: AIAnnotationResultResponse | None = None
+    reused_existing: bool = False
+    archived_at: datetime | None = None
+    lineage_job_id: int | None = None
+    active_generation_count: int = 0
+    generation_count: int = 0
+    generation_limit: int = 12
+    active_job_id: int | None = None
+    active_operation: AIAnnotationJobOperation | None = None
+    active_status: Literal["queued", "running"] | None = None
+
+
+class AIAnnotationGenerationSummary(BaseModel):
+    job_id: int
+    task_id: int
+    passage_id: int
+    provider: str
+    model: str
+    temperature: float | None = None
+    prompt_overridden: bool = False
+    status: AIAnnotationJobStatus
+    validation_status: str = ""
+    created_at: datetime
+    finished_at: datetime | None = None
+    review_status: Literal["not_started", "draft", "submitted"] = "not_started"
+    review_accuracy: float | None = None
+    review_submitted_at: datetime | None = None
+    has_working_copy: bool = False
+    latest_job_id: int
+    latest_operation: AIAnnotationJobOperation = "generate"
+    latest_status: AIAnnotationJobStatus
+    latest_provider: str = ""
+    latest_model: str = ""
+    archived_at: datetime | None = None
+    repair_count: int = 0
+
+
+class AIAnnotationGenerationGroup(BaseModel):
+    provider: str
+    model: str
+    generations: list[AIAnnotationGenerationSummary]
+
+
+class AIAnnotationGenerationListResponse(BaseModel):
+    task_id: int
+    active_job_id: int | None = None
+    active_operation: Literal["generate", "repair"] | None = None
+    active_status: Literal["queued", "running"] | None = None
+    active_generation_count: int
+    generation_count: int
+    generation_limit: int
+    groups: list[AIAnnotationGenerationGroup]
 
 
 AIAnnotationReviewVerdict = Literal["unreviewed", "correct", "incorrect"]
 AIAnnotationReviewStatus = Literal["draft", "submitted"]
+AIAnnotationReviewAdditionType = Literal[
+    "note",
+    "person",
+    "life_event",
+    "historical_event",
+    "person_relation",
+    "evidence",
+    "excluded_mention",
+    "unresolved_item",
+    "schema_conflict",
+]
 
 
 class AIAnnotationReviewStandard(BaseModel):
@@ -395,6 +511,12 @@ class AIAnnotationReviewDecision(BaseModel):
     item_id: str = Field(min_length=1, max_length=255)
     verdict: AIAnnotationReviewVerdict = "unreviewed"
     reason: str = Field(default="", max_length=2000)
+    correction: str = Field(default="", max_length=4000)
+    correction_evidence: list[EvidenceSpan] = Field(default_factory=list, max_length=8)
+    # 当五类事件检查由“原文未提及”纠正为“有事实”时，保存完整事件卡片。
+    # 使用 JSON 字段可兼容已落库的旧质检决定，无需新增数据库列。
+    correction_data: dict[str, Any] = Field(default_factory=dict)
+    remove_item: bool = False
 
 
 class AIAnnotationReviewOmission(BaseModel):
@@ -405,6 +527,11 @@ class AIAnnotationReviewOmission(BaseModel):
     correction: str = Field(default="", max_length=4000)
     evidence: list[EvidenceSpan] = Field(default_factory=list, max_length=8)
     evidence_note: str = Field(default="", max_length=1000)
+    # 旧质检草稿只有自由文本缺漏（note）。新草稿可在同一 JSON 列中保存
+    # 可回放的结构化新增操作，避免为了扩展质检能力修改历史记录格式。
+    addition_type: AIAnnotationReviewAdditionType = "note"
+    parent_key: str = Field(default="", max_length=64)
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 class AIAnnotationReviewUpdateRequest(BaseModel):
@@ -419,10 +546,22 @@ class AIAnnotationReviewItem(BaseModel):
     title: str
     question: str
     detail: str = ""
+    field_label: str = ""
+    ai_value: str = ""
+    group_key: str = ""
+    group_title: str = ""
+    section_key: str = ""
+    section_title: str = ""
+    value_kind: str = "text"
+    correction_hint: str = ""
     standard_ids: list[str] = Field(default_factory=list)
     evidence: list[EvidenceSpan] = Field(default_factory=list)
     verdict: AIAnnotationReviewVerdict = "unreviewed"
     reason: str = ""
+    correction: str = ""
+    correction_evidence: list[EvidenceSpan] = Field(default_factory=list)
+    correction_data: dict[str, Any] = Field(default_factory=dict)
+    remove_item: bool = False
 
 
 class AIAnnotationReviewSummary(BaseModel):
@@ -448,7 +587,10 @@ class AIAnnotationReviewResponse(BaseModel):
     items: list[AIAnnotationReviewItem]
     omissions: list[AIAnnotationReviewOmission]
     summary: AIAnnotationReviewSummary
+    ground_truth_document: AIAnnotationExportDocument | None = None
     reviewer_id: int
+    editable: bool = True
+    blind_submitted_at: datetime | None = None
     started_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -466,6 +608,24 @@ class AIAnnotationMetricDifference(BaseModel):
     category: str
     label: str
     count: int = Field(ge=0)
+
+
+class AIAnnotationMetricHumanReviewErrorType(BaseModel):
+    """一篇 AI 标注中被人工判为错误的检查项类型。"""
+
+    category: str
+    field_label: str
+    count: int = Field(ge=0)
+
+
+class AIAnnotationMetricOmission(BaseModel):
+    """人工质检中独立登记的缺漏或结构增补。"""
+
+    category: str
+    target_path: str = ""
+    description: str
+    correction: str = ""
+    count: int = Field(default=1, ge=1)
 
 
 class AIAnnotationDailyMetric(BaseModel):
@@ -501,10 +661,12 @@ class AIAnnotationMetricsSummary(BaseModel):
     total_first_round_errors: int = Field(ge=0)
     total_final_differences: int = Field(ge=0)
     human_reviewed_count: int = Field(default=0, ge=0)
+    human_scored_count: int = Field(default=0, ge=0)
     average_human_accuracy: float = Field(default=0, ge=0, le=1)
     total_human_correct: int = Field(default=0, ge=0)
     total_human_incorrect: int = Field(default=0, ge=0)
     total_human_omissions: int = Field(default=0, ge=0)
+    human_omission_categories: dict[str, int] = Field(default_factory=dict)
 
 
 class AIAnnotationMetricsRecord(BaseModel):
@@ -545,8 +707,26 @@ class AIAnnotationMetricsRecord(BaseModel):
     human_review_correct_count: int = Field(default=0, ge=0)
     human_review_incorrect_count: int = Field(default=0, ge=0)
     human_review_omission_count: int = Field(default=0, ge=0)
+    human_review_error_categories: dict[str, int] = Field(default_factory=dict)
+    human_review_error_types: list[AIAnnotationMetricHumanReviewErrorType] = Field(
+        default_factory=list
+    )
+    human_review_omission_categories: dict[str, int] = Field(default_factory=dict)
+    human_review_omissions: list[AIAnnotationMetricOmission] = Field(default_factory=list)
     human_review_submitted_at: datetime | None = None
     submission_id: int | None = None
+
+
+class AIAnnotationProviderModelMetrics(BaseModel):
+    provider: str
+    model: str
+    session_count: int = 0
+    completed_first_round_count: int = 0
+    failed_first_round_count: int = 0
+    human_reviewed_count: int = 0
+    average_human_accuracy: float = 0
+    total_tokens: int = 0
+    first_pass_valid_count: int = 0
 
 
 class AIAnnotationMetricsResponse(BaseModel):
@@ -557,6 +737,7 @@ class AIAnnotationMetricsResponse(BaseModel):
     final_differences: list[AIAnnotationMetricDifference] = Field(default_factory=list)
     daily: list[AIAnnotationDailyMetric] = Field(default_factory=list)
     records: list[AIAnnotationMetricsRecord] = Field(default_factory=list)
+    by_provider_model: list[AIAnnotationProviderModelMetrics] = Field(default_factory=list)
 
 
 class ExtractionDraftUpdateRequest(BaseModel):

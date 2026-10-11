@@ -20,13 +20,71 @@ from app.schemas.extraction_annotation import (
     AIAnnotationDailyMetric,
     AIAnnotationMetricDifference,
     AIAnnotationMetricError,
+    AIAnnotationMetricHumanReviewErrorType,
+    AIAnnotationMetricOmission,
     AIAnnotationMetricsRecord,
     AIAnnotationMetricsResponse,
     AIAnnotationMetricsSummary,
+    AIAnnotationProviderModelMetrics,
     AIAnnotationTokenUsage,
     AIAnnotationValidationIssue,
     ExtractionAnnotationLabel,
 )
+
+
+def _provider_model_metrics(
+    records: list[AIAnnotationMetricsRecord],
+) -> list[AIAnnotationProviderModelMetrics]:
+    grouped: dict[tuple[str, str], list[AIAnnotationMetricsRecord]] = defaultdict(list)
+    for item in records:
+        grouped[(item.provider, item.model)].append(item)
+    rows: list[AIAnnotationProviderModelMetrics] = []
+    for (provider, model), items in grouped.items():
+        completed = [
+            item
+            for item in items
+            if item.first_round_validation_status in {"valid", "invalid_format", "invalid_rules"}
+            or (
+                item.first_round_finished_at is not None
+                and item.first_round_validation_status != "failed"
+            )
+        ]
+        failed_first_round_count = sum(
+            item.first_round_validation_status == "failed"
+            or (
+                item.first_round_finished_at is None
+                and item.status == "failed"
+            )
+            for item in items
+        )
+        submitted_human_reviews = [
+            item for item in items if item.human_review_status == "submitted"
+        ]
+        scored_human_reviews = [
+            item for item in submitted_human_reviews if item.human_review_accuracy is not None
+        ]
+        rows.append(
+            AIAnnotationProviderModelMetrics(
+                provider=provider,
+                model=model,
+                session_count=len(items),
+                completed_first_round_count=len(completed),
+                failed_first_round_count=failed_first_round_count,
+                first_pass_valid_count=sum(
+                    item.first_round_validation_status == "valid" for item in items
+                ),
+                human_reviewed_count=len(submitted_human_reviews),
+                average_human_accuracy=(
+                    sum(item.human_review_accuracy or 0 for item in scored_human_reviews)
+                    / len(scored_human_reviews)
+                    if scored_human_reviews
+                    else 0
+                ),
+                total_tokens=sum(item.token_usage.total_tokens for item in items),
+            )
+        )
+    rows.sort(key=lambda item: (-item.session_count, item.provider, item.model))
+    return rows
 
 
 _DIFFERENCE_LABELS = {
@@ -169,7 +227,12 @@ def _final_differences(
         if not isinstance(first_payload, dict):
             return max(int(root.final_difference_count or 0), 0), stored
 
-        first_label = ExtractionAnnotationLabel.model_validate(first_payload)
+        from app.services.extraction_ai_annotation_service import load_model_keeping_original
+
+        first_label, _schema_issues = load_model_keeping_original(
+            ExtractionAnnotationLabel,
+            first_payload,
+        )
         final_label = ExtractionAnnotationLabel.model_validate(
             _json_object(submission.label_json)
         )
@@ -182,6 +245,180 @@ def _final_differences(
         return len(differences), dict(counts)
     except Exception:
         return max(int(root.final_difference_count or 0), 0), stored
+
+
+def _fallback_review_error_category(item_id: str) -> str:
+    """给无法按当前 Schema 还原的历史检查项提供稳定的兜底分类。"""
+
+    if item_id.startswith("passage:"):
+        return "材料"
+    if item_id.startswith("person:"):
+        if ":mention:" in item_id:
+            return "证据"
+        if ":event-check:" in item_id:
+            return "事件"
+        return "人物"
+    if item_id.startswith("event:"):
+        return "证据" if ":evidence" in item_id else "事件"
+    if item_id.startswith("history:"):
+        return "证据" if ":evidence" in item_id else "历史事件"
+    if item_id.startswith("relation:"):
+        return "证据" if ":evidence" in item_id else "关系"
+    if item_id.startswith("aux:"):
+        return "证据" if ":evidence" in item_id else "异常"
+    return "其他"
+
+
+def _scored_review_decisions(
+    review: ExtractionAIAnnotationReview | None,
+) -> list[dict[str, Any]]:
+    if review is None:
+        return []
+    return [
+        item
+        for item in _json_list(review.decisions_json)
+        if isinstance(item, dict)
+        and not str(item.get("item_id") or item.get("id") or "").startswith("coverage:")
+    ]
+
+
+def _human_review_score(
+    review: ExtractionAIAnnotationReview | None,
+) -> tuple[int, int, float | None]:
+    """按逐项记录重算，避免旧行的覆盖检查与缺漏污染正确率。"""
+
+    if review is None:
+        return 0, 0, None
+    decisions = _scored_review_decisions(review)
+    if not decisions:
+        # 旧行只剩汇总计数时，无法从中扣除覆盖检查；不展示伪精确值。
+        return 0, 0, None
+    correct = sum(item.get("verdict") == "correct" for item in decisions)
+    incorrect = sum(item.get("verdict") == "incorrect" for item in decisions)
+    denominator = correct + incorrect
+    return correct, incorrect, round(correct / denominator, 4) if denominator else None
+
+
+_OMISSION_CATEGORY_BY_ADDITION_TYPE = {
+    "person": "人物缺漏",
+    "life_event": "事件缺漏",
+    "historical_event": "历史事件缺漏",
+    "person_relation": "关系缺漏",
+    "evidence": "证据缺漏",
+    "schema_conflict": "结构增补",
+    "note": "其他缺漏",
+    "excluded_mention": "其他缺漏",
+    "unresolved_item": "其他缺漏",
+}
+
+
+def _human_review_omissions(
+    review: ExtractionAIAnnotationReview | None,
+) -> tuple[int, dict[str, int], list[AIAnnotationMetricOmission]]:
+    if review is None:
+        return 0, {}, []
+    entries: list[AIAnnotationMetricOmission] = []
+    for item in _json_list(review.omissions_json):
+        if not isinstance(item, dict):
+            continue
+        category = str(item.get("category") or "").strip() or _OMISSION_CATEGORY_BY_ADDITION_TYPE.get(
+            str(item.get("addition_type") or "note"), "其他缺漏"
+        )
+        description = str(item.get("description") or "").strip()
+        correction = str(item.get("correction") or "").strip()
+        target_path = str(item.get("target_path") or "").strip()
+        entries.append(
+            AIAnnotationMetricOmission(
+                category=category,
+                target_path=target_path,
+                description=description or correction or target_path or "历史记录未保存具体缺漏内容",
+                correction=correction if correction != description else "",
+            )
+        )
+    stored_count = max(int(review.omission_count or 0), 0)
+    if stored_count > len(entries):
+        entries.append(
+            AIAnnotationMetricOmission(
+                category="历史缺漏（未分类）",
+                description="历史记录未保存具体缺漏内容",
+                count=stored_count - len(entries),
+            )
+        )
+    categories: Counter[str] = Counter()
+    for entry in entries:
+        categories[entry.category] += entry.count
+    return sum(categories.values()), dict(sorted(categories.items())), entries
+
+
+def _human_review_error_breakdown(
+    root: ExtractionAIAnnotationJob,
+    review: ExtractionAIAnnotationReview | None,
+) -> tuple[dict[str, int], list[AIAnnotationMetricHumanReviewErrorType]]:
+    """统计人工质检中选择“否”的类别和具体检查字段。"""
+
+    if review is None:
+        return {}, []
+
+    incorrect_item_ids = [
+        str(item.get("item_id") or item.get("id") or "").strip()
+        for item in _scored_review_decisions(review)
+        if item.get("verdict") == "incorrect"
+    ]
+    incorrect_item_ids = [item_id for item_id in incorrect_item_ids if item_id]
+    if not incorrect_item_ids:
+        return {}, []
+
+    item_metadata: dict[str, tuple[str, str]] = {}
+    try:
+        result = _json_object(root.result_json)
+        label_payload = result.get("label")
+        if not isinstance(label_payload, dict):
+            document = result.get("document")
+            label_payload = document.get("label") if isinstance(document, dict) else None
+        if isinstance(label_payload, dict):
+            from app.services.extraction_ai_annotation_review_service import (
+                build_ai_annotation_review_items,
+            )
+
+            from app.services.extraction_ai_annotation_service import load_model_keeping_original
+
+            label, _schema_issues = load_model_keeping_original(
+                ExtractionAnnotationLabel,
+                label_payload,
+            )
+            item_metadata = {
+                item.id: (item.category, item.field_label or item.title)
+                for item in build_ai_annotation_review_items(label)
+            }
+    except Exception:
+        # 历史结果可能不再满足当前 Schema；仍按稳定 item_id 给出统计。
+        item_metadata = {}
+
+    category_counts: Counter[str] = Counter()
+    type_counts: Counter[tuple[str, str]] = Counter()
+    for item_id in incorrect_item_ids:
+        category, field_label = item_metadata.get(
+            item_id,
+            (_fallback_review_error_category(item_id), item_id),
+        )
+        category_counts[category] += 1
+        type_counts[(category, field_label)] += 1
+
+    categories = dict(
+        sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
+    )
+    error_types = [
+        AIAnnotationMetricHumanReviewErrorType(
+            category=category,
+            field_label=field_label,
+            count=count,
+        )
+        for (category, field_label), count in sorted(
+            type_counts.items(),
+            key=lambda item: (-item[1], item[0][0], item[0][1]),
+        )
+    ]
+    return categories, error_types
 
 
 class ExtractionAIAnnotationMetricsService:
@@ -214,6 +451,7 @@ class ExtractionAIAnnotationMetricsService:
             job
             for job in jobs
             if job.operation == "generate"
+            and getattr(job, "cloned_from_job_id", None) is None
             and (cutoff is None or (_utc(job.created_at) or now) >= cutoff)
         ]
         roots.sort(key=lambda item: (_utc(item.created_at) or now), reverse=True)
@@ -328,8 +566,28 @@ class ExtractionAIAnnotationMetricsService:
                 else None
             )
             human_review_submitted_at = (
-                _utc(human_review.submitted_at) if human_review is not None else None
+                _utc(
+                    human_review.submitted_at
+                    or (
+                        human_review.updated_at
+                        if human_review.status == "submitted"
+                        else None
+                    )
+                )
+                if human_review is not None
+                else None
             )
+            human_review_error_categories, human_review_error_types = (
+                _human_review_error_breakdown(root, human_review)
+            )
+            human_review_correct, human_review_incorrect, human_review_accuracy = (
+                _human_review_score(human_review)
+            )
+            (
+                human_review_omission_count,
+                human_review_omission_categories,
+                human_review_omissions,
+            ) = _human_review_omissions(human_review)
             ai_imported_at = (
                 _utc(submission.ai_imported_at) if submission is not None else None
             )
@@ -385,20 +643,14 @@ class ExtractionAIAnnotationMetricsService:
                 human_review_status=(
                     human_review.status if human_review is not None else "not_started"
                 ),
-                human_review_accuracy=(
-                    human_review.accuracy_basis_points / 10_000
-                    if human_review is not None
-                    else None
-                ),
-                human_review_correct_count=(
-                    human_review.correct_count if human_review is not None else 0
-                ),
-                human_review_incorrect_count=(
-                    human_review.incorrect_count if human_review is not None else 0
-                ),
-                human_review_omission_count=(
-                    human_review.omission_count if human_review is not None else 0
-                ),
+                human_review_accuracy=human_review_accuracy,
+                human_review_correct_count=human_review_correct,
+                human_review_incorrect_count=human_review_incorrect,
+                human_review_omission_count=human_review_omission_count,
+                human_review_error_categories=human_review_error_categories,
+                human_review_error_types=human_review_error_types,
+                human_review_omission_categories=human_review_omission_categories,
+                human_review_omissions=human_review_omissions,
                 human_review_submitted_at=(
                     human_review_submitted_at
                 ),
@@ -461,6 +713,12 @@ class ExtractionAIAnnotationMetricsService:
         submitted_human_reviews = [
             item for item in records if item.human_review_status == "submitted"
         ]
+        scored_human_reviews = [
+            item for item in submitted_human_reviews if item.human_review_accuracy is not None
+        ]
+        human_omission_categories: Counter[str] = Counter()
+        for item in submitted_human_reviews:
+            human_omission_categories.update(item.human_review_omission_categories)
         summary = AIAnnotationMetricsSummary(
             session_count=session_count,
             completed_first_round_count=completed_count,
@@ -510,10 +768,11 @@ class ExtractionAIAnnotationMetricsService:
             total_first_round_errors=sum(len(item.first_round_errors) for item in records),
             total_final_differences=sum(item.final_difference_count for item in records),
             human_reviewed_count=len(submitted_human_reviews),
+            human_scored_count=len(scored_human_reviews),
             average_human_accuracy=(
-                sum(item.human_review_accuracy or 0 for item in submitted_human_reviews)
-                / len(submitted_human_reviews)
-                if submitted_human_reviews
+                sum(item.human_review_accuracy or 0 for item in scored_human_reviews)
+                / len(scored_human_reviews)
+                if scored_human_reviews
                 else 0
             ),
             total_human_correct=sum(
@@ -525,6 +784,7 @@ class ExtractionAIAnnotationMetricsService:
             total_human_omissions=sum(
                 item.human_review_omission_count for item in submitted_human_reviews
             ),
+            human_omission_categories=dict(sorted(human_omission_categories.items())),
         )
         validation_errors = [
             AIAnnotationMetricError(
@@ -554,5 +814,6 @@ class ExtractionAIAnnotationMetricsService:
             validation_errors=validation_errors,
             final_differences=final_differences,
             daily=daily,
+            by_provider_model=_provider_model_metrics(records),
             records=records[:limit],
         )

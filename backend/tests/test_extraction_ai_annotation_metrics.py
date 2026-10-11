@@ -179,6 +179,12 @@ def test_ai_metrics_track_click_tokens_errors_repairs_and_final_submission(metri
 
     final_label = reimported.submission.label.model_copy(deep=True)
     final_label.passage.note = "人工核对后补充"
+    final_label.step_reviews = {
+        "material": True,
+        "persons": True,
+        "relations": True,
+        "checks": True,
+    }
     submitted = task_service.submit(
         task_id,
         annotator,
@@ -290,3 +296,111 @@ def test_background_job_persists_usage_and_first_round_snapshot(metrics_db, monk
     assert json.loads(saved.first_round_errors_json)[0]["code"] == "test_first_round_error"
     assert saved.first_round_warning_count == 1
     assert saved.first_round_truncated_count == 1
+
+
+def test_ai_metrics_exclude_legacy_coverage_and_report_omissions_separately(metrics_db):
+    db, task_id, annotator = metrics_db
+    passage_id = db.query(Passage.doc_id).scalar()
+    root = ExtractionAIAnnotationJob(
+        task_id=task_id,
+        passage_id=passage_id,
+        requested_by=annotator.id,
+        operation="generate",
+        status="success",
+        result_json="{}",
+        first_round_validation_status="valid",
+    )
+    db.add(root)
+    db.flush()
+    review = ExtractionAIAnnotationReview(
+        generation_job_id=root.id,
+        task_id=task_id,
+        passage_id=passage_id,
+        reviewer_id=annotator.id,
+        status="submitted",
+        standard_version="legacy-with-coverage",
+        decisions_json=json.dumps(
+            [
+                {"item_id": "coverage:persons", "verdict": "correct"},
+                {"item_id": "coverage:events", "verdict": "incorrect"},
+                {"item_id": "passage:source_type", "verdict": "correct"},
+                {"item_id": "person:p1:name", "verdict": "incorrect"},
+            ]
+        ),
+        omissions_json=json.dumps(
+            [
+                {"category": "人物缺漏", "target_path": "persons", "description": "遗漏李白之子"},
+                {"category": "关系缺漏", "target_path": "relations", "description": "遗漏父子关系", "correction": "李白与其子的父子关系"},
+            ],
+            ensure_ascii=False,
+        ),
+        # 老数据的预存口径把覆盖检查及缺漏都放进了正确率。
+        correct_count=2,
+        incorrect_count=2,
+        omission_count=2,
+        accuracy_basis_points=3333,
+    )
+    db.add(review)
+    db.commit()
+
+    metrics = ExtractionAIAnnotationMetricsService(db).get_metrics(days=0)
+    record = metrics.records[0]
+    assert record.human_review_correct_count == 1
+    assert record.human_review_incorrect_count == 1
+    assert record.human_review_accuracy == 0.5
+    assert record.human_review_error_categories == {"人物": 1}
+    assert record.human_review_omission_count == 2
+    assert record.human_review_omission_categories == {"人物缺漏": 1, "关系缺漏": 1}
+    assert [item.description for item in record.human_review_omissions] == [
+        "遗漏李白之子", "遗漏父子关系"
+    ]
+    assert record.human_review_omissions[1].correction == "李白与其子的父子关系"
+    assert metrics.summary.average_human_accuracy == 0.5
+    assert metrics.summary.human_scored_count == 1
+    assert metrics.summary.total_human_correct == 1
+    assert metrics.summary.total_human_incorrect == 1
+    assert metrics.summary.total_human_omissions == 2
+    assert metrics.summary.human_omission_categories == {"人物缺漏": 1, "关系缺漏": 1}
+
+
+def test_ai_metrics_do_not_guess_accuracy_when_legacy_decisions_are_missing(metrics_db):
+    db, task_id, annotator = metrics_db
+    passage_id = db.query(Passage.doc_id).scalar()
+    root = ExtractionAIAnnotationJob(
+        task_id=task_id,
+        passage_id=passage_id,
+        requested_by=annotator.id,
+        operation="generate",
+        status="success",
+        result_json="{}",
+    )
+    db.add(root)
+    db.flush()
+    db.add(
+        ExtractionAIAnnotationReview(
+            generation_job_id=root.id,
+            task_id=task_id,
+            passage_id=passage_id,
+            reviewer_id=annotator.id,
+            status="submitted",
+            standard_version="legacy-summary-only",
+            decisions_json="[]",
+            omissions_json="[]",
+            correct_count=4,
+            incorrect_count=1,
+            omission_count=2,
+            accuracy_basis_points=6667,
+        )
+    )
+    db.commit()
+
+    metrics = ExtractionAIAnnotationMetricsService(db).get_metrics(days=0)
+    record = metrics.records[0]
+    assert record.human_review_accuracy is None
+    assert record.human_review_correct_count == 0
+    assert record.human_review_incorrect_count == 0
+    assert record.human_review_omission_count == 2
+    assert record.human_review_omission_categories == {"历史缺漏（未分类）": 2}
+    assert record.human_review_omissions[0].count == 2
+    assert metrics.summary.human_scored_count == 0
+    assert metrics.summary.human_omission_categories == {"历史缺漏（未分类）": 2}

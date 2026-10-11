@@ -2,9 +2,19 @@ import apiClient from './client'
 
 export const EVENT_TYPES = ['出生', '籍贯', '死亡', '埋葬', '任职'] as const
 export const RELATION_CODES = ['F', 'M', 'S', 'D', 'H', 'W', 'Z', 'C', 'B', 'O'] as const
+export const RELATION_CATEGORIES = [
+  '亲属', '教授与传承', '隶属与任用', '合作与援助',
+  '交游与往来', '对抗与冲突', '其他',
+] as const
+export const OMISSION_CATEGORIES = [
+  '人物缺漏', '等级缺漏', '属性缺漏', '事件缺漏', '时间缺漏', '地点缺漏',
+  '官职缺漏', '历史事件缺漏', '关系缺漏', '证据缺漏', '其他缺漏',
+] as const
 
 export type EventType = (typeof EVENT_TYPES)[number]
 export type RelationCode = (typeof RELATION_CODES)[number]
+export type RelationCategory = (typeof RELATION_CATEGORIES)[number]
+export type OmissionCategory = (typeof OMISSION_CATEGORIES)[number]
 export type CheckState = 'unreviewed' | 'has_fact' | 'not_mentioned' | 'uncertain' | 'unsupported'
 export type FactState = 'confirmed' | 'uncertain' | 'unsupported'
 export type FieldState = 'present' | 'not_mentioned' | 'not_applicable' | 'uncertain' | 'unsupported'
@@ -93,6 +103,8 @@ export interface PersonRelationAnnotation {
   key: string
   source_person_key: string
   target_person_key: string
+  relation_category: RelationCategory | ''
+  relation_summary: string
   codes: RelationCode[]
   reverse_codes: RelationCode[]
   note: string
@@ -121,14 +133,27 @@ export interface SchemaConflict {
   evidence: EvidenceSpan[]
 }
 
+export interface AnnotationOmission {
+  key: string
+  category: OmissionCategory | ''
+  description: string
+  target_path: string
+  evidence: EvidenceSpan[]
+  evidence_note: string
+  resolution: 'open' | 'resolved' | 'unsupported'
+  resolution_note: string
+}
+
 export interface ExtractionAnnotationLabel {
   schema_version: string
+  step_reviews: Record<'material' | 'persons' | 'relations' | 'checks', boolean>
   passage: PassageAnnotation
   persons: PersonAnnotation[]
   person_relations: PersonRelationAnnotation[]
   excluded_mentions: ExcludedMention[]
   unresolved_items: UnresolvedItem[]
   schema_conflicts: SchemaConflict[]
+  omissions: AnnotationOmission[]
 }
 
 export interface ExtractionTaskSummary {

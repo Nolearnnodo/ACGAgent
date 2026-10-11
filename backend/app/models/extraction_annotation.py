@@ -28,7 +28,7 @@ class ExtractionAnnotationTask(Base):
         index=True,
     )
     context_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    spec_version: Mapped[str] = mapped_column(String(32), nullable=False, default="0.2.0")
+    spec_version: Mapped[str] = mapped_column(String(32), nullable=False, default="0.3.0")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open", index=True)
     required_annotation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)

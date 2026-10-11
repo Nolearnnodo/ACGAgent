@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onActivated, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 
 import { getApiErrorMessage } from '../api/client'
@@ -38,14 +38,18 @@ const maxFinalDifferences = computed(() => Math.max(
   1,
   ...(metrics.value?.final_differences?.map((item) => item.count) ?? [1]),
 ))
+const maxHumanOmissions = computed(() => Math.max(
+  1,
+  ...Object.values(metrics.value?.summary.human_omission_categories ?? {}),
+))
 
 const visibleRecords = computed(() => {
   const keyword = searchQuery.value.trim().toLocaleLowerCase()
   return (metrics.value?.records ?? []).filter((record) => {
-    if (recordFilter.value === 'submitted' && !record.submitted_at) return false
+    if (recordFilter.value === 'submitted' && record.human_review_status !== 'submitted') return false
     if (
       recordFilter.value === 'pending'
-      && (record.submitted_at || record.first_round_validation_status === 'failed')
+      && (record.human_review_status === 'submitted' || record.first_round_validation_status === 'failed')
     ) return false
     if (
       recordFilter.value === 'failed'
@@ -143,11 +147,33 @@ function firstRoundLabel(status: string) {
 }
 
 function sessionState(record: AIAnnotationMetricsRecord) {
-  if (record.submitted_at) return '已提交'
   if (record.status === 'failed' || record.first_round_validation_status === 'failed') return '失败'
-  if (record.status === 'queued') return '排队中'
-  if (record.status === 'running') return '执行中'
-  return '待提交'
+  if (record.human_review_status === 'submitted') return '质检已提交'
+  if (record.human_review_status === 'draft') return '质检中'
+  if (record.status === 'queued') return 'AI 排队中'
+  if (record.status === 'running') return 'AI 执行中'
+  return '待质检'
+}
+
+function humanReviewDenominator(record: AIAnnotationMetricsRecord) {
+  return record.human_review_correct_count
+    + record.human_review_incorrect_count
+}
+
+function humanReviewErrorCategories(record: AIAnnotationMetricsRecord) {
+  return Object.entries(record.human_review_error_categories ?? {})
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], 'zh-CN'))
+}
+
+function humanReviewOmissionCategories(record: AIAnnotationMetricsRecord) {
+  return Object.entries(record.human_review_omission_categories ?? {})
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], 'zh-CN'))
+}
+
+function humanReviewOmissionSummary(record: AIAnnotationMetricsRecord) {
+  return humanReviewOmissionCategories(record)
+    .map(([category, count]) => `${category} ${count}`)
+    .join(' · ')
 }
 
 function toggleRecord(sessionId: number) {
@@ -171,7 +197,7 @@ watch(days, () => {
   void loadMetrics()
 })
 
-onMounted(() => {
+onActivated(() => {
   void loadMetrics()
 })
 </script>
@@ -217,12 +243,12 @@ onMounted(() => {
           <article>
             <span>生成会话</span>
             <strong>{{ formatNumber(summary?.session_count) }}</strong>
-            <small>{{ formatNumber(summary?.submitted_count) }} 次已提交</small>
+            <small>{{ formatNumber(summary?.submitted_count) }} 篇盲标已最终提交</small>
           </article>
           <article>
-            <span>人工首轮正确率</span>
-            <strong>{{ formatPercent(summary?.average_human_accuracy) }}</strong>
-            <small>{{ formatNumber(summary?.human_reviewed_count) }} 次已质检 · 规则通过 {{ formatPercent(summary?.first_pass_valid_rate) }}</small>
+            <span>平均人工正确率</span>
+            <strong>{{ summary?.human_scored_count ? formatPercent(summary.average_human_accuracy) : '—' }}</strong>
+            <small>{{ formatNumber(summary?.human_scored_count) }} 篇可计算 / {{ formatNumber(summary?.human_reviewed_count) }} 篇已质检 · 缺漏 {{ formatNumber(summary?.total_human_omissions) }} 项另计</small>
           </article>
           <article>
             <span>人工处理耗时</span>
@@ -315,6 +341,20 @@ onMounted(() => {
             </div>
             <div class="difference-block">
               <div class="difference-block__title">
+                <span>独立缺漏 / 结构增补</span>
+                <strong>{{ formatNumber(summary?.total_human_omissions) }} 项</strong>
+              </div>
+              <div v-if="Object.keys(summary?.human_omission_categories ?? {}).length" class="difference-bars">
+                <div v-for="(count, category) in summary?.human_omission_categories" :key="category">
+                  <span>{{ category }}</span>
+                  <i><b :style="{ width: barWidth(count, maxHumanOmissions) }" /></i>
+                  <strong>{{ count }}</strong>
+                </div>
+              </div>
+              <p v-else>已提交质检尚无缺漏记录。</p>
+            </div>
+            <div class="difference-block">
+              <div class="difference-block__title">
                 <span>首轮 → 最终提交</span>
                 <strong>{{ formatNumber(summary?.total_final_differences) }} 处修改</strong>
               </div>
@@ -330,20 +370,61 @@ onMounted(() => {
           </div>
         </section>
 
+        <section class="records-panel model-panel">
+          <header class="records-heading">
+            <div>
+              <span>BY MODEL</span>
+              <h3>按模型</h3>
+              <p>同一服务与模型的首轮生成汇总。平均正确率只计算已评分的已提交质检。</p>
+            </div>
+          </header>
+          <div v-if="!(metrics?.by_provider_model?.length)" class="table-state">当前范围没有可按模型汇总的记录。</div>
+          <div v-else class="record-table-wrap">
+            <table class="record-table model-table">
+              <thead>
+                <tr>
+                  <th>服务</th>
+                  <th>模型</th>
+                  <th>会话</th>
+                  <th>完成首轮</th>
+                  <th>失败首轮</th>
+                  <th>首轮即通过</th>
+                  <th>已提交质检</th>
+                  <th>平均正确率</th>
+                  <th>Token</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in metrics?.by_provider_model ?? []" :key="`${row.provider}::${row.model}`">
+                  <td>{{ row.provider || '服务端默认' }}</td>
+                  <td>{{ row.model || '默认模型' }}</td>
+                  <td>{{ formatNumber(row.session_count) }}</td>
+                  <td>{{ formatNumber(row.completed_first_round_count) }}</td>
+                  <td>{{ formatNumber(row.failed_first_round_count) }}</td>
+                  <td>{{ formatNumber(row.first_pass_valid_count) }}</td>
+                  <td>{{ formatNumber(row.human_reviewed_count) }}</td>
+                  <td>{{ formatPercent(row.average_human_accuracy) }}</td>
+                  <td>{{ formatNumber(row.total_tokens) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <section class="records-panel">
           <header class="records-heading">
             <div>
               <span>SESSION LOG</span>
-              <h3>逐次标注记录</h3>
-              <p>人工处理从首次质检或 AI 成功导入中较早的时间开始，计至最终提交。</p>
+              <h3>逐篇 AI 标注质检</h3>
+              <p>正确率只统计已有标注检查项的对错；全文覆盖检查与缺漏、结构增补单独列出。</p>
             </div>
             <div class="record-tools">
-              <div class="filter-tabs" aria-label="提交状态筛选">
+              <div class="filter-tabs" aria-label="人工质检状态筛选">
                 <button
                   v-for="item in ([
                     ['all', '全部'],
-                    ['submitted', '已提交'],
-                    ['pending', '待提交'],
+                    ['submitted', '质检已提交'],
+                    ['pending', '待质检'],
                     ['failed', '失败'],
                   ] as [RecordFilter, string][] )"
                   :key="item[0]"
@@ -375,7 +456,10 @@ onMounted(() => {
                 <tr>
                   <th>会话 / 篇目</th>
                   <th>标注人</th>
-                  <th>首轮质量</th>
+                  <th>人工正确率</th>
+                  <th>判否错误类型</th>
+                  <th>缺漏 / 结构增补</th>
+                  <th>AI 首轮质量</th>
                   <th>人工处理</th>
                   <th>Token</th>
                   <th>修复</th>
@@ -401,13 +485,53 @@ onMounted(() => {
                       <span>{{ record.provider || '默认 Provider' }} · {{ record.model || '默认模型' }}</span>
                     </td>
                     <td>
+                      <strong v-if="record.human_review_status === 'submitted' && record.human_review_accuracy !== null" class="review-accuracy">
+                        {{ formatPercent(record.human_review_accuracy) }}
+                      </strong>
+                      <strong v-else>—</strong>
+                      <span v-if="record.human_review_status === 'submitted' && record.human_review_accuracy !== null">
+                        正确 {{ record.human_review_correct_count }} / {{ humanReviewDenominator(record) }}
+                        · {{ formatDate(record.human_review_submitted_at) }}
+                      </span>
+                      <span v-else-if="record.human_review_status === 'submitted'">历史记录缺少逐项判定</span>
+                      <span v-else>{{ record.human_review_status === 'draft' ? '质检中' : '尚未质检' }}</span>
+                    </td>
+                    <td>
+                      <div
+                        v-if="record.human_review_status === 'submitted' && humanReviewErrorCategories(record).length"
+                        class="error-type-tags"
+                      >
+                        <span
+                          v-for="([category, count]) in humanReviewErrorCategories(record).slice(0, 3)"
+                          :key="category"
+                        >{{ category }} {{ count }}</span>
+                      </div>
+                      <strong v-else-if="record.human_review_status === 'submitted' && record.human_review_accuracy === null">不可还原</strong>
+                      <strong v-else-if="record.human_review_status === 'submitted'" class="no-review-errors">无判否</strong>
+                      <strong v-else>—</strong>
+                      <span v-if="humanReviewErrorCategories(record).length > 3">
+                        另 {{ humanReviewErrorCategories(record).length - 3 }} 类
+                      </span>
+                      <span v-else-if="record.human_review_status === 'submitted' && record.human_review_accuracy === null">历史记录缺少逐项判定</span>
+                      <span v-else-if="record.human_review_status === 'submitted'">
+                        共 {{ record.human_review_incorrect_count }} 项
+                      </span>
+                    </td>
+                    <td>
+                      <strong v-if="record.human_review_status === 'submitted' && record.human_review_omission_count">
+                        {{ record.human_review_omission_count }} 项缺漏
+                      </strong>
+                      <strong v-else-if="record.human_review_status === 'submitted'" class="no-review-errors">无缺漏</strong>
+                      <strong v-else>—</strong>
+                      <span v-if="record.human_review_omission_count">
+                        {{ humanReviewOmissionSummary(record) }}
+                      </span>
+                    </td>
+                    <td>
                       <b class="quality" :data-status="record.first_round_validation_status">
                         {{ firstRoundLabel(record.first_round_validation_status) }}
                       </b>
-                      <span v-if="record.human_review_status === 'submitted'">
-                        人工 {{ formatPercent(record.human_review_accuracy) }} · 错 {{ record.human_review_incorrect_count }} / 漏 {{ record.human_review_omission_count }}
-                      </span>
-                      <span v-else>{{ record.first_round_errors.length }} 规则错误 · {{ record.final_difference_count }} 修改</span>
+                      <span>{{ record.first_round_errors.length }} 规则错误 · {{ record.final_difference_count }} 修改</span>
                     </td>
                     <td>
                       <strong>{{ formatDuration(record.human_processing_elapsed_ms) }}</strong>
@@ -423,11 +547,12 @@ onMounted(() => {
                     </td>
                     <td>
                       <b class="session-state" :data-state="sessionState(record)">{{ sessionState(record) }}</b>
+                      <span>盲标{{ record.submitted_at ? '已提交' : '未提交' }}</span>
                     </td>
                     <td><i class="chevron">⌄</i></td>
                   </tr>
                   <tr v-if="expandedSessionId === record.session_id" class="record-detail-row">
-                    <td colspan="8">
+                    <td colspan="11">
                       <div class="record-detail">
                         <div class="lifecycle">
                           <div>
@@ -489,13 +614,33 @@ onMounted(() => {
                             </dl>
                           </section>
                           <section>
-                            <span>FIRST-ROUND ISSUES</span>
-                            <p v-if="record.human_review_status === 'submitted'" class="human-review-summary">
-                              人工首轮正确率 {{ formatPercent(record.human_review_accuracy) }}：
+                            <span>HUMAN REVIEW REJECTIONS</span>
+                            <p v-if="record.human_review_status === 'submitted' && record.human_review_accuracy !== null" class="human-review-summary">
+                              本篇正确率 {{ formatPercent(record.human_review_accuracy) }}：
                               {{ record.human_review_correct_count }} 项正确，
-                              {{ record.human_review_incorrect_count }} 项错误，
-                              {{ record.human_review_omission_count }} 项缺漏。
+                              {{ record.human_review_incorrect_count }} 项判否。
                             </p>
+                            <p v-else-if="record.human_review_status === 'submitted'" class="detail-empty">历史记录缺少逐项判定，无法按当前口径重算正确率。</p>
+                            <ul v-if="record.human_review_status === 'submitted' && record.human_review_error_types.length" class="human-error-list">
+                              <li
+                                v-for="item in record.human_review_error_types"
+                                :key="`${item.category}:${item.field_label}`"
+                              >
+                                <span>{{ item.category }}</span>
+                                <strong>{{ item.field_label }}</strong>
+                                <b>×{{ item.count }}</b>
+                              </li>
+                            </ul>
+                            <p v-else-if="record.human_review_status === 'submitted' && record.human_review_accuracy === null" class="detail-empty">判否错误类型无法从历史记录还原。</p>
+                            <p v-else-if="record.human_review_status === 'submitted'" class="detail-empty">
+                              人工质检没有选择“否”。
+                            </p>
+                            <p v-else class="detail-empty">
+                              {{ record.human_review_status === 'draft' ? '质检尚未提交，暂不展示正确率与判否统计。' : '本篇尚未开始人工质检。' }}
+                            </p>
+                          </section>
+                          <section>
+                            <span>FIRST-ROUND ISSUES</span>
                             <ul v-if="record.first_round_errors.length">
                               <li v-for="issue in record.first_round_errors" :key="`${issue.path}:${issue.code}`">
                                 <code>{{ issue.code }}</code>
@@ -518,6 +663,23 @@ onMounted(() => {
                             </p>
                           </section>
                         </div>
+                        <section class="omission-detail">
+                          <header>
+                            <span>结构增补</span>
+                            <strong>缺漏明细 · {{ record.human_review_omission_count }} 项</strong>
+                            <small>单独统计，不进入人工正确率</small>
+                          </header>
+                          <ul v-if="record.human_review_omissions.length">
+                            <li v-for="(item, index) in record.human_review_omissions" :key="`${index}:${item.category}:${item.target_path}`">
+                              <b>{{ item.category }}</b>
+                              <span>{{ item.description }}</span>
+                              <em v-if="item.correction">补录：{{ item.correction }}</em>
+                              <code v-if="item.target_path">{{ item.target_path }}</code>
+                              <strong v-if="item.count > 1">×{{ item.count }}</strong>
+                            </li>
+                          </ul>
+                          <p v-else class="detail-empty">本篇没有登记缺漏或结构增补。</p>
+                        </section>
                       </div>
                     </td>
                   </tr>
@@ -640,6 +802,7 @@ onMounted(() => {
 .empty-state--compact { min-height: 78px; }
 
 .records-panel { margin-top: 22px; border-block: 1px solid var(--line); background: #fff; }
+.model-table { min-width: 860px; }
 .records-heading { padding: 18px 20px; border-bottom: 1px solid var(--line); }
 .records-heading p { margin: 5px 0 0; color: var(--muted); font-size: 9px; }
 .record-tools { display: flex; align-items: end; gap: 8px; }
@@ -651,25 +814,32 @@ onMounted(() => {
 .clear-button { height: 32px; border: 0; color: var(--blue); background: transparent; font-size: 9px; cursor: pointer; }
 
 .record-table-wrap { overflow-x: auto; }
-.record-table { width: 100%; min-width: 1000px; border-collapse: collapse; table-layout: fixed; }
+.record-table { width: 100%; min-width: 1450px; border-collapse: collapse; table-layout: fixed; }
 .record-table th { padding: 9px 12px; color: #929db2; background: #fafbfd; font-size: 8px; font-weight: 600; letter-spacing: .05em; text-align: left; }
-.record-table th:nth-child(1) { width: 21%; }
-.record-table th:nth-child(2) { width: 17%; }
-.record-table th:nth-child(3) { width: 13%; }
-.record-table th:nth-child(4) { width: 13%; }
-.record-table th:nth-child(5) { width: 12%; }
+.record-table th:nth-child(1) { width: 17%; }
+.record-table th:nth-child(2) { width: 12%; }
+.record-table th:nth-child(3) { width: 8%; }
+.record-table th:nth-child(4) { width: 11%; }
+.record-table th:nth-child(5) { width: 10%; }
 .record-table th:nth-child(6) { width: 9%; }
-.record-table th:nth-child(7) { width: 10%; }
-.record-table th:nth-child(8) { width: 4%; }
+.record-table th:nth-child(7) { width: 9%; }
+.record-table th:nth-child(8) { width: 9%; }
+.record-table th:nth-child(9) { width: 6%; }
+.record-table th:nth-child(10) { width: 7%; }
+.record-table th:nth-child(11) { width: 2%; }
 .record-row { border-top: 1px solid #edf0f5; cursor: pointer; outline: none; transition: background .16s ease; }
 .record-row:hover, .record-row:focus, .record-row.expanded { background: #f7faff; }
 .record-row td { height: 59px; padding: 9px 12px; vertical-align: middle; }
 .record-row td > strong, .record-row td > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .record-row td > strong { color: #344563; font-size: 10px; }
 .record-row td > span { margin-top: 4px; color: #8b97ad; font-size: 8px; }
+.record-row td > strong.review-accuracy { color: #2e8a63; font-size: 14px; letter-spacing: -.02em; }
+.record-row td > strong.no-review-errors { color: #3f7e62; }
+.error-type-tags { display: flex; flex-wrap: wrap; gap: 3px; }
+.error-type-tags span { padding: 3px 5px; border-radius: 4px; color: #9b4d52; background: #fff0f1; font-size: 8px; white-space: nowrap; }
 .quality, .session-state { display: inline-block; padding: 3px 6px; border-radius: 4px; color: #3f7e62; background: #edf8f3; font-size: 8px; }
 .quality[data-status='invalid_rules'], .quality[data-status='invalid_format'], .quality[data-status='failed'] { color: #a24c4c; background: #fff0f0; }
-.session-state[data-state='待提交'], .session-state[data-state='排队中'], .session-state[data-state='执行中'] { color: #966d25; background: #fff6e3; }
+.session-state[data-state='待质检'], .session-state[data-state='质检中'], .session-state[data-state='AI 排队中'], .session-state[data-state='AI 执行中'] { color: #966d25; background: #fff6e3; }
 .session-state[data-state='失败'] { color: #a24c4c; background: #fff0f0; }
 .chevron { display: block; color: #8895ac; font-style: normal; font-size: 15px; transform: rotate(0); transition: transform .2s ease; }
 .record-row.expanded .chevron { transform: rotate(180deg); }
@@ -690,7 +860,7 @@ onMounted(() => {
 .timing-breakdown span { color: var(--muted); font-size: 8px; }
 .timing-breakdown strong { overflow: hidden; color: #344563; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .timing-breakdown small { overflow: hidden; color: #8a96ad; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
-.detail-columns { display: grid; grid-template-columns: .7fr 1.35fr .8fr; gap: 22px; margin-top: 19px; padding-top: 16px; border-top: 1px solid #dfe6f1; }
+.detail-columns { display: grid; grid-template-columns: .65fr 1fr 1.2fr .75fr; gap: 22px; margin-top: 19px; padding-top: 16px; border-top: 1px solid #dfe6f1; }
 .detail-columns section { min-width: 0; }
 .detail-columns dl { display: grid; gap: 5px; margin: 10px 0 0; }
 .detail-columns dl div { display: flex; justify-content: space-between; gap: 12px; font-size: 9px; }
@@ -702,7 +872,24 @@ onMounted(() => {
 .detail-columns li strong { overflow: hidden; color: #566680; text-overflow: ellipsis; white-space: nowrap; }
 .detail-columns li p { grid-column: 1 / -1; margin: 0; color: var(--muted); }
 .human-review-summary { margin: 10px 0 0; padding: 7px 8px; border-left: 2px solid #3a9b70; background: #eef9f4; color: #3c705a; font-size: 9px; line-height: 1.55; }
+.detail-columns ul.human-error-list { max-height: 170px; }
+.detail-columns .human-error-list li { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 6px; }
+.human-error-list li > span { padding: 2px 5px; border-radius: 4px; color: #a14f55; background: #fff0f1; white-space: nowrap; }
+.human-error-list li > strong { color: #566680; font-size: 8px; white-space: normal; }
+.human-error-list li > b { color: #9f4950; font-size: 8px; }
 .detail-empty { margin: 10px 0 0; color: var(--muted); font-size: 9px; }
+.omission-detail { margin-top: 18px; padding-top: 16px; border-top: 1px solid #dfe6f1; }
+.omission-detail header { display: flex; align-items: baseline; gap: 10px; }
+.omission-detail header > span { color: var(--blue); font: 700 9px/1.2 ui-monospace, monospace; letter-spacing: .1em; }
+.omission-detail header > strong { font-size: 10px; }
+.omission-detail header > small { color: var(--muted); font-size: 9px; }
+.omission-detail ul { display: grid; gap: 5px; margin: 10px 0 0; padding: 0; list-style: none; }
+.omission-detail li { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 10px; padding: 7px 9px; border: 1px solid #e3e9f3; border-radius: 5px; background: #fff; font-size: 9px; }
+.omission-detail li b { color: #9b6424; white-space: nowrap; }
+.omission-detail li span { color: #344563; }
+.omission-detail li em { color: #526685; font-style: normal; }
+.omission-detail li code { color: var(--muted); }
+.omission-detail li strong { margin-left: auto; color: #9b6424; }
 .table-state { min-height: 160px; display: grid; place-content: center; color: var(--muted); font-size: 10px; }
 
 @keyframes page-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
