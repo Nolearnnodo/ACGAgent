@@ -5,7 +5,7 @@
 便于和简略提示词的产出进行对照。
 """
 
-AI_ANNOTATION_PROMPT_VERSION = "2026-09-26-v0.5.0"
+AI_ANNOTATION_PROMPT_VERSION = "2026-10-11-v0.6.0"
 
 
 AI_ANNOTATION_FORMAT_REQUIREMENTS = """输出必须满足下面的当前 ExtractionAnnotationLabel 格式契约。
@@ -154,8 +154,10 @@ AI_ANNOTATION_FORMAT_REVIEW_SYSTEM_PROMPT = """你是 ACGAgent 功能 A 的标�
 """ + AI_ANNOTATION_FORMAT_REQUIREMENTS
 
 
-# 远程抽取不再让模型一次性生成完整的 ExtractionAnnotationLabel。模型只输出
-# 一个语义分片；证据 id、UTF-16 偏移、稳定 key、默认字段和最终 wrapper 由服务端补齐。
+# 默认可一次输出完整 ExtractionAnnotationLabel。只有输入会超出上下文时，才按
+# 材料与人物、生平事件、历史事件、人物关系四类任务拆开。下面的分片提示词只给
+# 这种超窗拆分，以及按字段修复时使用。证据 id、UTF-16 偏移、稳定 key、默认字段
+# 和最终 wrapper 仍由服务端补齐。
 AI_ANNOTATION_FRAGMENT_COMMON_RULES = """你正在执行 ACGAgent 功能 A 的分片标注，不是生成完整导出文件。
 只允许使用输入中的 title/context 和系统明确提供的字典；禁止外部知识、常识补全、联网检索和猜测。
 只输出一个 JSON 对象，不要 Markdown、代码围栏、解释、思维过程或对象外文字。
@@ -251,6 +253,60 @@ AI_ANNOTATION_HISTORICAL_FRAGMENT_SYSTEM_PROMPT = AI_ANNOTATION_FRAGMENT_COMMON_
   }],
   "unresolved_items": [],
   "schema_conflicts": []
+}
+不要用朝代、年份、官职或外部史实猜测历史事件；三级人物不建立 historical_events。
+"""
+
+AI_ANNOTATION_LIFE_EVENTS_SYSTEM_PROMPT = AI_ANNOTATION_FRAGMENT_COMMON_RULES + """
+本次负责输入 persons 中全部人物的五类生平事件：出生、籍贯、死亡、埋葬、任职。
+不要只做其中一个事件类型，不要分析输入名单之外的人物，不要生成 historical_events 或 person_relations。
+每个人都要给出五个 event_checks。只有原文明确表达的该类型事实才写入 life_events；未提及写 not_mentioned，不要为了填满字段推断出生年、死亡日或埋葬地点。
+输出对象允许的结构如下：
+{
+  "persons": [{
+    "key": "输入中的人物键",
+    "event_checks": {"出生":"has_fact|not_mentioned|uncertain|unsupported","籍贯":"...","死亡":"...","埋葬":"...","任职":"..."},
+    "life_events": [{
+      "event_type": "出生|籍贯|死亡|埋葬|任职",
+      "state": "confirmed|uncertain|unsupported",
+      "time": {"state":"...","raw":"","era":"","era_year":null,"gregorian_year":null,"month_text":"","day_text":""},
+      "location": {"state":"...","raw":"","dao":"","fu":"","zhou":"","jun":"","xian":"","other":""},
+      "official_title": "仅任职事件填写",
+      "evidence": [{"quote":"","start":0,"end":0}],
+      "note": ""
+    }],
+    "unresolved_items": [],
+    "schema_conflicts": []
+  }]
+}
+
+event_checks 与 life_events、evidence 必须严格一致：
+- 只有找到能证明“该人物发生了该类事实”的正文原文证据时，才能把该类写成 has_fact。
+- 某个 event_check="has_fact" 时，life_events 必须有一条对应 event_type 的事件；该事件必须包含 1 至 8 条非空、可按 quote/start/end 回放的 evidence，证据需同时支持人物归属和该类事实，只有人物姓名或只有事件关键词都不够。
+- 找不到上述有效正文证据时，禁止填写 has_fact，也禁止编造、改写或用 title/外部知识代替证据；全文没有明确事实时填写 not_mentioned 且不要为该类建 life_events，有相关文字但事实或归属不能确定时填写 uncertain。
+籍贯事件的 time 必须是 state=not_applicable 且其余时间字段为空/null；任职事件必须填写原文官职，其他事件 official_title 必须为空。
+不要把婚姻、迁居、受封、考试、战斗等塞进这五类；无法无损表示的事实写入 unresolved_items 或 schema_conflicts。
+"""
+
+AI_ANNOTATION_HISTORICAL_EVENTS_SYSTEM_PROMPT = AI_ANNOTATION_FRAGMENT_COMMON_RULES + """
+本次负责输入 persons 中全部人物的历史事件关联，不要生成生平事件或人物关系，不要分析名单之外的人物。
+只有正文明确指向具体历史事件且同时说明该人物作用时才建立条目；“从征”“有功”等泛称不足以单独建立历史事件。
+没有历史事件的人物仍要返回，historical_events 用空数组。
+输出对象允许的结构如下：
+{
+  "persons": [{
+    "key": "输入中的人物键",
+    "historical_events": [{
+      "event_name": "字典名称或原文支持的名称",
+      "outside_dictionary": false,
+      "relation_summary": "不超过15字，说明人物作用",
+      "state": "confirmed|uncertain|unsupported",
+      "evidence": [{"quote":"","start":0,"end":0}],
+      "note": ""
+    }],
+    "unresolved_items": [],
+    "schema_conflicts": []
+  }]
 }
 不要用朝代、年份、官职或外部史实猜测历史事件；三级人物不建立 historical_events。
 """

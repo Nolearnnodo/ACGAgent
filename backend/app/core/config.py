@@ -84,6 +84,17 @@ class Settings(BaseSettings):
         le=200,
         alias="AI_ANNOTATION_MAX_REPAIRS_PER_GENERATION",
     )
+    # 中文按一字一 token 估算输入。只有输入加上预留输出放不进窗口时，标注才按任务类型分片。
+    ai_annotation_context_window_tokens: int = Field(
+        default=131072,
+        ge=4096,
+        alias="AI_ANNOTATION_CONTEXT_WINDOW_TOKENS",
+    )
+    ai_annotation_reserved_output_tokens: int = Field(
+        default=16384,
+        ge=0,
+        alias="AI_ANNOTATION_RESERVED_OUTPUT_TOKENS",
+    )
     identity_merge_disabled: bool = Field(default=False, alias="IDENTITY_MERGE_DISABLED")
 
     @property

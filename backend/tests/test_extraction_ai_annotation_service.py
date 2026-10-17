@@ -28,6 +28,7 @@ from app.schemas.extraction_annotation import (
 )
 from app.services.extraction_ai_annotation_service import (
     AIAnnotationConfigError,
+    AIAnnotationProviderError,
     ExtractionAIAnnotationService,
     parse_ai_annotation_result,
 )
@@ -35,6 +36,7 @@ from app.services.extraction_ai_annotation_prompt import (
     AI_ANNOTATION_EVENT_FRAGMENT_SYSTEM_PROMPT,
     AI_ANNOTATION_FORMAT_REQUIREMENTS,
     AI_ANNOTATION_FORMAT_REVIEW_SYSTEM_PROMPT,
+    AI_ANNOTATION_LIFE_EVENTS_SYSTEM_PROMPT,
     AI_ANNOTATION_SYSTEM_PROMPT,
 )
 from app.services import extraction_ai_annotation_job_service as job_module
@@ -162,6 +164,16 @@ def test_event_fragment_prompt_requires_replayable_evidence_for_has_fact():
     assert "life_events 必须返回一条对应 event_type 的事件" in prompt
     assert "必须包含 1 至 8 条非空、可按 quote/start/end 回放的 evidence" in prompt
     assert "找不到上述有效正文证据时，禁止填写 has_fact" in prompt
+
+
+def test_life_events_bundle_prompt_covers_every_event_type():
+    prompt = AI_ANNOTATION_LIFE_EVENTS_SYSTEM_PROMPT
+
+    for event_type in EVENT_TYPES:
+        assert event_type in prompt
+    assert "本次最多返回一条" not in prompt
+    assert "has_fact" in prompt
+    assert "1 至 8 条" in prompt
 
 
 def test_validation_reports_evidence_problem(ai_annotation_db):
@@ -437,43 +449,20 @@ def test_validation_persists_current_result_for_user(ai_annotation_db):
     assert result.validation_status == "valid"
 
 
-def test_remote_generation_uses_bounded_semantic_fragments(ai_annotation_db, monkeypatch):
-    db, task_id = ai_annotation_db
-    service = ExtractionAIAnnotationService(db)
-    calls = []
-    fragment_by_purpose = {
-        "extraction_ai_annotation_passage_person": {
-            "passage": {"source_type": "epitaph"},
-            "persons": [
-                {
-                    "key": "model-key",
-                    "name_surface": "李白",
-                    "level": 1,
-                    "level_reason": "题名和正文均围绕该人物展开",
-                    "mentions": [{"quote": "李白", "start": 0, "end": 2}],
-                }
-            ],
-        },
-        "extraction_ai_annotation_life_event_fragment": {
-            "event_checks": {event_type: "not_mentioned" for event_type in ("出生", "籍贯", "死亡", "埋葬", "任职")},
-            "life_events": [],
-        },
-        "extraction_ai_annotation_historical_event_fragment": {
-            "historical_events": [],
-        },
-        "extraction_ai_annotation_relation_fragment": {
-            "person_relations": [],
-        },
-    }
+def _not_mentioned_checks() -> dict[str, str]:
+    return {event_type: "not_mentioned" for event_type in EVENT_TYPES}
 
+
+def _annotation_provider(calls: list, responder):
     class FakeProvider:
         def __init__(self, **_kwargs):
             pass
 
         def chat_completion_with_usage(self, messages, metadata):
             calls.append((messages, metadata))
+            content = responder(messages, metadata)
             return SimpleNamespace(
-                content=json.dumps(fragment_by_purpose[metadata["purpose"]], ensure_ascii=False),
+                content=content,
                 model="fragment-model",
                 usage=SimpleNamespace(
                     prompt_tokens=10,
@@ -485,42 +474,334 @@ def test_remote_generation_uses_bounded_semantic_fragments(ai_annotation_db, mon
                 ),
             )
 
+    return FakeProvider
+
+
+def _generate_request(task_id: int) -> AIAnnotationGenerateRequest:
+    return AIAnnotationGenerateRequest(
+        task_id=task_id,
+        config=AIAnnotationConfigRequest(
+            provider="deepseek",
+            api_key="temporary-key",
+            base_url="https://example.test",
+            model="annotation-model",
+        ),
+    )
+
+
+def test_remote_generation_uses_one_call_when_context_fits(ai_annotation_db, monkeypatch):
+    db, task_id = ai_annotation_db
+    service = ExtractionAIAnnotationService(db)
+    calls = []
+
+    def respond(_messages, metadata):
+        assert metadata["purpose"] == "extraction_ai_annotation_document"
+        return json.dumps(
+            {
+                "passage": {"source_type": "epitaph"},
+                "persons": [
+                    {
+                        "key": "model-key",
+                        "name_surface": "李白",
+                        "level": 1,
+                        "level_reason": "题名和正文均围绕该人物展开",
+                        "mentions": [{"quote": "李白", "start": 0, "end": 2}],
+                        "event_checks": _not_mentioned_checks(),
+                        "life_events": [],
+                        "historical_events": [],
+                    }
+                ],
+                "person_relations": [],
+            },
+            ensure_ascii=False,
+        )
+
     monkeypatch.setattr(
         "app.services.extraction_ai_annotation_service.DeepSeekProvider",
-        FakeProvider,
+        _annotation_provider(calls, respond),
+    )
+
+    result = service.generate(_generate_request(task_id))
+
+    assert result.validation_status == "valid"
+    assert len(calls) == 1
+    assert calls[0][1]["purpose"] == "extraction_ai_annotation_document"
+    user_payload = json.loads(calls[0][0][1]["content"])
+    assert user_payload["stage"] == "document"
+    assert "event_type" not in user_payload
+    assert "古籍知识抽取标注器" in calls[0][0][0]["content"]
+    assert all("max_tokens" not in call[1] and "thinking" not in call[1] for call in calls)
+    assert result.fragment_count == 1
+    assert result.truncated_fragments == []
+    assert result.token_usage.prompt_tokens == 10
+    assert result.token_usage.completion_tokens == 4
+    assert result.token_usage.total_tokens == 14
+    assert result.token_usage.prompt_cache_hit_tokens == 3
+    assert result.token_usage.llm_call_count == 1
+    assert result.document is not None
+    assert result.document.label.persons[0].key == "p1"
+    assert result.document.label.persons[0].mentions[0].id == "p1-m1"
+    assert result.document.label.persons[0].event_checks["出生"] == "not_mentioned"
+
+
+def test_complete_prompt_is_sent_verbatim_without_sharding(ai_annotation_db, monkeypatch):
+    db, task_id = ai_annotation_db
+    service = ExtractionAIAnnotationService(db)
+    calls = []
+    spec = "# 古籍人物与事件信息提取规范\n\n只输出本规范规定的 JSON。"
+    model_json = json.dumps(
+        {
+            "document": {"title": "AI 测试篇目"},
+            "persons": [{"id": "p1", "original_name": "李白"}],
+            "biographical_events": [],
+            "historical_event_links": [],
+            "person_relations": [],
+            "other_facts": [],
+            "uncertain_items": [],
+        },
+        ensure_ascii=False,
+    )
+
+    def respond(_messages, _metadata):
+        return model_json
+
+    monkeypatch.setattr(
+        "app.services.extraction_ai_annotation_service.DeepSeekProvider",
+        _annotation_provider(calls, respond),
     )
 
     result = service.generate(
         AIAnnotationGenerateRequest(
             task_id=task_id,
             config=AIAnnotationConfigRequest(
-                provider="deepseek",
+                provider="同济",
                 api_key="temporary-key",
-                base_url="https://example.test",
-                model="annotation-model",
+                base_url="https://agent.tongji.edu.cn/api/proxy/api/v1",
+                model="glm5.3flash2",
+            ),
+            prompt_overrides=AIAnnotationPromptOverrides(
+                system_prompt=spec,
+                user_prompt="不发送这段文字",
+                complete_prompt=True,
             ),
         )
     )
 
+    assert len(calls) == 1
+    assert calls[0][1]["purpose"] == "extraction_ai_annotation_document"
+    sent = calls[0][0]
+    assert len(sent) == 1
+    assert sent[0]["role"] == "system"
+    assert sent[0]["content"].startswith(spec)
+    assert "标题：AI 测试篇目\n正文：\n李白字太白，少有逸才。" in sent[0]["content"]
+    assert "不发送这段文字" not in sent[0]["content"]
+    assert "古籍知识抽取标注器" not in sent[0]["content"]
+    assert "用户消息 JSON" not in sent[0]["content"]
+    assert result.model == "glm5.3flash2"
+    assert result.fragment_count == 1
+    assert result.raw_content == model_json
+    assert result.label is None
+    assert result.document is None
+    assert result.validation_status == "invalid_format"
+
+
+def test_complete_prompt_does_not_fall_back_to_shards(ai_annotation_db, monkeypatch):
+    db, task_id = ai_annotation_db
+    service = ExtractionAIAnnotationService(db)
+    calls = []
+
+    def respond(_messages, _metadata):
+        raise RuntimeError("maximum context length exceeded")
+
+    monkeypatch.setattr(
+        "app.services.extraction_ai_annotation_service.DeepSeekProvider",
+        _annotation_provider(calls, respond),
+    )
+
+    with pytest.raises(AIAnnotationProviderError):
+        service.generate(
+            AIAnnotationGenerateRequest(
+                task_id=task_id,
+                config=AIAnnotationConfigRequest(
+                    provider="同济",
+                    api_key="temporary-key",
+                    base_url="https://agent.tongji.edu.cn/api/proxy/api/v1",
+                    model="glm5.3flash2",
+                ),
+                prompt_overrides=AIAnnotationPromptOverrides(
+                    system_prompt="完整规范",
+                    user_prompt="不发送",
+                    complete_prompt=True,
+                ),
+            )
+        )
+
+    assert len(calls) == 1
+
+
+def test_context_overflow_splits_by_task_type_not_event_type(ai_annotation_db, monkeypatch):
+    db, task_id = ai_annotation_db
+    service = ExtractionAIAnnotationService(db)
+    calls = []
+
+    def fits(_self, messages):
+        user_payload = json.loads(messages[-1]["content"])
+        stage = user_payload.get("stage")
+        if stage == "document":
+            return False
+        if stage == "life_events" and len(user_payload.get("persons") or []) > 1:
+            return False
+        return True
+
+    def respond(messages, metadata):
+        user_payload = json.loads(messages[-1]["content"])
+        purpose = metadata["purpose"]
+        if purpose == "extraction_ai_annotation_passage_person":
+            return json.dumps(
+                {
+                    "passage": {"source_type": "epitaph"},
+                    "persons": [
+                        {
+                            "name_surface": "李白",
+                            "level": 1,
+                            "level_reason": "题名和正文均围绕该人物展开",
+                            "mentions": [{"quote": "李白", "start": 0, "end": 2}],
+                        },
+                        {
+                            "name_surface": "太白",
+                            "level": 2,
+                            "level_reason": "与叙事中心有直接联系和具体作用",
+                            "mentions": [{"quote": "太白", "start": 3, "end": 5}],
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if purpose == "extraction_ai_annotation_life_events":
+            assert "event_type" not in user_payload
+            assert len(user_payload["persons"]) == 1
+            person_key = user_payload["persons"][0]["key"]
+            return json.dumps(
+                {
+                    "persons": [
+                        {
+                            "key": person_key,
+                            "event_checks": _not_mentioned_checks(),
+                            "life_events": [],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if purpose == "extraction_ai_annotation_historical_events":
+            assert len(user_payload["persons"]) == 2
+            return json.dumps(
+                {
+                    "persons": [
+                        {"key": person["key"], "historical_events": []}
+                        for person in user_payload["persons"]
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if purpose == "extraction_ai_annotation_relations":
+            assert user_payload["source_person_keys"] == ["p1", "p2"]
+            return json.dumps({"person_relations": []}, ensure_ascii=False)
+        raise AssertionError(purpose)
+
+    monkeypatch.setattr(ExtractionAIAnnotationService, "_fits_context", fits)
+    monkeypatch.setattr(
+        "app.services.extraction_ai_annotation_service.DeepSeekProvider",
+        _annotation_provider(calls, respond),
+    )
+
+    result = service.generate(_generate_request(task_id))
+
+    purposes = [call[1]["purpose"] for call in calls]
+    assert purposes == [
+        "extraction_ai_annotation_passage_person",
+        "extraction_ai_annotation_life_events",
+        "extraction_ai_annotation_life_events",
+        "extraction_ai_annotation_historical_events",
+        "extraction_ai_annotation_relations",
+    ]
+    assert "extraction_ai_annotation_life_event_fragment" not in purposes
+    assert result.document is not None
+    assert [person.key for person in result.document.label.persons] == ["p1", "p2"]
+    assert result.document.label.persons[0].event_checks["任职"] == "not_mentioned"
+    assert result.document.label.persons[1].event_checks["死亡"] == "not_mentioned"
+    assert result.fragment_count == 5
+
+
+def test_context_length_error_falls_back_to_task_types(ai_annotation_db, monkeypatch):
+    db, task_id = ai_annotation_db
+    service = ExtractionAIAnnotationService(db)
+    calls = []
+
+    def respond(messages, metadata):
+        purpose = metadata["purpose"]
+        if purpose == "extraction_ai_annotation_document":
+            raise RuntimeError("maximum context length exceeded")
+        if purpose == "extraction_ai_annotation_passage_person":
+            return json.dumps(
+                {
+                    "persons": [
+                        {
+                            "name_surface": "李白",
+                            "level": 1,
+                            "level_reason": "正文围绕该人物展开",
+                            "mentions": [{"quote": "李白", "start": 0, "end": 2}],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if purpose == "extraction_ai_annotation_life_events":
+            user_payload = json.loads(messages[-1]["content"])
+            return json.dumps(
+                {
+                    "persons": [
+                        {
+                            "key": user_payload["persons"][0]["key"],
+                            "event_checks": _not_mentioned_checks(),
+                            "life_events": [],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if purpose == "extraction_ai_annotation_historical_events":
+            user_payload = json.loads(messages[-1]["content"])
+            return json.dumps(
+                {
+                    "persons": [
+                        {"key": person["key"], "historical_events": []}
+                        for person in user_payload["persons"]
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if purpose == "extraction_ai_annotation_relations":
+            return json.dumps({"person_relations": []}, ensure_ascii=False)
+        raise AssertionError(purpose)
+
+    monkeypatch.setattr(
+        "app.services.extraction_ai_annotation_service.DeepSeekProvider",
+        _annotation_provider(calls, respond),
+    )
+
+    result = service.generate(_generate_request(task_id))
+
+    assert [call[1]["purpose"] for call in calls] == [
+        "extraction_ai_annotation_document",
+        "extraction_ai_annotation_passage_person",
+        "extraction_ai_annotation_life_events",
+        "extraction_ai_annotation_historical_events",
+        "extraction_ai_annotation_relations",
+    ]
     assert result.validation_status == "valid"
-    assert len(calls) == 8
-    assert calls[0][1]["purpose"] == "extraction_ai_annotation_passage_person"
-    assert [call[1]["purpose"] for call in calls[1:6]] == [
-        "extraction_ai_annotation_life_event_fragment"
-    ] * 5
-    assert calls[6][1]["purpose"] == "extraction_ai_annotation_historical_event_fragment"
-    assert calls[7][1]["purpose"] == "extraction_ai_annotation_relation_fragment"
-    assert all("max_tokens" not in call[1] and "thinking" not in call[1] for call in calls)
-    assert result.fragment_count == 8
-    assert result.truncated_fragments == []
-    assert result.token_usage.prompt_tokens == 80
-    assert result.token_usage.completion_tokens == 32
-    assert result.token_usage.total_tokens == 112
-    assert result.token_usage.prompt_cache_hit_tokens == 24
-    assert result.token_usage.llm_call_count == 8
     assert result.document is not None
     assert result.document.label.persons[0].key == "p1"
-    assert result.document.label.persons[0].mentions[0].id == "p1-m1"
 
 
 def test_repair_rebuilds_only_semantic_fragments_and_persists(ai_annotation_db, monkeypatch):
@@ -529,21 +810,6 @@ def test_repair_rebuilds_only_semantic_fragments_and_persists(ai_annotation_db, 
     assert admin is not None
     service = ExtractionAIAnnotationService(db)
     calls = []
-    fragment_by_purpose = {
-        "extraction_ai_annotation_passage_person": {
-            "persons": [{
-                "name_surface": "李白",
-                "level": 1,
-                "level_reason": "正文围绕该人物展开",
-                "mentions": [{"quote": "李白", "start": 0, "end": 2}],
-            }],
-        },
-        "extraction_ai_annotation_life_event_fragment": {
-            "event_checks": {event_type: "not_mentioned" for event_type in ("出生", "籍贯", "死亡", "埋葬", "任职")},
-        },
-        "extraction_ai_annotation_historical_event_fragment": {},
-        "extraction_ai_annotation_relation_fragment": {},
-    }
 
     class FakeProvider:
         def __init__(self, **_kwargs):
@@ -551,8 +817,22 @@ def test_repair_rebuilds_only_semantic_fragments_and_persists(ai_annotation_db, 
 
         def chat_completion_with_usage(self, messages, metadata):
             calls.append((messages, metadata))
+            assert metadata["purpose"] == "extraction_ai_annotation_document"
             return SimpleNamespace(
-                content=json.dumps(fragment_by_purpose[metadata["purpose"]], ensure_ascii=False),
+                content=json.dumps(
+                    {
+                        "persons": [{
+                            "name_surface": "李白",
+                            "level": 1,
+                            "level_reason": "正文围绕该人物展开",
+                            "mentions": [{"quote": "李白", "start": 0, "end": 2}],
+                            "event_checks": {
+                                event_type: "not_mentioned" for event_type in EVENT_TYPES
+                            },
+                        }],
+                    },
+                    ensure_ascii=False,
+                ),
                 model="repair-model",
             )
 
@@ -593,8 +873,8 @@ def test_repair_rebuilds_only_semantic_fragments_and_persists(ai_annotation_db, 
     )
 
     assert result.validation_status == "valid"
-    assert len(calls) == 8
-    assert all(call[1]["purpose"] != "extraction_ai_annotation_format_review" for call in calls)
+    assert len(calls) == 1
+    assert calls[0][1]["purpose"] == "extraction_ai_annotation_document"
     saved_result = db.query(ExtractionAIAnnotationSavedResult).one()
     assert saved_result.source_job_id == root.id
     assert saved_result.lineage_job_id == root.id

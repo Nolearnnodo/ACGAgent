@@ -59,7 +59,9 @@ from app.services.extraction_annotation_service import (
 from app.services.extraction_ai_annotation_prompt import (
     AI_ANNOTATION_AUXILIARY_FRAGMENT_SYSTEM_PROMPT,
     AI_ANNOTATION_EVENT_FRAGMENT_SYSTEM_PROMPT,
+    AI_ANNOTATION_HISTORICAL_EVENTS_SYSTEM_PROMPT,
     AI_ANNOTATION_HISTORICAL_FRAGMENT_SYSTEM_PROMPT,
+    AI_ANNOTATION_LIFE_EVENTS_SYSTEM_PROMPT,
     AI_ANNOTATION_PROMPT_VERSION,
     AI_ANNOTATION_PASSAGE_PERSON_SYSTEM_PROMPT,
     AI_ANNOTATION_RELATION_FRAGMENT_SYSTEM_PROMPT,
@@ -73,6 +75,30 @@ _SCHEMA_FIT_ATTEMPTS = 5
 
 _FRAGMENT_RETRY_LIMIT = 2
 _RELATION_SOURCE_BATCH_SIZE = 4
+_DOCUMENT_PURPOSE = "extraction_ai_annotation_document"
+_LIFE_EVENTS_PURPOSE = "extraction_ai_annotation_life_events"
+_HISTORICAL_EVENTS_PURPOSE = "extraction_ai_annotation_historical_events"
+_RELATIONS_PURPOSE = "extraction_ai_annotation_relations"
+_REQUIRED_FRAGMENT_PURPOSES = {
+    "extraction_ai_annotation_passage_person",
+    _DOCUMENT_PURPOSE,
+}
+# 只把上下文窗口错误和整篇输出被长度截断当成“需要按任务类型重拆”。
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "max context",
+    "context window",
+    "input is too long",
+    "prompt is too long",
+    "exceeds the model",
+    "finish_reason=length",
+    "超出上下文",
+    "上下文长度",
+    "上下文窗口",
+    "超过最大上下文",
+)
 
 
 @dataclass
@@ -468,7 +494,7 @@ def parse_ai_annotation_result(data: dict[str, Any]) -> AIAnnotationResultRespon
 
 
 class ExtractionAIAnnotationService:
-    """对指定标注任务执行分片 AI 抽取，并在服务端合并结果。"""
+    """对指定标注任务执行 AI 抽取，并在服务端合并结果。"""
 
     def __init__(self, db: Session):
         self.db = db
@@ -547,22 +573,34 @@ class ExtractionAIAnnotationService:
             )
 
         provider = self._build_provider(config, model_name)
-        (
-            assembled_document,
-            resolved_model,
-            fragment_count,
-            truncated_fragments,
-            fragment_warnings,
-        ) = (
-            self._generate_staged_document(
-                task,
-                passage,
-                config,
-                provider,
-                prompt_overrides=payload.prompt_overrides,
+        overrides = payload.prompt_overrides
+        if overrides is not None and overrides.complete_prompt:
+            raw_content, fragment_count, truncated_fragments, fragment_warnings = (
+                self._generate_verbatim_prompt_document(
+                    task,
+                    passage,
+                    provider,
+                    overrides,
+                )
             )
-        )
-        raw_content = json.dumps(assembled_document, ensure_ascii=False, indent=2)
+            resolved_model = model_name
+        else:
+            (
+                assembled_document,
+                resolved_model,
+                fragment_count,
+                truncated_fragments,
+                fragment_warnings,
+            ) = (
+                self._generate_staged_document(
+                    task,
+                    passage,
+                    config,
+                    provider,
+                    prompt_overrides=overrides,
+                )
+            )
+            raw_content = json.dumps(assembled_document, ensure_ascii=False, indent=2)
         return self._validate_content(
             task,
             passage,
@@ -1456,6 +1494,32 @@ class ExtractionAIAnnotationService:
         )
         return result
 
+    def _generate_verbatim_prompt_document(
+        self,
+        task: ExtractionAnnotationTask,
+        passage: Passage,
+        provider: DeepSeekProvider,
+        prompt_overrides: AIAnnotationPromptOverrides,
+    ) -> tuple[str, int, list[str], list[str]]:
+        """把给定规范原文当作唯一提示词，只附标题和正文。
+
+        不截断、不附加旧标注契约，也不在超窗或输出过长时改走分片。
+        模型原文原样进入结果，不按旧标注结构改写。
+        """
+
+        spec = prompt_overrides.system_prompt
+        separator = "" if spec.endswith("\n\n") else ("\n" if spec.endswith("\n") else "\n\n")
+        query = f"{spec}{separator}标题：{passage.title}\n正文：\n{passage.context}"
+        call = self._call_remote_model(
+            provider,
+            [{"role": "system", "content": query}],
+            stage="整篇标注",
+            purpose=_DOCUMENT_PURPOSE,
+        )
+        self._remember_model_output("整篇标注", call.content)
+        truncated = ["整篇标注"] if call.finish_reason == "length" else []
+        return call.content or "", 1, truncated, []
+
     def _generate_staged_document(
         self,
         task: ExtractionAnnotationTask,
@@ -1465,10 +1529,11 @@ class ExtractionAIAnnotationService:
         *,
         prompt_overrides: AIAnnotationPromptOverrides | None = None,
     ) -> tuple[dict[str, Any], str, int, list[str], list[str]]:
-        """按语义分片调用模型，并在服务端组装唯一的完整导出文档。
+        """默认一次生成完整标注。只有放不进上下文时才按任务类型拆开。
 
-        模型永远不会收到“请重新生成整个当前 JSON”的复核任务。每个失败或疑似
-        截断的分片只会在自己的输入范围内重试；最终冗余字段和偏移量由服务端生成。
+        超窗后的四类是材料与人物、生平事件、历史事件、人物关系。某一类仍然
+        放不下时，只按人物切组，不按出生、籍贯、死亡、埋葬、任职再拆。
+        证据偏移和稳定 key 由服务端补齐。
         """
 
         calls = 0
@@ -1476,129 +1541,182 @@ class ExtractionAIAnnotationService:
         truncated_fragments: list[str] = []
         fragment_warnings: list[str] = []
 
-        passage_fragment = self._call_fragment_json(
-            provider,
-            self._build_fragment_messages(
-                task,
-                passage,
-                system_prompt=AI_ANNOTATION_PASSAGE_PERSON_SYSTEM_PROMPT,
-                payload={
-                    "stage": "passage_person",
-                    "extra_instruction": config.extra_instruction.strip(),
-                },
-                prompt_overrides=prompt_overrides,
-            ),
-            stage="材料和人物分片",
-            purpose="extraction_ai_annotation_passage_person",
-        )
-        calls += passage_fragment[1]
-        models.extend(passage_fragment[2])
-        truncated_fragments.extend(passage_fragment[3])
-        fragment_warnings.extend(passage_fragment[4])
-        passage_data = passage_fragment[0]
+        def absorb(result: tuple[dict[str, Any], int, list[str], list[str], list[str]]) -> dict[str, Any]:
+            nonlocal calls
+            calls += result[1]
+            models.extend(result[2])
+            truncated_fragments.extend(result[3])
+            fragment_warnings.extend(result[4])
+            return result[0]
 
+        extra_instruction = config.extra_instruction.strip()
+        document_messages = self._build_fragment_messages(
+            task,
+            passage,
+            system_prompt=AI_ANNOTATION_SYSTEM_PROMPT,
+            payload={
+                "stage": "document",
+                "extra_instruction": extra_instruction,
+            },
+            prompt_overrides=prompt_overrides,
+        )
+        if self._fits_context(document_messages):
+            try:
+                document_fragment = absorb(
+                    self._call_fragment_json(
+                        provider,
+                        document_messages,
+                        stage="整篇标注",
+                        purpose=_DOCUMENT_PURPOSE,
+                        retry_on_length=False,
+                    )
+                )
+            except AIAnnotationProviderError as exc:
+                if not self._is_context_overflow(exc):
+                    raise
+            else:
+                label = self._normalize_assembled_label(
+                    task,
+                    passage,
+                    self._adopt_full_label(document_fragment),
+                )
+                return (
+                    self._build_export_document(task, passage, label),
+                    (models[-1] if models else ""),
+                    calls,
+                    truncated_fragments,
+                    fragment_warnings,
+                )
+
+        passage_fragment = absorb(
+            self._call_fragment_json(
+                provider,
+                self._build_fragment_messages(
+                    task,
+                    passage,
+                    system_prompt=AI_ANNOTATION_PASSAGE_PERSON_SYSTEM_PROMPT,
+                    payload={
+                        "stage": "passage_person",
+                        "extra_instruction": extra_instruction,
+                    },
+                    prompt_overrides=prompt_overrides,
+                ),
+                stage="材料和人物",
+                purpose="extraction_ai_annotation_passage_person",
+            )
+        )
         label_payload = self._assemble_passage_person_fragment(
             task,
             passage,
-            passage_data,
+            passage_fragment,
         )
         persons = label_payload["persons"]
-
-        # 三级人物只保留人物信息；一、二级人物分别执行生平和历史事件分片，
-        # 这样一个人物的事件数量也不会把整篇输出推到单次上限。
+        expandable = []
         for person in persons:
             if person.get("level") == 3:
                 person["event_checks"] = {
                     event_type: "unreviewed" for event_type in EVENT_TYPES
                 }
                 continue
+            expandable.append(person)
 
-            for event_type in EVENT_TYPES:
-                event_fragment = self._call_fragment_json(
+        def life_messages(group: list[dict[str, Any]]) -> list[dict[str, str]]:
+            return self._build_fragment_messages(
+                task,
+                passage,
+                system_prompt=AI_ANNOTATION_LIFE_EVENTS_SYSTEM_PROMPT,
+                payload={
+                    "stage": "life_events",
+                    "persons": [self._person_summary_for_model(person) for person in group],
+                    "extra_instruction": extra_instruction,
+                },
+                prompt_overrides=prompt_overrides,
+            )
+
+        def historical_messages(group: list[dict[str, Any]]) -> list[dict[str, str]]:
+            return self._build_fragment_messages(
+                task,
+                passage,
+                system_prompt=AI_ANNOTATION_HISTORICAL_EVENTS_SYSTEM_PROMPT,
+                payload={
+                    "stage": "historical_events",
+                    "persons": [self._person_summary_for_model(person) for person in group],
+                    "extra_instruction": extra_instruction,
+                },
+                prompt_overrides=prompt_overrides,
+            )
+
+        life_groups = self._partition_for_context(expandable, life_messages)
+        for index, group in enumerate(life_groups, start=1):
+            stage = self._task_stage_name("生平事件", index, len(life_groups))
+            fragment = absorb(
+                self._call_fragment_json(
                     provider,
-                    self._build_fragment_messages(
-                        task,
-                        passage,
-                        system_prompt=AI_ANNOTATION_EVENT_FRAGMENT_SYSTEM_PROMPT,
-                        payload={
-                            "stage": "life_event",
-                            "person": self._person_summary_for_model(person),
-                            "person_key": person["key"],
-                            "event_type": event_type,
-                        },
-                        prompt_overrides=prompt_overrides,
-                    ),
-                    stage=f"人物 {person['key']} 的 {event_type} 事件分片",
-                    purpose="extraction_ai_annotation_life_event_fragment",
+                    life_messages(group),
+                    stage=stage,
+                    purpose=_LIFE_EVENTS_PURPOSE,
                 )
-                calls += event_fragment[1]
-                models.extend(event_fragment[2])
-                truncated_fragments.extend(event_fragment[3])
-                fragment_warnings.extend(event_fragment[4])
-                self._merge_event_fragment(person, event_fragment[0], event_type)
-
-            historical_fragment = self._call_fragment_json(
-                provider,
-                self._build_fragment_messages(
-                    task,
-                    passage,
-                    system_prompt=AI_ANNOTATION_HISTORICAL_FRAGMENT_SYSTEM_PROMPT,
-                    payload={
-                        "stage": "historical_event",
-                        "person": self._person_summary_for_model(person),
-                        "person_key": person["key"],
-                    },
-                    prompt_overrides=prompt_overrides,
-                ),
-                stage=f"人物 {person['key']} 的历史事件分片",
-                purpose="extraction_ai_annotation_historical_event_fragment",
             )
-            calls += historical_fragment[1]
-            models.extend(historical_fragment[2])
-            truncated_fragments.extend(historical_fragment[3])
-            fragment_warnings.extend(historical_fragment[4])
-            self._merge_event_fragment(person, historical_fragment[0], "historical")
+            self._merge_life_events_bundle(
+                group,
+                fragment,
+                stage=stage,
+                label_payload=label_payload,
+            )
 
-        # 关系按 source 人物分组；每个请求最多四个 source，遇到截断时由
-        # _call_fragment_json 仅重试当前关系批次，不会重新生成前面的内容。
+        historical_groups = self._partition_for_context(expandable, historical_messages)
+        for index, group in enumerate(historical_groups, start=1):
+            stage = self._task_stage_name("历史事件", index, len(historical_groups))
+            fragment = absorb(
+                self._call_fragment_json(
+                    provider,
+                    historical_messages(group),
+                    stage=stage,
+                    purpose=_HISTORICAL_EVENTS_PURPOSE,
+                )
+            )
+            self._merge_historical_bundle(
+                group,
+                fragment,
+                stage=stage,
+                label_payload=label_payload,
+            )
+
         relation_sources = [person["key"] for person in persons if person.get("key")]
-        for start in range(0, len(relation_sources), _RELATION_SOURCE_BATCH_SIZE):
-            source_keys = relation_sources[start : start + _RELATION_SOURCE_BATCH_SIZE]
-            relation_fragment = self._call_fragment_json(
-                provider,
-                self._build_fragment_messages(
-                    task,
-                    passage,
-                    system_prompt=AI_ANNOTATION_RELATION_FRAGMENT_SYSTEM_PROMPT,
-                    payload={
-                        "stage": "person_relation",
-                        "source_person_keys": source_keys,
-                        "persons": [self._person_summary_for_model(person) for person in persons],
-                    },
-                    prompt_overrides=prompt_overrides,
-                ),
-                stage=f"人物关系分片 {start // _RELATION_SOURCE_BATCH_SIZE + 1}",
-                purpose="extraction_ai_annotation_relation_fragment",
+
+        def relation_messages(source_keys: list[str]) -> list[dict[str, str]]:
+            return self._build_fragment_messages(
+                task,
+                passage,
+                system_prompt=AI_ANNOTATION_RELATION_FRAGMENT_SYSTEM_PROMPT,
+                payload={
+                    "stage": "person_relation",
+                    "source_person_keys": source_keys,
+                    "persons": [self._person_summary_for_model(person) for person in persons],
+                    "extra_instruction": extra_instruction,
+                },
+                prompt_overrides=prompt_overrides,
             )
-            calls += relation_fragment[1]
-            models.extend(relation_fragment[2])
-            truncated_fragments.extend(relation_fragment[3])
-            fragment_warnings.extend(relation_fragment[4])
-            label_payload["person_relations"].extend(
-                relation_fragment[0].get("person_relations") or []
+
+        relation_groups = self._partition_for_context(relation_sources, relation_messages)
+        for index, source_keys in enumerate(relation_groups, start=1):
+            stage = self._task_stage_name("人物关系", index, len(relation_groups))
+            fragment = absorb(
+                self._call_fragment_json(
+                    provider,
+                    relation_messages(source_keys),
+                    stage=stage,
+                    purpose=_RELATIONS_PURPOSE,
+                )
             )
-            self._register_fragment_warning(
-                label_payload,
-                relation_fragment[0],
-                stage=f"人物关系分片 {start // _RELATION_SOURCE_BATCH_SIZE + 1}",
-            )
+            label_payload["person_relations"].extend(fragment.get("person_relations") or [])
+            self._register_fragment_warning(label_payload, fragment, stage=stage)
             for field in ("unresolved_items", "schema_conflicts", "excluded_mentions"):
-                label_payload[field].extend(relation_fragment[0].get(field) or [])
+                label_payload[field].extend(fragment.get(field) or [])
 
         label = self._normalize_assembled_label(task, passage, label_payload)
-        document = self._build_export_document(task, passage, label)
         return (
-            document,
+            self._build_export_document(task, passage, label),
             (models[-1] if models else ""),
             calls,
             truncated_fragments,
@@ -1662,6 +1780,7 @@ class ExtractionAIAnnotationService:
         *,
         stage: str,
         purpose: str,
+        retry_on_length: bool = True,
     ) -> tuple[dict[str, Any], int, list[str], list[str], list[str]]:
         models: list[str] = []
         truncated: list[str] = []
@@ -1679,6 +1798,10 @@ class ExtractionAIAnnotationService:
             if call.finish_reason == "length":
                 truncated.append(stage)
                 last_error = "finish_reason=length"
+                if not retry_on_length:
+                    raise AIAnnotationProviderError(
+                        f"{stage}输出未完成（finish_reason=length），单次输出放不进上下文。"
+                    )
             elif not call.content.strip():
                 last_error = "empty_content"
             else:
@@ -1704,7 +1827,7 @@ class ExtractionAIAnnotationService:
                 }
                 messages = retry_messages
 
-        if purpose != "extraction_ai_annotation_passage_person":
+        if purpose not in _REQUIRED_FRAGMENT_PURPOSES:
             warning = f"{stage}: {last_error or 'fragment_failed'}"
             warnings.append(warning)
             return (
@@ -1718,6 +1841,210 @@ class ExtractionAIAnnotationService:
             f"{stage}输出未完成（{last_error}），已只重试当前分片 { _FRAGMENT_RETRY_LIMIT } 次；"
             "请降低单片复杂度或稍后重试。"
         )
+
+    def _context_input_budget(self) -> int:
+        settings = get_settings()
+        window = int(settings.ai_annotation_context_window_tokens)
+        reserved = int(settings.ai_annotation_reserved_output_tokens)
+        if reserved >= window:
+            return max(window // 2, 1)
+        return max(window - reserved, 1)
+
+    @staticmethod
+    def _estimate_messages_tokens(messages: list[dict[str, str]]) -> int:
+        """中文大约一字一 token。这里只判断输入会不会超出上下文，不作为计费。"""
+
+        return sum(len(str(message.get("content") or "")) for message in messages)
+
+    def _fits_context(self, messages: list[dict[str, str]]) -> bool:
+        return self._estimate_messages_tokens(messages) <= self._context_input_budget()
+
+    @staticmethod
+    def _is_context_overflow(exc: Exception) -> bool:
+        text = " ".join(str(exc).split()).lower()
+        return any(marker.lower() in text for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+    def _partition_for_context(
+        self,
+        items: list[Any],
+        build_messages,
+    ) -> list[list[Any]]:
+        """整组放得下就一次发送。放不下才对半切，切到单个元素仍放不下也照发。"""
+
+        if not items:
+            return []
+        if len(items) == 1 or self._fits_context(build_messages(items)):
+            return [items]
+        mid = len(items) // 2
+        return self._partition_for_context(items[:mid], build_messages) + self._partition_for_context(
+            items[mid:],
+            build_messages,
+        )
+
+    @staticmethod
+    def _task_stage_name(base: str, index: int, total: int) -> str:
+        if total <= 1:
+            return base
+        return f"{base} {index}"
+
+    def _adopt_full_label(self, fragment: dict[str, Any]) -> dict[str, Any]:
+        """收下整篇 JSON，并把模型自拟的人物键改成服务端顺序键。"""
+
+        if isinstance(fragment.get("label"), dict):
+            fragment = fragment["label"]
+        passage_data = fragment.get("passage")
+        if not isinstance(passage_data, dict):
+            passage_data = {}
+        persons: list[dict[str, Any]] = []
+        key_map: dict[str, str] = {}
+        for index, raw_person in enumerate(fragment.get("persons") or [], start=1):
+            if not isinstance(raw_person, dict):
+                continue
+            person = dict(raw_person)
+            old_key = str(person.get("key") or "")
+            new_key = f"p{index}"
+            if old_key:
+                key_map.setdefault(old_key, new_key)
+            person["key"] = new_key
+            person["mentions"] = self._compact_evidence_list(person.get("mentions"))
+            person.setdefault(
+                "event_checks",
+                {event_type: "unreviewed" for event_type in EVENT_TYPES},
+            )
+            person["life_events"] = list(person.get("life_events") or [])
+            person["historical_events"] = list(person.get("historical_events") or [])
+            persons.append(person)
+
+        relations: list[dict[str, Any]] = []
+        for raw_relation in fragment.get("person_relations") or []:
+            if not isinstance(raw_relation, dict):
+                continue
+            item = dict(raw_relation)
+            source = str(item.get("source_person_key") or "")
+            target = str(item.get("target_person_key") or "")
+            item["source_person_key"] = key_map.get(source, source)
+            item["target_person_key"] = key_map.get(target, target)
+            relations.append(item)
+        return {
+            "passage": passage_data,
+            "persons": persons,
+            "person_relations": relations,
+            "excluded_mentions": list(fragment.get("excluded_mentions") or []),
+            "unresolved_items": list(fragment.get("unresolved_items") or []),
+            "schema_conflicts": list(fragment.get("schema_conflicts") or []),
+        }
+
+    def _merge_life_events_bundle(
+        self,
+        targets: list[dict[str, Any]],
+        fragment: dict[str, Any],
+        *,
+        stage: str,
+        label_payload: dict[str, Any],
+    ) -> None:
+        warning = fragment.get("_fragment_warning")
+        if warning:
+            for person in targets:
+                person.setdefault("event_checks", {})
+                for event_type in EVENT_TYPES:
+                    person["event_checks"][event_type] = "uncertain"
+                person.setdefault("_unresolved_items", []).append(
+                    {
+                        "category": "fragment_empty_response",
+                        "note": f"{stage}没有返回可解析内容，待人工复核。",
+                    }
+                )
+            return
+
+        returned: dict[str, dict[str, Any]] = {}
+        for item in fragment.get("persons") or []:
+            if isinstance(item, dict) and item.get("key"):
+                returned[str(item["key"])] = item
+        used_fragment_as_person = False
+        if len(targets) == 1 and targets[0]["key"] not in returned:
+            if any(key in fragment for key in ("event_checks", "life_events", "event_check")):
+                returned[targets[0]["key"]] = fragment
+                used_fragment_as_person = True
+
+        for person in targets:
+            item = returned.get(person["key"])
+            person.setdefault("event_checks", {})
+            person.setdefault("life_events", [])
+            if item is None:
+                for event_type in EVENT_TYPES:
+                    person["event_checks"][event_type] = "uncertain"
+                person.setdefault("_unresolved_items", []).append(
+                    {
+                        "category": "fragment_empty_response",
+                        "note": f"{stage}没有返回人物 {person['key']} 的生平事件，待人工复核。",
+                    }
+                )
+                continue
+            checks = item.get("event_checks") if isinstance(item.get("event_checks"), dict) else {}
+            for event_type in EVENT_TYPES:
+                if event_type in checks:
+                    person["event_checks"][event_type] = self._normalize_check_state(checks[event_type])
+                else:
+                    person["event_checks"][event_type] = "uncertain"
+            person["life_events"].extend(
+                event
+                for event in (item.get("life_events") or [])
+                if isinstance(event, dict) and event.get("event_type") in EVENT_TYPES
+            )
+            person.setdefault("_unresolved_items", []).extend(item.get("unresolved_items") or [])
+            person.setdefault("_schema_conflicts", []).extend(item.get("schema_conflicts") or [])
+
+        if used_fragment_as_person:
+            return
+        for field in ("unresolved_items", "schema_conflicts"):
+            label_payload.setdefault(field, []).extend(fragment.get(field) or [])
+
+    def _merge_historical_bundle(
+        self,
+        targets: list[dict[str, Any]],
+        fragment: dict[str, Any],
+        *,
+        stage: str,
+        label_payload: dict[str, Any],
+    ) -> None:
+        warning = fragment.get("_fragment_warning")
+        if warning:
+            for person in targets:
+                person.setdefault("historical_events", [])
+                person.setdefault("_unresolved_items", []).append(
+                    {
+                        "category": "fragment_empty_response",
+                        "note": f"{stage}没有返回可解析内容，待人工复核。",
+                    }
+                )
+            return
+
+        returned: dict[str, dict[str, Any]] = {}
+        for item in fragment.get("persons") or []:
+            if isinstance(item, dict) and item.get("key"):
+                returned[str(item["key"])] = item
+        used_fragment_as_person = False
+        if len(targets) == 1 and targets[0]["key"] not in returned and "historical_events" in fragment:
+            returned[targets[0]["key"]] = fragment
+            used_fragment_as_person = True
+
+        for person in targets:
+            item = returned.get(person["key"])
+            if item is None:
+                person.setdefault("historical_events", [])
+                person.setdefault("_unresolved_items", []).append(
+                    {
+                        "category": "fragment_empty_response",
+                        "note": f"{stage}没有返回人物 {person['key']} 的历史事件，待人工复核。",
+                    }
+                )
+                continue
+            self._merge_event_fragment(person, item, "historical")
+
+        if used_fragment_as_person:
+            return
+        for field in ("unresolved_items", "schema_conflicts"):
+            label_payload.setdefault(field, []).extend(fragment.get(field) or [])
 
     @staticmethod
     def _person_summary_for_model(person: dict[str, Any]) -> dict[str, Any]:

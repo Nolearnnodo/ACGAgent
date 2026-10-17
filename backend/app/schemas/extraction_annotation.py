@@ -291,6 +291,8 @@ class AIAnnotationPromptOverrides(BaseModel):
 
     system_prompt: str = Field(min_length=1, max_length=100_000)
     user_prompt: str = Field(min_length=1, max_length=10_000_000)
+    # 为真时 system_prompt 是整次调用的唯一提示词，不附加旧契约，也不按任务拆片。
+    complete_prompt: bool = False
 
 
 class AIAnnotationGenerateRequest(BaseModel):
